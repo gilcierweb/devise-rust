@@ -1,0 +1,17 @@
+[package]
+name = "devise-rust-actix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Actix Web integration for devise-rust"
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+devise-rust = { path = "../devise-rust" }
+# Phase 7 adds: actix-web, actix-session (see .planning/ROADMAP.md)
