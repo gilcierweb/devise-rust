@@ -12,3 +12,29 @@ readme.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+bcrypt.workspace = true
+chrono.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+rust-i18n.workspace = true
+once_cell.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+subtle.workspace = true
+
+[features]
+test-utils = []
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+tokio = { version = "1", features = ["macros", "rt"] }
+# Dev-only: email_regexp matrix test (runtime use lands with validatable in Phase 4)
+regex = "1.10"

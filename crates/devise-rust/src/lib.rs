@@ -16,6 +16,30 @@
 
 #![warn(clippy::all, clippy::pedantic, unsafe_code)]
 
-// Modules land in follow-up plans:
-//   01-02 → config, crypto, i18n, parameter
-//   01-03 → adapter, time
+// Initialize rust-i18n at crate root — loads translations from `locales/*.yml`
+// (vendored Devise catalog, adapted to `_version: 1` layout where filename = locale)
+rust_i18n::i18n!("locales", fallback = "en");
+
+pub mod config;
+pub mod crypto;
+pub mod i18n;
+pub mod parameter;
+
+#[cfg(test)]
+mod tests {
+    use crate::config::DeviseConfig;
+
+    #[test]
+    fn test_config_defaults() {
+        let config = DeviseConfig::default();
+        assert_eq!(config.stretches, 12);
+        assert_eq!(config.remember_for, chrono::TimeDelta::weeks(2));
+        assert_eq!(config.timeout_in, chrono::TimeDelta::minutes(30));
+        assert_eq!(config.reset_password_within, chrono::TimeDelta::hours(6));
+        // Devise 5.0.4 defaults (devise/lib/devise.rb): paranoid = false, default_scope = nil
+        assert!(!config.paranoid);
+        assert_eq!(config.default_scope, None);
+        assert_eq!(config.email_regexp, r"\A[^@\s]+@[^@\s]+\z");
+        assert_eq!(config.password_length, 6..128);
+    }
+}
