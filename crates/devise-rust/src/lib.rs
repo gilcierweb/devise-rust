@@ -20,10 +20,15 @@
 // (vendored Devise catalog, adapted to `_version: 1` layout where filename = locale)
 rust_i18n::i18n!("locales", fallback = "en");
 
+pub mod adapter;
 pub mod config;
 pub mod crypto;
 pub mod i18n;
 pub mod parameter;
+pub mod time;
+
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
 
 #[cfg(test)]
 mod tests {
