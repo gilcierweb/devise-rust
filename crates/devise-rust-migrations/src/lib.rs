@@ -357,6 +357,22 @@ pub fn is_valid_identifier(table: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// Returns `true` when `component` is a flat relative path component.
+///
+/// Only ASCII alphanumerics, `_`, `-`, and `.` are allowed, and the component
+/// must not be `.`, `..`, or contain a path separator — so `dir.join(...)`
+/// can never escape `dir` (threat T-2-04).
+#[must_use]
+fn is_flat_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.contains(['/', '\\'])
+        && component
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
 /// Validates `table`, returning it on success.
 ///
 /// # Errors
@@ -386,13 +402,24 @@ impl MigrationPayload {
     /// Writes `<dir>/<timestamp>_<migration_name>/{up.sql,down.sql}`.
     ///
     /// Creates parent directories as needed. Refuses to overwrite an
-    /// existing migration directory (threat T-2-04).
+    /// existing migration directory (threat T-2-04). Both the timestamp and
+    /// the migration name must be flat path components (no separators,
+    /// no `..`, no absolute paths), so writes can never escape `dir` —
+    /// even for a hand-constructed payload that bypassed [`emit`].
     ///
     /// # Errors
     ///
-    /// Returns [`EmitError::OutputExists`] when the target directory already
+    /// Returns [`EmitError::InvalidIdentifier`] when the timestamp or
+    /// migration name is not a flat path component,
+    /// [`EmitError::OutputExists`] when the target directory already
     /// exists, or [`EmitError::Io`] on filesystem failures.
     pub fn write_to(&self, dir: &Path, timestamp: &str) -> Result<PathBuf, EmitError> {
+        if !is_flat_component(timestamp) {
+            return Err(EmitError::InvalidIdentifier(timestamp.to_owned()));
+        }
+        if !is_flat_component(&self.migration_name) {
+            return Err(EmitError::InvalidIdentifier(self.migration_name.clone()));
+        }
         let target = dir.join(format!("{timestamp}_{}", self.migration_name));
         if target.exists() {
             return Err(EmitError::OutputExists(target));

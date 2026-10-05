@@ -427,6 +427,42 @@ fn cli_tempdir(suffix: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn write_to_confines_writes_to_output_dir() {
+    use devise_rust_migrations::MigrationFiles;
+
+    let files = emit(&full_options()).unwrap();
+    let out = cli_tempdir("confine");
+
+    // Timestamp traversal rejected before any file exists.
+    assert!(matches!(
+        files.write_to(&out, "../../evil"),
+        Err(EmitError::InvalidIdentifier(_))
+    ));
+    assert!(!out.join("evil").exists());
+
+    // Hand-built payload with an absolute migration name cannot escape either.
+    let hostile = MigrationFiles {
+        migration_name: "/tmp/devise_hostile".to_owned(),
+        up_sql: String::new(),
+        down_sql: String::new(),
+    };
+    assert!(matches!(
+        hostile.write_to(&out, "20260101000000"),
+        Err(EmitError::InvalidIdentifier(_))
+    ));
+
+    // Happy path still writes, second write refuses to overwrite.
+    let written = files.write_to(&out, "20260101000000").unwrap();
+    assert!(written.join("up.sql").exists());
+    assert!(matches!(
+        files.write_to(&out, "20260101000000"),
+        Err(EmitError::OutputExists(_))
+    ));
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
 fn cli_smoke_writes_devise_create_layout() {
     let out = cli_tempdir("smoke");
     let status = std::process::Command::new(cli_binary())
