@@ -406,3 +406,129 @@ fn invalid_identifier_matrix() {
         );
     }
 }
+
+/// Absolute path to the compiled `devise-migrations` binary.
+///
+/// Cargo exposes `CARGO_BIN_EXE_<name>` to integration tests; the dash vs
+/// underscore spelling differs across toolchains, so both are probed.
+fn cli_binary() -> String {
+    option_env!("CARGO_BIN_EXE_devise-migrations")
+        .or(option_env!("CARGO_BIN_EXE_devise_migrations"))
+        .expect("devise-migrations binary was not built")
+        .to_owned()
+}
+
+fn cli_tempdir(suffix: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "devise_migrations_{suffix}_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn cli_smoke_writes_devise_create_layout() {
+    let out = cli_tempdir("smoke");
+    let status = std::process::Command::new(cli_binary())
+        .args([
+            "users",
+            "--dialect",
+            "postgres",
+            "--modules",
+            "all",
+            "--output",
+            out.to_str().unwrap(),
+            "--timestamp",
+            "20260101000000",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let dir = out.join("20260101000000_devise_create_users");
+    let up = std::fs::read_to_string(dir.join("up.sql")).unwrap();
+    let down = std::fs::read_to_string(dir.join("down.sql")).unwrap();
+    assert!(up.contains("encrypted_password"));
+    assert!(up.contains("CREATE UNIQUE INDEX index_users_on_email"));
+    assert!(down.contains("DROP TABLE users;"));
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn cli_existing_flow_writes_add_devise_layout() {
+    let out = cli_tempdir("existing");
+    let status = std::process::Command::new(cli_binary())
+        .args([
+            "users",
+            "--dialect",
+            "sqlite",
+            "--pk",
+            "uuid",
+            "--modules",
+            "all",
+            "--existing",
+            "--output",
+            out.to_str().unwrap(),
+            "--timestamp",
+            "20260101000001",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let dir = out.join("20260101000001_add_devise_to_users");
+    let up = std::fs::read_to_string(dir.join("up.sql")).unwrap();
+    assert!(up.contains("ALTER TABLE users ADD COLUMN"));
+    assert!(!up.contains("CREATE TABLE"));
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn cli_help_lists_every_flag() {
+    let output = std::process::Command::new(cli_binary())
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for flag in [
+        "--dialect",
+        "--pk",
+        "--modules",
+        "--reconfirmable",
+        "--lock-strategy",
+        "--unlock-strategy",
+        "--remember-token",
+        "--existing",
+        "--timestamps",
+        "--output",
+        "--timestamp",
+    ] {
+        assert!(stdout.contains(flag), "--help missing {flag}");
+    }
+}
+
+#[test]
+fn cli_unknown_module_exits_two() {
+    let out = cli_tempdir("unknown");
+    let output = std::process::Command::new(cli_binary())
+        .args([
+            "users",
+            "--modules",
+            "validatable",
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("adds no devise columns"), "{stderr}");
+    assert!(!out.join("migrations").exists());
+
+    let _ = std::fs::remove_dir_all(&out);
+}
