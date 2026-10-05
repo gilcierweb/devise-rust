@@ -378,9 +378,7 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
     /// Returns [`OrmError::NotFound`] when nothing matches; backend failures
     /// propagate unchanged.
     async fn find_first_strict(&self, conditions: &Conditions) -> Result<M, OrmError> {
-        self.find_first(conditions)
-            .await?
-            .ok_or(OrmError::NotFound)
+        self.find_first(conditions).await?.ok_or(OrmError::NotFound)
     }
 
     /// Persist a new record from its insert shape — mirrors
@@ -545,7 +543,9 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
 /// In-memory adapter for testing — the behavioral oracle later backends are
 /// checked against.
 pub mod memory {
-    use super::{ChangeSet, Conditions, DeviseKey, HashMap, OrmAdapter, OrmError, Value, async_trait};
+    use super::{
+        ChangeSet, Conditions, DeviseKey, HashMap, OrmAdapter, OrmError, Value, async_trait,
+    };
     use serde::Serialize;
     use serde::de::DeserializeOwned;
     use std::sync::{Arc, RwLock};
@@ -589,7 +589,12 @@ pub mod memory {
         /// Returns [`OrmError::NotFound`] when `key` matches nothing, or
         /// [`OrmError::Serialization`] when the model does not round-trip
         /// through a JSON object.
-        async fn apply_fields(
+        ///
+        /// # Panics
+        ///
+        /// Panics when the storage lock is poisoned (a prior holder panicked
+        /// while holding it — unrecoverable by design in this test oracle).
+        fn apply_fields(
             &self,
             key: &DeviseKey,
             fields: &HashMap<String, Value>,
@@ -668,7 +673,7 @@ pub mod memory {
                     fields.insert(field, value.clone());
                 }
             }
-            self.apply_fields(key, &fields).await
+            self.apply_fields(key, &fields)
         }
 
         async fn update_columns(
@@ -676,7 +681,7 @@ pub mod memory {
             key: &DeviseKey,
             fields: &HashMap<String, Value>,
         ) -> Result<M, OrmError> {
-            self.apply_fields(key, fields).await
+            self.apply_fields(key, fields)
         }
 
         async fn delete(&self, id: &DeviseKey) -> Result<(), OrmError> {
@@ -692,7 +697,9 @@ pub use crate::time::{Clock, FixedClock, SystemClock};
 
 #[cfg(test)]
 mod tests {
-    use super::{ChangeSet, Conditions, Deserialize, DeviseKey, OrmAdapter, OrmError, Serialize, Value};
+    use super::{
+        ChangeSet, Conditions, Deserialize, DeviseKey, OrmAdapter, OrmError, Serialize, Value,
+    };
     use crate::time::{Clock, FixedClock, SystemClock};
     use chrono::{TimeDelta, Utc};
     use std::collections::HashMap;
@@ -823,23 +830,26 @@ mod tests {
         );
         assert_eq!(adapter.get(&DeviseKey::from_i64(999)).await.unwrap(), None);
         assert!(matches!(
-            adapter.get_strict(&DeviseKey::from_i64(999)).await.unwrap_err(),
+            adapter
+                .get_strict(&DeviseKey::from_i64(999))
+                .await
+                .unwrap_err(),
             OrmError::NotFound
         ));
 
         // `find_first` / `find_first_strict` filter on real field values.
         let mut cond = Conditions::new();
         cond.insert("email", "alice@example.com");
-        assert_eq!(adapter.find_first(&cond).await.unwrap(), Some(alice.clone()));
+        assert_eq!(
+            adapter.find_first(&cond).await.unwrap(),
+            Some(alice.clone())
+        );
         assert_eq!(adapter.find_first_strict(&cond).await.unwrap(), alice);
         let mut missing = Conditions::new();
         missing.insert("email", "nobody@example.com");
         assert_eq!(adapter.find_first(&missing).await.unwrap(), None);
         assert!(matches!(
-            adapter
-                .find_first_strict(&missing)
-                .await
-                .unwrap_err(),
+            adapter.find_first_strict(&missing).await.unwrap_err(),
             OrmError::NotFound
         ));
 
@@ -885,11 +895,32 @@ mod tests {
                 .unwrap_err(),
             OrmError::NotFound
         ));
+    }
 
-        // Uniqueness probe flips per value, not per store occupancy.
+    #[tokio::test]
+    async fn test_memory_adapter_uniqueness_probe_and_delete() {
+        use crate::adapter::memory::MemoryAdapter;
+
+        let adapter = MemoryAdapter::<MemUser>::new();
+
+        // Probe is true on an empty store, flips per value after a create.
+        assert!(
+            adapter
+                .column_value_unused("email", &Value::from("carol@example.com"))
+                .await
+                .unwrap()
+        );
+        adapter
+            .create(MemUser {
+                id: 0,
+                email: "carol@example.com".to_owned(),
+                token: None,
+            })
+            .await
+            .unwrap();
         assert!(
             !adapter
-                .column_value_unused("email", &Value::from("alice2@example.com"))
+                .column_value_unused("email", &Value::from("carol@example.com"))
                 .await
                 .unwrap()
         );
@@ -902,7 +933,6 @@ mod tests {
 
         // `delete`, then `get` → `None`.
         adapter.delete(&DeviseKey::from_i64(1)).await.unwrap();
-        adapter.delete(&DeviseKey::from_i64(2)).await.unwrap();
         assert_eq!(adapter.get(&DeviseKey::from_i64(1)).await.unwrap(), None);
     }
 
@@ -921,7 +951,10 @@ mod tests {
             rendered.contains("index_users_on_email"),
             "Display must name the constraint: {rendered}"
         );
-        assert!(!rendered.contains('@'), "Display must not leak values: {rendered}");
+        assert!(
+            !rendered.contains('@'),
+            "Display must not leak values: {rendered}"
+        );
         assert!(format!("{unique:?}").contains("UniqueViolation"));
 
         let bare = OrmError::UniqueViolation { constraint: None };
@@ -952,10 +985,7 @@ mod tests {
         // `std::error::Error` plumbing: sources surface, units carry none.
         let with_source = OrmError::Query {
             message: "m".to_owned(),
-            source: Some(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "boom",
-            ))),
+            source: Some(Box::new(std::io::Error::other("boom"))),
         };
         assert!(std::error::Error::source(&with_source).is_some());
         assert!(std::error::Error::source(&OrmError::NotFound).is_none());
