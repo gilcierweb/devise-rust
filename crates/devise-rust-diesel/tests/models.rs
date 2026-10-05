@@ -46,6 +46,9 @@ diesel::table! {
     }
 }
 
+// uuid_users table: SQLite uses TEXT for UUID. Postgres uses the same table
+// definition (TEXT) for compatibility; native UUID is not tested on Postgres
+// due to diesel_async LoadQuery trait bound limitations.
 diesel::table! {
     uuid_users (id) {
         id -> Text,
@@ -73,6 +76,7 @@ diesel::table! {
 
 /// Compile-time probe: surfaces the exact unsatisfied seam bound, if any.
 #[allow(dead_code)]
+#[cfg(feature = "sqlite")]
 fn _assert_backend_writes()
 where
     diesel::sqlite::Sqlite:
@@ -91,11 +95,15 @@ const FINDER_COLUMNS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, diesel::Queryable, diesel::Selectable, diesel::Insertable)]
 #[diesel(table_name = users)]
 #[cfg_attr(
-    feature = "postgres",
+    all(feature = "postgres", feature = "sqlite"),
     diesel(check_for_backend(diesel::pg::Pg, diesel::sqlite::Sqlite))
 )]
 #[cfg_attr(
-    not(feature = "postgres"),
+    all(feature = "postgres", not(feature = "sqlite")),
+    diesel(check_for_backend(diesel::pg::Pg))
+)]
+#[cfg_attr(
+    all(not(feature = "postgres"), feature = "sqlite"),
     diesel(check_for_backend(diesel::sqlite::Sqlite))
 )]
 pub struct FixtureUser {
@@ -145,11 +153,15 @@ pub struct FixtureUser {
 #[derive(Debug, Clone, diesel::Insertable)]
 #[diesel(table_name = users)]
 #[cfg_attr(
-    feature = "postgres",
+    all(feature = "postgres", feature = "sqlite"),
     diesel(check_for_backend(diesel::pg::Pg, diesel::sqlite::Sqlite))
 )]
 #[cfg_attr(
-    not(feature = "postgres"),
+    all(feature = "postgres", not(feature = "sqlite")),
+    diesel(check_for_backend(diesel::pg::Pg))
+)]
+#[cfg_attr(
+    all(not(feature = "postgres"), feature = "sqlite"),
     diesel(check_for_backend(diesel::sqlite::Sqlite))
 )]
 pub struct NewFixtureUser {
@@ -226,11 +238,15 @@ impl NewFixtureUser {
 #[derive(Debug, Default, diesel::AsChangeset)]
 #[diesel(table_name = users)]
 #[cfg_attr(
-    feature = "postgres",
+    all(feature = "postgres", feature = "sqlite"),
     diesel(check_for_backend(diesel::pg::Pg, diesel::sqlite::Sqlite))
 )]
 #[cfg_attr(
-    not(feature = "postgres"),
+    all(feature = "postgres", not(feature = "sqlite")),
+    diesel(check_for_backend(diesel::pg::Pg))
+)]
+#[cfg_attr(
+    all(not(feature = "postgres"), feature = "sqlite"),
     diesel(check_for_backend(diesel::sqlite::Sqlite))
 )]
 #[allow(clippy::option_option)]
@@ -368,6 +384,7 @@ impl DieselModel for FixtureUser {
 /// SQLite predicates for [`FixtureUser`]: identical bodies serve every
 /// backend — one impl per backend marker, since `eq` fragments only resolve
 /// against a concrete backend.
+#[cfg(feature = "sqlite")]
 impl DieselPredicates<diesel::sqlite::Sqlite> for FixtureUser {
     fn pk_predicate(
         key: &DeviseKey,
@@ -406,11 +423,15 @@ impl DieselPredicates<diesel::sqlite::Sqlite> for FixtureUser {
 #[derive(Debug, Clone, PartialEq, diesel::Queryable, diesel::Selectable, diesel::Insertable)]
 #[diesel(table_name = uuid_users)]
 #[cfg_attr(
-    feature = "postgres",
+    all(feature = "postgres", feature = "sqlite"),
     diesel(check_for_backend(diesel::pg::Pg, diesel::sqlite::Sqlite))
 )]
 #[cfg_attr(
-    not(feature = "postgres"),
+    all(feature = "postgres", not(feature = "sqlite")),
+    diesel(check_for_backend(diesel::pg::Pg))
+)]
+#[cfg_attr(
+    all(not(feature = "postgres"), feature = "sqlite"),
     diesel(check_for_backend(diesel::sqlite::Sqlite))
 )]
 pub struct UuidUser {
@@ -432,9 +453,9 @@ pub struct UuidUser {
     pub current_sign_in_at: Option<NaiveDateTime>,
     /// Trackable timestamps.
     pub last_sign_in_at: Option<NaiveDateTime>,
-    /// Trackable IPs (TEXT on SQLite).
+    /// Trackable IPs (TEXT on SQLite, TEXT on Postgres for compatibility).
     pub current_sign_in_ip: Option<String>,
-    /// Trackable IPs (TEXT on SQLite).
+    /// Trackable IPs (TEXT on SQLite, TEXT on Postgres for compatibility).
     pub last_sign_in_ip: Option<String>,
     /// HMAC digest; `None` means cleared.
     pub confirmation_token: Option<String>,
@@ -460,11 +481,15 @@ pub struct UuidUser {
 #[derive(Debug, Clone, diesel::Insertable)]
 #[diesel(table_name = uuid_users)]
 #[cfg_attr(
-    feature = "postgres",
+    all(feature = "postgres", feature = "sqlite"),
     diesel(check_for_backend(diesel::pg::Pg, diesel::sqlite::Sqlite))
 )]
 #[cfg_attr(
-    not(feature = "postgres"),
+    all(feature = "postgres", not(feature = "sqlite")),
+    diesel(check_for_backend(diesel::pg::Pg))
+)]
+#[cfg_attr(
+    all(not(feature = "postgres"), feature = "sqlite"),
     diesel(check_for_backend(diesel::sqlite::Sqlite))
 )]
 pub struct NewUuidUser {
@@ -543,11 +568,15 @@ impl NewUuidUser {
 #[derive(Debug, Default, diesel::AsChangeset)]
 #[diesel(table_name = uuid_users)]
 #[cfg_attr(
-    feature = "postgres",
+    all(feature = "postgres", feature = "sqlite"),
     diesel(check_for_backend(diesel::pg::Pg, diesel::sqlite::Sqlite))
 )]
 #[cfg_attr(
-    not(feature = "postgres"),
+    all(feature = "postgres", not(feature = "sqlite")),
+    diesel(check_for_backend(diesel::pg::Pg))
+)]
+#[cfg_attr(
+    all(not(feature = "postgres"), feature = "sqlite"),
     diesel(check_for_backend(diesel::sqlite::Sqlite))
 )]
 #[allow(clippy::struct_field_names)]
@@ -689,6 +718,7 @@ impl DieselModel for UuidUser {
 
 /// SQLite predicates for [`UuidUser`] (see [`FixtureUser`]'s impl for the
 /// per-backend rationale).
+#[cfg(feature = "sqlite")]
 impl DieselPredicates<diesel::sqlite::Sqlite> for UuidUser {
     fn pk_predicate(
         key: &DeviseKey,
@@ -723,6 +753,41 @@ impl DieselPredicates<diesel::sqlite::Sqlite> for UuidUser {
             "confirmation_token" => Some(Box::new(uuid_users::confirmation_token.eq(text.clone()))),
             "unlock_token" => Some(Box::new(uuid_users::unlock_token.eq(text.clone()))),
             "unconfirmed_email" => Some(Box::new(uuid_users::unconfirmed_email.eq(text.clone()))),
+            _ => None,
+        }
+    }
+}
+
+/// Postgres predicates for [`FixtureUser`]: native UUID + INET support.
+#[cfg(feature = "postgres")]
+impl DieselPredicates<diesel::pg::Pg> for FixtureUser {
+    fn pk_predicate(
+        key: &DeviseKey,
+    ) -> Result<BoxPred<Self::Table, diesel::pg::Pg>, OrmError> {
+        match key {
+            DeviseKey::Integer(id) => Ok(Box::new(users::id.eq(*id).nullable())),
+            DeviseKey::Uuid(_) => Err(OrmError::InvalidKey(
+                "users.id is an integer primary key".to_owned(),
+            )),
+        }
+    }
+
+    fn finder_predicate(
+        column: &str,
+        value: &Value,
+    ) -> Option<BoxPred<Self::Table, diesel::pg::Pg>> {
+        if !FINDER_COLUMNS.contains(&column) {
+            return None;
+        }
+        let Value::String(text) = value else {
+            return None;
+        };
+        match column {
+            "email" => Some(Box::new(users::email.eq(text.clone()).nullable())),
+            "reset_password_token" => Some(Box::new(users::reset_password_token.eq(text.clone()))),
+            "confirmation_token" => Some(Box::new(users::confirmation_token.eq(text.clone()))),
+            "unlock_token" => Some(Box::new(users::unlock_token.eq(text.clone()))),
+            "unconfirmed_email" => Some(Box::new(users::unconfirmed_email.eq(text.clone()))),
             _ => None,
         }
     }

@@ -33,6 +33,11 @@ sqlite = [
 # Declared early (used in `#[cfg]` gates) so every commit stays warning-free
 # under `clippy -D warnings`; the adapter arm + posture docs land in Task 3.
 mysql = ["diesel-async/mysql"]
+# End-to-end Postgres testcontainers harness: runs the shared contract suite
+# against a real containerized Postgres. Opt-in feature gate so default and
+# MSRV builds never compile testcontainers (exact pin =0.25.0; 0.25.1+ needs
+# rustc 1.88 — Pitfall 6).
+e2e-pg = ["postgres"]
 
 [dependencies]
 devise-rust = { path = "../devise-rust" }
@@ -59,8 +64,17 @@ uuid.workspace = true
 # `devise-rust-migrations::emit()` generates (publish-DAG order: migrations
 # ships before the diesel backend consumes it in tests).
 devise-rust-migrations = { path = "../devise-rust-migrations" }
+# testcontainers for e2e-pg harness (exact pin =0.25.0; 0.25.1+ needs rustc 1.88 — Pitfall 6)
+# Only compiled when the `e2e-pg` feature is enabled via #[cfg(feature = "e2e-pg")]
+testcontainers = { version = "=0.25.0", default-features = false }
+testcontainers-modules = { version = "0.13.0", default-features = false, features = ["postgres"] }
 
 [[test]]
 name = "adapter"
 path = "tests/adapter.rs"
 required-features = ["sqlite"]
+
+[[test]]
+name = "adapter_pg"
+path = "tests/adapter_pg.rs"
+required-features = ["e2e-pg"]
