@@ -1,0 +1,48 @@
+---
+source: crates/devise-rust-migrations/tests/snapshots.rs
+expression: "format!(\"{}\\n---\\n{}\", files.up_sql, files.down_sql)"
+---
+ALTER TABLE users ADD COLUMN email VARCHAR NOT NULL DEFAULT '';
+ALTER TABLE users ADD COLUMN encrypted_password VARCHAR NOT NULL DEFAULT '';
+ALTER TABLE users ADD COLUMN reset_password_token VARCHAR; -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
+ALTER TABLE users ADD COLUMN reset_password_sent_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN remember_created_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN sign_in_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN current_sign_in_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN last_sign_in_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN current_sign_in_ip INET;
+ALTER TABLE users ADD COLUMN last_sign_in_ip INET;
+ALTER TABLE users ADD COLUMN confirmation_token VARCHAR; -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
+ALTER TABLE users ADD COLUMN confirmed_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN confirmation_sent_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN unconfirmed_email VARCHAR;
+ALTER TABLE users ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN unlock_token VARCHAR; -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
+ALTER TABLE users ADD COLUMN locked_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN created_at TIMESTAMP NOT NULL;
+ALTER TABLE users ADD COLUMN updated_at TIMESTAMP NOT NULL;
+CREATE UNIQUE INDEX index_users_on_email ON users (email);
+CREATE UNIQUE INDEX index_users_on_reset_password_token ON users (reset_password_token);
+CREATE UNIQUE INDEX index_users_on_confirmation_token ON users (confirmation_token);
+CREATE UNIQUE INDEX index_users_on_unlock_token ON users (unlock_token);
+
+---
+ALTER TABLE users DROP COLUMN updated_at;
+ALTER TABLE users DROP COLUMN created_at;
+ALTER TABLE users DROP COLUMN locked_at;
+ALTER TABLE users DROP COLUMN unlock_token;
+ALTER TABLE users DROP COLUMN failed_attempts;
+ALTER TABLE users DROP COLUMN unconfirmed_email;
+ALTER TABLE users DROP COLUMN confirmation_sent_at;
+ALTER TABLE users DROP COLUMN confirmed_at;
+ALTER TABLE users DROP COLUMN confirmation_token;
+ALTER TABLE users DROP COLUMN last_sign_in_ip;
+ALTER TABLE users DROP COLUMN current_sign_in_ip;
+ALTER TABLE users DROP COLUMN last_sign_in_at;
+ALTER TABLE users DROP COLUMN current_sign_in_at;
+ALTER TABLE users DROP COLUMN sign_in_count;
+ALTER TABLE users DROP COLUMN remember_created_at;
+ALTER TABLE users DROP COLUMN reset_password_sent_at;
+ALTER TABLE users DROP COLUMN reset_password_token;
+ALTER TABLE users DROP COLUMN encrypted_password;
+ALTER TABLE users DROP COLUMN email;

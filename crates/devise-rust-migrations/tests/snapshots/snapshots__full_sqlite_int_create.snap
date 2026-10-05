@@ -1,0 +1,33 @@
+---
+source: crates/devise-rust-migrations/tests/snapshots.rs
+expression: "format!(\"{}\\n---\\n{}\", files.up_sql, files.down_sql)"
+---
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL DEFAULT '',
+  encrypted_password TEXT NOT NULL DEFAULT '',
+  reset_password_token TEXT -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  reset_password_sent_at DATETIME,
+  remember_created_at DATETIME,
+  sign_in_count INTEGER NOT NULL DEFAULT 0,
+  current_sign_in_at DATETIME,
+  last_sign_in_at DATETIME,
+  current_sign_in_ip TEXT,
+  last_sign_in_ip TEXT,
+  confirmation_token TEXT -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  confirmed_at DATETIME,
+  confirmation_sent_at DATETIME,
+  unconfirmed_email TEXT,
+  failed_attempts INTEGER NOT NULL DEFAULT 0,
+  unlock_token TEXT -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  locked_at DATETIME,
+  created_at DATETIME NOT NULL,
+  updated_at DATETIME NOT NULL
+);
+CREATE UNIQUE INDEX index_users_on_email ON users (email);
+CREATE UNIQUE INDEX index_users_on_reset_password_token ON users (reset_password_token);
+CREATE UNIQUE INDEX index_users_on_confirmation_token ON users (confirmation_token);
+CREATE UNIQUE INDEX index_users_on_unlock_token ON users (unlock_token);
+
+---
+DROP TABLE users;

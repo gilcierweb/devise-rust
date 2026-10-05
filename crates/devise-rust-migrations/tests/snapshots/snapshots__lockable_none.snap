@@ -1,0 +1,16 @@
+---
+source: crates/devise-rust-migrations/tests/snapshots.rs
+expression: "format!(\"{}\\n---\\n{}\", files.up_sql, files.down_sql)"
+---
+CREATE TABLE users (
+  id BIGSERIAL PRIMARY KEY,
+  email VARCHAR NOT NULL DEFAULT '',
+  encrypted_password VARCHAR NOT NULL DEFAULT '',
+  locked_at TIMESTAMP,
+  created_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+);
+CREATE UNIQUE INDEX index_users_on_email ON users (email);
+
+---
+DROP TABLE users;

@@ -6,8 +6,7 @@ use std::collections::BTreeSet;
 use rstest::rstest;
 
 use devise_rust_migrations::{
-    Dialect, EmitError, EmitOptions, Flow, LockStrategy, Module, PkKind, UnlockStrategy,
-    emit,
+    Dialect, EmitError, EmitOptions, Flow, LockStrategy, Module, PkKind, UnlockStrategy, emit,
 };
 
 /// Every D-10 devise column name the generator must emit verbatim.
@@ -202,11 +201,7 @@ fn matrix_full_create(#[case] dialect: Dialect, #[case] pk: PkKind) {
         }
     }
     // Digest-only comment on every token column.
-    for token_col in [
-        "reset_password_token",
-        "confirmation_token",
-        "unlock_token",
-    ] {
+    for token_col in ["reset_password_token", "confirmation_token", "unlock_token"] {
         assert!(
             files
                 .up_sql
@@ -268,7 +263,11 @@ fn matrix_existing_flow(#[case] dialect: Dialect) {
     assert_eq!(files.migration_name, "add_devise_to_users");
     assert!(!files.up_sql.contains("CREATE TABLE"));
     assert!(files.up_sql.contains("ALTER TABLE users ADD COLUMN"));
-    assert!(files.up_sql.contains("CREATE UNIQUE INDEX index_users_on_email"));
+    assert!(
+        files
+            .up_sql
+            .contains("CREATE UNIQUE INDEX index_users_on_email")
+    );
     for column in ALL_COLUMNS {
         assert!(
             files.up_sql.contains(&format!("ADD COLUMN {column}")),
@@ -309,7 +308,11 @@ fn lockable_none_strategies_emit_only_locked_at() {
     let files = emit(&opts).unwrap();
 
     assert!(files.up_sql.contains("locked_at"));
-    for absent in ["failed_attempts", "unlock_token", "index_users_on_unlock_token"] {
+    for absent in [
+        "failed_attempts",
+        "unlock_token",
+        "index_users_on_unlock_token",
+    ] {
         assert!(
             !files.up_sql.contains(absent),
             "lock-none up.sql must not contain {absent}"
@@ -341,7 +344,10 @@ fn reconfirmable_off_omits_unconfirmed_email() {
 fn remember_token_opt_in() {
     let without = full_options();
     assert!(
-        !emit(&without).unwrap().up_sql.contains("remember_token VARCHAR")
+        !emit(&without)
+            .unwrap()
+            .up_sql
+            .contains("remember_token VARCHAR")
             && !emit(&without)
                 .unwrap()
                 .up_sql
