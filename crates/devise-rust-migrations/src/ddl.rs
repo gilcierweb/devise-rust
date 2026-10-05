@@ -97,15 +97,6 @@ impl ColumnDef {
         }
     }
 
-    /// Rendered line for `CREATE TABLE` bodies (`<spec>[ -- comment]`).
-    fn create_line(&self) -> String {
-        if self.digest {
-            format!("{} {DIGEST_COMMENT}", self.spec)
-        } else {
-            self.spec.clone()
-        }
-    }
-
     /// Rendered `ADD COLUMN` statement (comment after the terminator).
     fn add_column_statement(&self, table: &str) -> String {
         let mut stmt = format!("ALTER TABLE {table} ADD COLUMN {};", self.spec);
@@ -315,14 +306,35 @@ pub(crate) fn index_statements(opts: &EmitOptions) -> Vec<String> {
 }
 
 /// `CREATE TABLE` statement for the create flow.
+///
+/// Digest notes render as their own `--` line AFTER the column's comma: a
+/// trailing `-- comment,` would swallow the separator into the comment and
+/// SQLite would silently merge the following column into the type name
+/// (columns vanish without an error). Commas therefore stay glued to the
+/// spec; comment lines never carry one.
 pub(crate) fn create_table(opts: &EmitOptions, columns: &[ColumnDef]) -> String {
     let table = opts.table.as_str();
     let mut sql = format!("CREATE TABLE {table} (\n");
-    sql.push_str("  ");
-    sql.push_str(&pk_line(opts.dialect, opts.pk));
+    // Body lines: a digest note follows its column on its own line, and the
+    // separator comma stays glued to the spec — never inside the `--`
+    // comment (where SQLite would swallow it and silently merge the next
+    // column into the type name).
+    let mut lines = vec![(format!("  {}", pk_line(opts.dialect, opts.pk)), true)];
     for col in columns {
-        sql.push_str(",\n  ");
-        sql.push_str(&col.create_line());
+        lines.push((format!("  {}", col.spec), true));
+        if col.digest {
+            lines.push((format!("  {DIGEST_COMMENT}"), false));
+        }
+    }
+    let last = lines.len() - 1;
+    for (index, (line, is_spec)) in lines.iter().enumerate() {
+        if index > 0 {
+            sql.push('\n');
+        }
+        sql.push_str(line);
+        if *is_spec && index < last {
+            sql.push(',');
+        }
     }
     sql.push_str("\n);");
     sql

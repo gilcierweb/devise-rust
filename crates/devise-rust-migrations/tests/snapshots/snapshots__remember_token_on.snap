@@ -6,21 +6,25 @@ CREATE TABLE users (
   id BIGSERIAL PRIMARY KEY,
   email VARCHAR NOT NULL DEFAULT '',
   encrypted_password VARCHAR NOT NULL DEFAULT '',
-  reset_password_token VARCHAR -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  reset_password_token VARCHAR,
+  -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
   reset_password_sent_at TIMESTAMP,
   remember_created_at TIMESTAMP,
-  remember_token VARCHAR -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  remember_token VARCHAR,
+  -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
   sign_in_count INTEGER NOT NULL DEFAULT 0,
   current_sign_in_at TIMESTAMP,
   last_sign_in_at TIMESTAMP,
   current_sign_in_ip INET,
   last_sign_in_ip INET,
-  confirmation_token VARCHAR -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  confirmation_token VARCHAR,
+  -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
   confirmed_at TIMESTAMP,
   confirmation_sent_at TIMESTAMP,
   unconfirmed_email VARCHAR,
   failed_attempts INTEGER NOT NULL DEFAULT 0,
-  unlock_token VARCHAR -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  unlock_token VARCHAR,
+  -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
   locked_at TIMESTAMP,
   created_at TIMESTAMP NOT NULL,
   updated_at TIMESTAMP NOT NULL

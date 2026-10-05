@@ -8,10 +8,59 @@ authors.workspace = true
 description = "Diesel ORM adapter for devise-rust"
 repository.workspace = true
 homepage.workspace = true
+# Only the contract suite is an integration target; `tests/models.rs` is a
+# shared support module, never a target on its own.
+autotests = false
 
 [lints]
 workspace = true
 
+[features]
+default = []
+# Async postgres backend over `AsyncPgConnection` (compiled; execution lands
+# in 02-04's testcontainers leg). `deadpool` is diesel-async's first-party
+# pool integration (deadpool ^0.12 arrives transitively).
+postgres = ["diesel-async/postgres", "diesel-async/deadpool"]
+# Async sqlite backend over `SyncConnectionWrapper<SqliteConnection>`.
+# `returning_clauses_for_sqlite_3_35` is REQUIRED: `create`/`update` use
+# `get_result()` (RETURNING), which sqlite only supports behind this flag.
+sqlite = [
+    "diesel-async/sqlite",
+    "diesel/returning_clauses_for_sqlite_3_35",
+    "diesel-async/deadpool",
+    "dep:libsqlite3-sys",
+]
+# Declared early (used in `#[cfg]` gates) so every commit stays warning-free
+# under `clippy -D warnings`; the adapter arm + posture docs land in Task 3.
+mysql = ["diesel-async/mysql"]
+
 [dependencies]
 devise-rust = { path = "../devise-rust" }
-# Phase 6 adds: diesel, diesel-async (see .planning/ROADMAP.md)
+diesel.workspace = true
+diesel-async.workspace = true
+async-trait.workspace = true
+# Only for `serde::de::Error::custom` in the ChangeSet bridge: writing
+# `Value::Null` into a NOT NULL column surfaces as `OrmError::Serialization`.
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+# Hermetic SQLite engine: this environment (and possibly contributors')
+# ships only the sqlite runtime without linkable dev files, so the `sqlite`
+# feature builds from bundled C sources instead of `-lsqlite3`.
+libsqlite3-sys = { version = "0.35", features = ["bundled"], optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+rstest.workspace = true
+pretty_assertions.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+# DDL bootstrap for the sqlite rig: the fixture schema is the DDL that
+# `devise-rust-migrations::emit()` generates (publish-DAG order: migrations
+# ships before the diesel backend consumes it in tests).
+devise-rust-migrations = { path = "../devise-rust-migrations" }
+
+[[test]]
+name = "adapter"
+path = "tests/adapter.rs"
+required-features = ["sqlite"]

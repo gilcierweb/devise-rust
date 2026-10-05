@@ -6,7 +6,8 @@ CREATE TABLE users (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   email VARCHAR(255) NOT NULL DEFAULT '',
   encrypted_password VARCHAR(255) NOT NULL DEFAULT '',
-  reset_password_token VARCHAR(255) -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  reset_password_token VARCHAR(255),
+  -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
   reset_password_sent_at DATETIME,
   remember_created_at DATETIME,
   sign_in_count INT NOT NULL DEFAULT 0,
@@ -14,12 +15,14 @@ CREATE TABLE users (
   last_sign_in_at DATETIME,
   current_sign_in_ip VARCHAR(39),
   last_sign_in_ip VARCHAR(39),
-  confirmation_token VARCHAR(255) -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  confirmation_token VARCHAR(255),
+  -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
   confirmed_at DATETIME,
   confirmation_sent_at DATETIME,
   unconfirmed_email VARCHAR(255),
   failed_attempts INT NOT NULL DEFAULT 0,
-  unlock_token VARCHAR(255) -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  unlock_token VARCHAR(255),
+  -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
   locked_at DATETIME,
   created_at DATETIME NOT NULL,
   updated_at DATETIME NOT NULL

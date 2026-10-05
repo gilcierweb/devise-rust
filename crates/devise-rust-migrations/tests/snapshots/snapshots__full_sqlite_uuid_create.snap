@@ -6,7 +6,8 @@ CREATE TABLE users (
   id TEXT PRIMARY KEY,
   email TEXT NOT NULL DEFAULT '',
   encrypted_password TEXT NOT NULL DEFAULT '',
-  reset_password_token TEXT -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  reset_password_token TEXT,
+  -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
   reset_password_sent_at DATETIME,
   remember_created_at DATETIME,
   sign_in_count INTEGER NOT NULL DEFAULT 0,
@@ -14,12 +15,14 @@ CREATE TABLE users (
   last_sign_in_at DATETIME,
   current_sign_in_ip TEXT,
   last_sign_in_ip TEXT,
-  confirmation_token TEXT -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  confirmation_token TEXT,
+  -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
   confirmed_at DATETIME,
   confirmation_sent_at DATETIME,
   unconfirmed_email TEXT,
   failed_attempts INTEGER NOT NULL DEFAULT 0,
-  unlock_token TEXT -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity),
+  unlock_token TEXT,
+  -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
   locked_at DATETIME,
   created_at DATETIME NOT NULL,
   updated_at DATETIME NOT NULL
