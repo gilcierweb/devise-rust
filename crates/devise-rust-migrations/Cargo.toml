@@ -1,0 +1,23 @@
+[package]
+name = "devise-rust-migrations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Devise-parity migration generator for devise-rust (ORM-agnostic DDL)"
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# Used only by the `devise-migrations` binary for default timestamps;
+# the `emit()` library itself stays IO- and clock-free.
+chrono.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+rstest.workspace = true
