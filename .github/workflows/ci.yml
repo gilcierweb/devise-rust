@@ -32,6 +32,9 @@ jobs:
           components: clippy
       - name: Check clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      # MySQL posture: the `mysql` feature compiles on stable (clippy --all-features)
+      # but is excluded from MSRV and CI execution because mysql_async declares no
+      # rust_version (assumption A1). MySQL templates ship as CI-pending (D-16).
 
   test:
     name: Test
@@ -41,6 +44,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run tests
         run: cargo test --all
+
+  test-postgres:
+    name: Test Postgres (e2e)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run Postgres e2e tests
+        run: cargo test -p devise-rust-diesel --features e2e-pg
 
   test-msrv:
     name: Test MSRV (1.85)
