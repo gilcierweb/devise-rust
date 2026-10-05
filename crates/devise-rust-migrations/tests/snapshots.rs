@@ -419,10 +419,8 @@ fn cli_binary() -> String {
 }
 
 fn cli_tempdir(suffix: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "devise_migrations_{suffix}_{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("devise_migrations_{suffix}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
