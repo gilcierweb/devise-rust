@@ -300,6 +300,123 @@ pub trait DatabaseAuthenticatable: Authenticatable {
     }
 }
 
+// ============================================================================
+// Validatable (VAL-01, VAL-02)
+// Mirrors devise/lib/devise/models/validatable.rb
+// ============================================================================
+
+/// `Validatable` module: email and password validations. Validation lives on
+/// the model and runs against [`DeviseConfig`] (`email_regexp`,
+/// `password_length`); uniqueness additionally needs the adapter.
+///
+/// == Options
+///
+/// * `email_regexp` - format for the email attribute (Devise default
+///   `\\A[^@\\s]+@[^@\\s]+\\z`)
+/// * `password_length` - allowed password length (Devise default `6..128`,
+///   bounds inclusive as in Ruby)
+///
+/// == Examples
+///
+/// ```ignore
+/// let errors = user.validate(&config);
+/// assert!(errors.is_empty());
+/// ```
+#[async_trait]
+pub trait Validatable: DatabaseAuthenticatable {
+    /// The record's email for validation (None until set).
+    fn email_value(&self) -> Option<&str>;
+
+    /// `password_required?`: true for new records OR when password/
+    /// confirmation is present (VAL-password-cond locked decision).
+    fn password_required(&self) -> bool {
+        !self.persisted() || self.password().is_some() || self.password_confirmation().is_some()
+    }
+
+    /// `email_required?`: true by default; models may override.
+    fn email_required(&self) -> bool {
+        true
+    }
+
+    /// The record's primary key as a string, for excluding self from the
+    /// uniqueness check on persisted records.
+    fn uniqueness_scope_id(&self) -> Option<String> {
+        None
+    }
+
+    /// Match `email` against the configured `email_regexp` (Devise default
+    /// `\\A[^@\\s]+@[^@\\s]+\\z`; `\\A`/`\\z` anchors translated for the
+    /// `regex` crate).
+    fn email_format_valid(email: &str, config: &DeviseConfig) -> bool {
+        let pattern = config.email_regexp.replace(r"\A", "^").replace(r"\z", "$");
+        regex::Regex::new(&pattern).is_ok_and(|re| re.is_match(email))
+    }
+
+    /// Run the full Validatable validation set, returning Devise-keyed errors
+    /// (`:blank`, `:invalid`, `:confirmation`, `:too_short`, `:too_long`).
+    ///
+    /// Uniqueness is NOT checked here (needs the adapter) - see
+    /// [`validate_email_uniqueness`](Self::validate_email_uniqueness).
+    fn validate(&self, config: &DeviseConfig) -> ValidationErrors {
+        let mut errors = ValidationErrors::new();
+
+        if self.email_required() {
+            match self.email_value() {
+                Some(email) if !email.is_empty() => {
+                    if !Self::email_format_valid(email, config) {
+                        errors.add("email", ":invalid");
+                    }
+                }
+                _ => errors.add("email", ":blank"),
+            }
+        }
+
+        if self.password_required() {
+            match self.password() {
+                Some(password) if !password.is_empty() => {
+                    if let Some(confirmation) = self.password_confirmation() {
+                        if confirmation != password {
+                            errors.add("password_confirmation", ":confirmation");
+                        }
+                    }
+                    // `password_length` mirrors Ruby's inclusive `..` range.
+                    let length = password.len();
+                    if length < config.password_length.start {
+                        errors.add("password", ":too_short");
+                    } else if length > config.password_length.end {
+                        errors.add("password", ":too_long");
+                    }
+                }
+                _ => errors.add("password", ":blank"),
+            }
+        }
+
+        errors
+    }
+
+    /// Devise `validates_uniqueness_of :email, case_sensitive: true` (VAL-01):
+    /// the email was already downcased/stripped by `before_validation`
+    /// (normalize hooks), so the lookup uses the value as stored - no
+    /// second normalization here (that would diverge from the DB check).
+    async fn validate_email_uniqueness<A>(&self, adapter: &A, errors: &mut ValidationErrors)
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+    {
+        let Some(email) = self.email_value().filter(|e| !e.is_empty()) else {
+            return;
+        };
+        let mut conditions = Conditions::new();
+        conditions.insert("email", Value::String(email.to_string()));
+        if let Ok(Some(existing)) = adapter.find_first(&conditions).await {
+            let existing_id = existing.uniqueness_scope_id();
+            if existing_id.is_none() || existing_id != self.uniqueness_scope_id() {
+                errors.add("email", ":taken");
+            }
+        }
+    }
+}
+
 /// `Authenticatable` base trait - mirrors Devise's `Authenticatable` module.
 ///
 /// All Devise models implement this trait. Static finders are generic over
@@ -658,6 +775,17 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Validatable for TestUser {
+        fn email_value(&self) -> Option<&str> {
+            Some(&self.email)
+        }
+
+        fn uniqueness_scope_id(&self) -> Option<String> {
+            self.persisted().then(|| self.id.to_string())
+        }
+    }
+
     fn test_config() -> DeviseConfig {
         DeviseConfig {
             stretches: 4,
@@ -986,6 +1114,122 @@ mod tests {
             DatabaseAuthenticatable::email_notification_recipient(&user, &steady, &config)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn validatable_tests() {
+        let config = test_config();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        adapter
+            .create(TestUser::testing("secret123", &config))
+            .await
+            .unwrap();
+
+        // New record: password required; blank email/password flagged.
+        let blank = TestUser::default();
+        assert!(Validatable::password_required(&blank));
+        let errors = Validatable::validate(&blank, &config);
+        assert_eq!(
+            errors.get("email").map(Vec::as_slice),
+            Some(&[":blank".to_string()][..])
+        );
+        assert_eq!(
+            errors.get("password").map(Vec::as_slice),
+            Some(&[":blank".to_string()][..])
+        );
+
+        // Format via email_regexp (Devise default \A[^@\s]+@[^@\s]+\z).
+        for bad in ["not-an-email", "missing@", "@example.com", "a b@c.com"] {
+            let user = TestUser {
+                email: bad.to_string(),
+                password: Some("secret123".to_string()),
+                ..TestUser::default()
+            };
+            let errors = Validatable::validate(&user, &config);
+            assert_eq!(
+                errors.get("email").map(Vec::as_slice),
+                Some(&[":invalid".to_string()][..]),
+                "{bad} should be :invalid"
+            );
+        }
+
+        // Confirmation mismatch and length bounds (6..128 inclusive, Ruby range).
+        let mut mismatch = TestUser::default();
+        mismatch.email = "fresh@example.com".to_string();
+        mismatch.set_password(Some("secret123".to_string()), &config);
+        mismatch.set_password_confirmation(Some("different".to_string()));
+        let errors = Validatable::validate(&mismatch, &config);
+        assert_eq!(
+            errors.get("password_confirmation").map(Vec::as_slice),
+            Some(&[":confirmation".to_string()][..])
+        );
+
+        let mut short = TestUser::default();
+        short.email = "fresh@example.com".to_string();
+        short.set_password_virtual(Some("12345".to_string()));
+        let errors = Validatable::validate(&short, &config);
+        assert_eq!(
+            errors.get("password").map(Vec::as_slice),
+            Some(&[":too_short".to_string()][..])
+        );
+
+        let mut long = TestUser::default();
+        long.email = "fresh@example.com".to_string();
+        long.set_password_virtual(Some("x".repeat(129)));
+        let errors = Validatable::validate(&long, &config);
+        assert_eq!(
+            errors.get("password").map(Vec::as_slice),
+            Some(&[":too_long".to_string()][..])
+        );
+
+        // 6 and 128 are valid bounds (Ruby inclusive range parity).
+        for len in [6usize, 128] {
+            let mut user = TestUser::default();
+            user.email = "bounds@example.com".to_string();
+            user.set_password_virtual(Some("x".repeat(len)));
+            let errors = Validatable::validate(&user, &config);
+            assert!(errors.is_empty(), "length {len} should pass: {errors:?}");
+        }
+
+        // Persisted record with no password fields: password not required.
+        let persisted = TestUser::testing("secret123", &config);
+        assert!(!Validatable::password_required(&persisted));
+
+        // Uniqueness: another record with the same email (case-sensitive at DB).
+        let dupe = TestUser {
+            email: "test@example.com".to_string(),
+            password: Some("secret123".to_string()),
+            ..TestUser::default()
+        };
+        let mut errors = Validatable::validate(&dupe, &config);
+        Validatable::validate_email_uniqueness(&dupe, &adapter, &mut errors).await;
+        assert_eq!(
+            errors.get("email").map(Vec::as_slice),
+            Some(&[":taken".to_string()][..])
+        );
+
+        // Same record updating itself: not a uniqueness violation.
+        let mut self_update = TestUser::testing("secret123", &config);
+        self_update.email = "self@example.com".to_string();
+        adapter
+            .update(
+                &DeviseKey::from_i64(1),
+                &crate::adapter::ChangeSet::new(
+                    std::collections::HashMap::from([(
+                        "email".to_string(),
+                        crate::adapter::Value::String("test@example.com".to_string()),
+                    )]),
+                    std::collections::HashMap::from([(
+                        "email".to_string(),
+                        crate::adapter::Value::String("self@example.com".to_string()),
+                    )]),
+                ),
+            )
+            .await
+            .unwrap();
+        let mut errors = ValidationErrors::new();
+        Validatable::validate_email_uniqueness(&self_update, &adapter, &mut errors).await;
+        assert!(errors.is_empty(), "self-update must not be :taken");
     }
 
     #[test]
