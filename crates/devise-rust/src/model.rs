@@ -74,6 +74,83 @@ pub trait PasswordVerifiable: AnyDeviseModel {
     fn valid_password(&self, password: &str, config: &DeviseConfig) -> bool;
 }
 
+// ============================================================================
+// DatabaseAuthenticatable (DBAU-01..10)
+// Mirrors devise/lib/devise/models/database_authenticatable.rb
+// ============================================================================
+
+/// `DatabaseAuthenticatable` module - password handling over
+/// `encrypted_password` with virtual `password`/`password_confirmation`.
+///
+/// == Options
+///
+/// * `pepper` - appended to the password before bcrypt hashing
+/// * `stretches` - bcrypt cost factor (default 12)
+/// * `send_email_changed_notification` - email the ORIGINAL address on email change
+/// * `send_password_change_notification` - email on password change
+///
+/// == Examples
+///
+/// ```ignore
+/// user.set_password(Some("secret123".to_string()), &config);
+/// assert!(user.valid_password("secret123", &config));
+/// assert!(!user.valid_password("wrong", &config));
+/// ```
+#[async_trait]
+pub trait DatabaseAuthenticatable: Authenticatable {
+    /// Stored `encrypted_password` column value (None before first set).
+    fn encrypted_password(&self) -> Option<&str>;
+    /// Set the `encrypted_password` column (already hashed value).
+    fn set_encrypted_password(&mut self, value: Option<String>);
+    /// Virtual `password` attribute (never persisted).
+    fn password(&self) -> Option<&str>;
+    /// Store the virtual `password` value as-is (no hashing).
+    fn set_password_virtual(&mut self, password: Option<String>);
+    /// Virtual `password_confirmation` attribute.
+    fn password_confirmation(&self) -> Option<&str>;
+    /// Store the virtual `password_confirmation` value.
+    fn set_password_confirmation(&mut self, value: Option<String>);
+    /// Whether the record is persisted (Devise `persisted?`).
+    fn persisted(&self) -> bool;
+    /// Devise `assign_attributes` - model-defined mapping of raw params onto
+    /// fields. Implementations must ignore `password`/`password_confirmation`/
+    /// `current_password` keys (password assignment goes through
+    /// [`set_password`](Self::set_password) which carries the config).
+    fn assign_attributes(&mut self, attrs: &serde_json::Map<String, JsonValue>);
+
+    /// `password=` setter (DBAU-01): encrypts via `Encryptor::digest`
+    /// (stretches, pepper) and stores to `encrypted_password` ONLY when the
+    /// password is present (Devise `password.present?` - None or empty skips).
+    fn set_password(&mut self, password: Option<String>, config: &DeviseConfig) {
+        if let Some(plain) = password.as_deref().filter(|p| !p.is_empty()) {
+            let digest = crate::crypto::encryptor::digest(plain, config);
+            self.set_encrypted_password(Some(digest));
+        }
+        self.set_password_virtual(password);
+    }
+
+    /// `valid_password?(password)` (DBAU-02): bcrypt verify via
+    /// `Encryptor::compare` (constant-time). False when `encrypted_password`
+    /// is blank (matches Devise).
+    fn valid_password(&self, password: &str, config: &DeviseConfig) -> bool {
+        match self.encrypted_password() {
+            Some(hash) if !hash.is_empty() => {
+                crate::crypto::encryptor::compare(password, hash, config)
+            }
+            _ => false,
+        }
+    }
+
+    /// `authenticatable_salt` (DBAU-06): `encrypted_password[0,29]` - changing
+    /// the password invalidates existing sessions. Wire the model's
+    /// `AnyDeviseModel::authenticatable_salt` to this default.
+    fn database_authenticatable_salt(&self) -> Option<String> {
+        self.encrypted_password()
+            .filter(|p| !p.is_empty())
+            .and_then(|p| p.get(..29).map(str::to_string))
+    }
+}
+
 /// `Authenticatable` base trait - mirrors Devise's `Authenticatable` module.
 ///
 /// All Devise models implement this trait. Static finders are generic over
@@ -313,6 +390,14 @@ mod tests {
         id: i64,
         email: String,
         encrypted_password: String,
+        #[serde(skip)]
+        password: Option<String>,
+        #[serde(skip)]
+        password_confirmation: Option<String>,
+        #[serde(skip)]
+        skip_email_notification: bool,
+        #[serde(skip)]
+        skip_password_notification: bool,
     }
 
     impl TestUser {
@@ -321,6 +406,10 @@ mod tests {
                 id: 1,
                 email: "test@example.com".to_string(),
                 encrypted_password: crate::crypto::encryptor::digest(password, config),
+                password: None,
+                password_confirmation: None,
+                skip_email_notification: false,
+                skip_password_notification: false,
             }
         }
     }
@@ -352,6 +441,55 @@ mod tests {
     impl Authenticatable for TestUser {
         fn serializable_hash(&self) -> JsonValue {
             serde_json::json!({ "id": self.id, "email": self.email })
+        }
+    }
+
+    impl crate::mailer::HasEmail for TestUser {
+        fn email(&self) -> &str {
+            &self.email
+        }
+    }
+
+    #[async_trait]
+    impl DatabaseAuthenticatable for TestUser {
+        fn encrypted_password(&self) -> Option<&str> {
+            if self.encrypted_password.is_empty() {
+                None
+            } else {
+                Some(&self.encrypted_password)
+            }
+        }
+
+        fn set_encrypted_password(&mut self, value: Option<String>) {
+            self.encrypted_password = value.unwrap_or_default();
+        }
+
+        fn password(&self) -> Option<&str> {
+            self.password.as_deref()
+        }
+
+        fn set_password_virtual(&mut self, password: Option<String>) {
+            self.password = password;
+        }
+
+        fn password_confirmation(&self) -> Option<&str> {
+            self.password_confirmation.as_deref()
+        }
+
+        fn set_password_confirmation(&mut self, value: Option<String>) {
+            self.password_confirmation = value;
+        }
+
+        fn persisted(&self) -> bool {
+            self.id != 0
+        }
+
+        fn assign_attributes(&mut self, attrs: &serde_json::Map<String, JsonValue>) {
+            // Password keys are virtual and hashed by set_password (config
+            // needed), so assign_attributes deliberately skips them.
+            if let Some(JsonValue::String(email)) = attrs.get("email") {
+                self.email = email.clone();
+            }
         }
     }
 
@@ -443,6 +581,50 @@ mod tests {
         let hash = user.serializable_hash();
         assert!(hash.get("email").is_some());
         assert!(hash.get("encrypted_password").is_none());
+    }
+
+    #[test]
+    fn database_authenticatable_tracer() {
+        let config = test_config();
+        let mut user = TestUser {
+            id: 1,
+            email: "tracer@example.com".to_string(),
+            ..TestUser::default()
+        };
+
+        // password= encrypts via Encryptor and stores to encrypted_password.
+        DatabaseAuthenticatable::set_password(&mut user, Some("secret123".to_string()), &config);
+        let encrypted = user.encrypted_password.clone();
+        assert!(encrypted.starts_with("$2"), "bcrypt hash: {encrypted}");
+        assert!(!encrypted.contains("secret123"));
+
+        // valid_password verifies with the constant-time compare.
+        assert!(DatabaseAuthenticatable::valid_password(
+            &user,
+            "secret123",
+            &config
+        ));
+        assert!(!DatabaseAuthenticatable::valid_password(
+            &user, "wrong", &config
+        ));
+
+        // authenticatable_salt = encrypted_password[0,29].
+        let salt = DatabaseAuthenticatable::database_authenticatable_salt(&user)
+            .expect("salt for encrypted record");
+        assert_eq!(salt, encrypted[..29]);
+        assert_eq!(salt.len(), 29);
+
+        // Blank password leaves encrypted_password untouched (present? semantics).
+        DatabaseAuthenticatable::set_password(&mut user, Some(String::new()), &config);
+        assert_eq!(user.encrypted_password, encrypted);
+        DatabaseAuthenticatable::set_password(&mut user, None, &config);
+        assert_eq!(user.encrypted_password, encrypted);
+
+        // valid_password is false for a blank encrypted_password (Devise parity).
+        let new_user = TestUser::default();
+        assert!(!DatabaseAuthenticatable::valid_password(
+            &new_user, "anything", &config
+        ));
     }
 
     #[test]
