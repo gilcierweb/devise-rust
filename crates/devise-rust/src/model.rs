@@ -149,6 +149,152 @@ pub trait DatabaseAuthenticatable: Authenticatable {
             .filter(|p| !p.is_empty())
             .and_then(|p| p.get(..29).map(str::to_string))
     }
+
+    /// `clean_up_passwords` (DBAU-utils): clears the virtual password fields
+    /// after save so they cannot leak into serialization. Devise
+    /// `clean_up_passwords`.
+    fn clean_up_passwords(&mut self) {
+        self.set_password_virtual(None);
+        self.set_password_confirmation(None);
+    }
+
+    /// Whether the email-change notification is suppressed
+    /// (Devise `skip_email_changed_notification!` flag state).
+    fn skips_email_changed_notification(&self) -> bool {
+        false
+    }
+
+    /// Whether the password-change notification is suppressed
+    /// (Devise `skip_password_change_notification!` flag state).
+    fn skips_password_change_notification(&self) -> bool {
+        false
+    }
+
+    /// Devise `skip_email_changed_notification!`: suppress the notification
+    /// for the current in-flight update.
+    fn skip_email_changed_notification(&mut self) {}
+
+    /// Devise `skip_password_change_notification!`: suppress the notification
+    /// for the current in-flight update.
+    fn skip_password_change_notification(&mut self) {}
+
+    /// `update_with_password(params)` (DBAU-03): requires the current password,
+    /// strips blank password fields (so an untouched password is never reset),
+    /// applies the remaining attributes. Returns the `:current_password :invalid`
+    /// error after applying attrs (Devise re-renders the form with the edits).
+    fn update_with_password(
+        &mut self,
+        params: &mut serde_json::Map<String, JsonValue>,
+        config: &DeviseConfig,
+    ) -> Result<(), ValidationErrors> {
+        let current = params
+            .remove("current_password")
+            .and_then(|v| v.as_str().map(str::to_string));
+        if params
+            .get("password")
+            .is_none_or(|p| p.as_str().is_none_or(str::is_empty))
+        {
+            params.remove("password");
+            params.remove("password_confirmation");
+        }
+
+        let allowed = current
+            .as_deref()
+            .is_some_and(|pw| self.valid_password(pw, config));
+        self.assign_attributes(params);
+        let mut errors = ValidationErrors::new();
+        if !allowed {
+            errors.add("current_password", ":invalid");
+        }
+        self.clean_up_passwords();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// `update_without_password(params)` (DBAU-04): never touches password
+    /// fields - strips all three keys and applies the rest.
+    fn update_without_password(&mut self, params: &mut serde_json::Map<String, JsonValue>) {
+        params.remove("password");
+        params.remove("password_confirmation");
+        params.remove("current_password");
+        self.assign_attributes(params);
+        self.clean_up_passwords();
+    }
+
+    /// `destroy_with_password(current_password)` (DBAU-05): destroys the
+    /// record only when the supplied password is valid; returns whether the
+    /// record was destroyed (Devise: `valid_password? && destroy`).
+    async fn destroy_with_password<A>(
+        &self,
+        current_password: &str,
+        adapter: &A,
+        config: &DeviseConfig,
+    ) -> Result<bool, crate::adapter::OrmError>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+    {
+        if !self.valid_password(current_password, config) {
+            return Ok(false);
+        }
+        adapter.delete(&self.to_key()).await?;
+        Ok(true)
+    }
+
+    /// `after_database_authentication` hook (DBAU-07): documented no-op
+    /// extension point, called by the strategy after successful password auth.
+    fn after_database_authentication(&self) {}
+
+    /// Email-change notification recipient (DBAU-08): the ORIGINAL email from
+    /// the ChangeSet's previous value. `None` when the notification is
+    /// disabled, skipped, or no email change occurred.
+    fn email_notification_recipient(
+        &self,
+        changes: &crate::adapter::ChangeSet,
+        config: &DeviseConfig,
+    ) -> Option<String> {
+        if !config.send_email_changed_notification || self.skips_email_changed_notification() {
+            return None;
+        }
+        if !changes.has_changed("email") {
+            return None;
+        }
+        match changes.previous_value("email") {
+            Some(crate::adapter::Value::String(email)) if !email.is_empty() => Some(email.clone()),
+            _ => None,
+        }
+    }
+
+    /// Password-change notification decision (DBAU-09): pending when enabled,
+    /// not skipped, and `encrypted_password` changed. Recipient is the record's
+    /// current email (the new address wins for password changes).
+    fn password_change_notification_pending(
+        &self,
+        changes: &crate::adapter::ChangeSet,
+        config: &DeviseConfig,
+    ) -> bool {
+        config.send_password_change_notification
+            && !self.skips_password_change_notification()
+            && changes.has_changed("encrypted_password")
+    }
+
+    /// `find_for_database_authentication(conditions)` (DBAU-10): the strategy
+    /// entry point - conditions arrive already filtered/normalized by the
+    /// parameter layer (DBAU-strategy locked decision).
+    async fn find_for_database_authentication<A>(
+        conditions: &Conditions,
+        adapter: &A,
+        config: &DeviseConfig,
+    ) -> Option<Self>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+    {
+        Self::find_for_authentication(conditions, adapter, config).await
+    }
 }
 
 /// `Authenticatable` base trait - mirrors Devise's `Authenticatable` module.
@@ -491,6 +637,22 @@ mod tests {
                 self.email = email.clone();
             }
         }
+
+        fn skips_email_changed_notification(&self) -> bool {
+            self.skip_email_notification
+        }
+
+        fn skips_password_change_notification(&self) -> bool {
+            self.skip_password_notification
+        }
+
+        fn skip_email_changed_notification(&mut self) {
+            self.skip_email_notification = true;
+        }
+
+        fn skip_password_change_notification(&mut self) {
+            self.skip_password_notification = true;
+        }
     }
 
     fn test_config() -> DeviseConfig {
@@ -625,6 +787,191 @@ mod tests {
         assert!(!DatabaseAuthenticatable::valid_password(
             &new_user, "anything", &config
         ));
+    }
+
+    #[tokio::test]
+    async fn database_authenticatable_methods() {
+        use std::collections::HashMap;
+
+        let config = DeviseConfig {
+            stretches: 4,
+            send_email_changed_notification: true,
+            send_password_change_notification: true,
+            ..DeviseConfig::default()
+        };
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let user = TestUser::testing("secret123", &config);
+        adapter.create(user.clone()).await.unwrap();
+
+        // clean_up_passwords clears the virtual fields.
+        let mut cleaned = user.clone();
+        cleaned.password = Some("x".to_string());
+        cleaned.password_confirmation = Some("x".to_string());
+        DatabaseAuthenticatable::clean_up_passwords(&mut cleaned);
+        assert_eq!(
+            (cleaned.password(), cleaned.password_confirmation()),
+            (None, None)
+        );
+
+        // update_with_password: valid current_password applies attrs (DBAU-03).
+        let mut ok_user = user.clone();
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "current_password".to_string(),
+            JsonValue::String("secret123".to_string()),
+        );
+        params.insert(
+            "email".to_string(),
+            JsonValue::String("new@example.com".to_string()),
+        );
+        DatabaseAuthenticatable::update_with_password(&mut ok_user, &mut params, &config)
+            .expect("valid current password");
+        assert_eq!(ok_user.email, "new@example.com");
+
+        // update_with_password: wrong current_password keeps attrs applied to
+        // the in-memory record (Devise re-render semantics) and returns
+        // :current_password :invalid. Virtual fields cleared afterward.
+        let mut bad_user = user.clone();
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "current_password".to_string(),
+            JsonValue::String("wrong".to_string()),
+        );
+        params.insert(
+            "email".to_string(),
+            JsonValue::String("nope@example.com".to_string()),
+        );
+        params.insert("password".to_string(), JsonValue::String(String::new()));
+        params.insert(
+            "password_confirmation".to_string(),
+            JsonValue::String(String::new()),
+        );
+        let err =
+            DatabaseAuthenticatable::update_with_password(&mut bad_user, &mut params, &config)
+                .expect_err("wrong current password");
+        assert_eq!(
+            err.get("current_password").map(Vec::as_slice),
+            Some(&[":invalid".to_string()][..])
+        );
+        assert!(!params.contains_key("password"), "blank password stripped");
+
+        // update_without_password never touches password keys (DBAU-04).
+        let mut plain = user.clone();
+        let encrypted_before = plain.encrypted_password.clone();
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("hacked123".to_string()),
+        );
+        params.insert(
+            "email".to_string(),
+            JsonValue::String("safe@example.com".to_string()),
+        );
+        DatabaseAuthenticatable::update_without_password(&mut plain, &mut params);
+        assert_eq!(plain.encrypted_password, encrypted_before);
+        assert_eq!(plain.email, "safe@example.com");
+
+        // find_for_database_authentication routes through find_for_authentication (DBAU-10).
+        // (Runs before the destroy checks below: the record must exist.)
+        let mut conditions = Conditions::new();
+        conditions.insert(
+            "email",
+            AdapterValue::String("test@example.com".to_string()),
+        );
+        let found =
+            TestUser::find_for_database_authentication(&conditions, &adapter, &config).await;
+        assert_eq!(found.map(|u| u.id), Some(1));
+
+        // destroy_with_password destroys only on a valid password (DBAU-05).
+        assert!(
+            !DatabaseAuthenticatable::destroy_with_password(&user, "wrong", &adapter, &config)
+                .await
+                .unwrap()
+        );
+        assert!(
+            DatabaseAuthenticatable::destroy_with_password(&user, "secret123", &adapter, &config)
+                .await
+                .unwrap()
+        );
+        assert!(
+            adapter
+                .get(&DeviseKey::from_i64(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // after_database_authentication hook exists and defaults to no-op (DBAU-07).
+        DatabaseAuthenticatable::after_database_authentication(&user);
+
+        // Notification decisions (DBAU-08/09): email change notifies the
+        // ORIGINAL address; password change notifies the current one.
+        let previous = HashMap::from([(
+            "email".to_string(),
+            crate::adapter::Value::String("old@example.com".to_string()),
+        )]);
+        let current = HashMap::from([
+            (
+                "email".to_string(),
+                crate::adapter::Value::String("new@example.com".to_string()),
+            ),
+            (
+                "encrypted_password".to_string(),
+                crate::adapter::Value::String("hash".to_string()),
+            ),
+        ]);
+        let changes = crate::adapter::ChangeSet::new(previous, current);
+        assert_eq!(
+            DatabaseAuthenticatable::email_notification_recipient(&user, &changes, &config)
+                .as_deref(),
+            Some("old@example.com")
+        );
+        assert!(
+            DatabaseAuthenticatable::password_change_notification_pending(&user, &changes, &config)
+        );
+
+        // Skip flags and disabled config suppress notifications.
+        let mut skipping = user.clone();
+        DatabaseAuthenticatable::skip_email_changed_notification(&mut skipping);
+        DatabaseAuthenticatable::skip_password_change_notification(&mut skipping);
+        assert!(
+            DatabaseAuthenticatable::email_notification_recipient(&skipping, &changes, &config)
+                .is_none()
+        );
+        assert!(
+            !DatabaseAuthenticatable::password_change_notification_pending(
+                &skipping, &changes, &config
+            )
+        );
+        let quiet = DeviseConfig {
+            stretches: 4,
+            send_email_changed_notification: false,
+            send_password_change_notification: false,
+            ..DeviseConfig::default()
+        };
+        assert!(
+            DatabaseAuthenticatable::email_notification_recipient(&user, &changes, &quiet)
+                .is_none()
+        );
+        assert!(
+            !DatabaseAuthenticatable::password_change_notification_pending(&user, &changes, &quiet)
+        );
+
+        // No email change -> no email notification.
+        let steady = crate::adapter::ChangeSet::new(
+            HashMap::from([(
+                "email".to_string(),
+                crate::adapter::Value::String("a@example.com".to_string()),
+            )]),
+            HashMap::from([(
+                "email".to_string(),
+                crate::adapter::Value::String("a@example.com".to_string()),
+            )]),
+        );
+        assert!(
+            DatabaseAuthenticatable::email_notification_recipient(&user, &steady, &config)
+                .is_none()
+        );
     }
 
     #[test]
