@@ -16,11 +16,9 @@ use crate::failure::{AnyDeviseModel, AuthOutcome, Failure};
 use crate::hooks::{Event, HookContext, HookRegistry};
 use crate::model::ModelFinder;
 use crate::request::AuthRequest;
-use crate::scope::{Module, ScopeRegistry};
+use crate::scope::ScopeRegistry;
 use crate::session::{self, SessionStore};
-use crate::strategy::{
-    HttpBasicStrategy, ParamsStrategy, ParanoidStrategy, RememberableStrategy, Strategy,
-};
+use crate::strategy::Strategy;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -57,14 +55,6 @@ impl Default for SetUserOpts {
             run_callbacks: true,
             force: false,
         }
-    }
-}
-
-fn boxed<S: Strategy + 'static>(strategy: S, paranoid: bool) -> Box<dyn Strategy> {
-    if paranoid {
-        Box::new(ParanoidStrategy::new(strategy))
-    } else {
-        Box::new(strategy)
     }
 }
 
@@ -420,14 +410,7 @@ impl AuthProxy {
             .cloned()
             .ok_or_else(|| Failure::Config(format!("no finder for scope '{scope}'")))?;
         let config = self.config.clone();
-        let paranoid = config.paranoid;
-
-        let mut strategies: Vec<Box<dyn Strategy>> = Vec::new();
-        if mapping.has_module(Module::Rememberable) {
-            strategies.push(boxed(RememberableStrategy::default(), paranoid));
-        }
-        strategies.push(boxed(ParamsStrategy::default(), paranoid));
-        strategies.push(boxed(HttpBasicStrategy::default(), paranoid));
+        let strategies = crate::strategy::strategies_for(&mapping, config.paranoid);
 
         for strategy in &strategies {
             let strategy_id = strategy.id();

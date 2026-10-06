@@ -18,23 +18,46 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use std::marker::PhantomData;
 
+/// Normalize one credential value per Devise config (AUTH-06).
+///
+/// Single home for the downcase/trim rules that `ParameterFilter::filter`
+/// applies to `serde_json::Value` trees; this is its flat `Conditions`
+/// counterpart, shared by finders and strategies.
+#[must_use]
+pub fn normalize_credential_value(
+    value: String,
+    key: &str,
+    case_insensitive_keys: &[String],
+    strip_whitespace_keys: &[String],
+) -> String {
+    let mut value = value;
+    if case_insensitive_keys.iter().any(|k| k == key) {
+        value.make_ascii_lowercase();
+    }
+    if strip_whitespace_keys.iter().any(|k| k == key) {
+        value = value.trim().to_string();
+    }
+    value
+}
+
 /// Normalize auth conditions per Devise config (AUTH-06).
 ///
-/// Applies `case_insensitive_keys` (downcase) and `strip_whitespace_keys`
-/// (trim) to string values, returning a new map. Concrete models call this
-/// on their condition maps before validation and lookup.
+/// Applies [`normalize_credential_value`] to every string entry, returning
+/// a new map. Concrete models call this on their condition maps before
+/// validation and lookup.
 #[must_use]
 pub fn normalize_auth_conditions(conditions: &Conditions, config: &DeviseConfig) -> Conditions {
     let mut normalized = Conditions::new();
     for (key, value) in conditions.iter() {
         let mut value = value.clone();
         if let Value::String(text) = &mut value {
-            if config.case_insensitive_keys.iter().any(|k| k == key) {
-                text.make_ascii_lowercase();
-            }
-            if config.strip_whitespace_keys.iter().any(|k| k == key) {
-                *text = text.trim().to_string();
-            }
+            let raw = std::mem::take(text);
+            *text = normalize_credential_value(
+                raw,
+                key,
+                &config.case_insensitive_keys,
+                &config.strip_whitespace_keys,
+            );
         }
         normalized.insert(key.clone(), value);
     }

@@ -162,7 +162,7 @@ where
 }
 
 /// UNSAFE attributes that must never be serialized or logged - exact list from
-/// Devise's `UNSAFE_ATTRIBUTES_FOR_SERIALIZATION` (18 attributes).
+/// Devise's `UNSAFE_ATTRIBUTES_FOR_SERIALIZATION` (19 attributes).
 ///
 /// These are excluded from `serializable_hash` and `Debug` implementations
 /// to prevent credential leakage in logs, error reports, and API responses.

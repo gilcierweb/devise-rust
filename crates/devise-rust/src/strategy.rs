@@ -91,20 +91,28 @@ fn extract_param(request: &AuthRequest, scope: &str, key: &str) -> Option<String
         .cloned()
 }
 
-/// Normalize one credential value per strategy key lists.
-fn normalize_credential(
-    key: &str,
-    mut value: String,
-    case_insensitive_keys: &[String],
-    strip_whitespace_keys: &[String],
-) -> String {
-    if case_insensitive_keys.iter().any(|k| k == key) {
-        value.make_ascii_lowercase();
+/// Build the strategy chain in Devise execution order.
+///
+/// Rememberable (no-input) runs first when the mapping enables it, then
+/// params, then HTTP Basic. Each entry is paranoid-wrapped when `paranoid`
+/// is set. `AuthProxy` consumes this so the order is defined once.
+#[must_use]
+pub fn strategies_for(mapping: &Mapping, paranoid: bool) -> Vec<Box<dyn Strategy>> {
+    fn boxed<S: Strategy + 'static>(strategy: S, paranoid: bool) -> Box<dyn Strategy> {
+        if paranoid {
+            Box::new(ParanoidStrategy::new(strategy))
+        } else {
+            Box::new(strategy)
+        }
     }
-    if strip_whitespace_keys.iter().any(|k| k == key) {
-        value = value.trim().to_string();
+
+    let mut chain: Vec<Box<dyn Strategy>> = Vec::with_capacity(3);
+    if mapping.has_module(crate::scope::Module::Rememberable) {
+        chain.push(boxed(RememberableStrategy::default(), paranoid));
     }
-    value
+    chain.push(boxed(ParamsStrategy::default(), paranoid));
+    chain.push(boxed(HttpBasicStrategy::default(), paranoid));
+    chain
 }
 
 /// Params strategy - form credentials in `params[scope]`.
@@ -138,9 +146,9 @@ impl ParamsStrategy {
         let mut found = false;
         for key in &self.authentication_keys {
             let raw = extract_param(request, scope, key)?;
-            let value = normalize_credential(
-                key,
+            let value = crate::model::normalize_credential_value(
                 raw,
+                key,
                 &self.case_insensitive_keys,
                 &self.strip_whitespace_keys,
             );
@@ -481,6 +489,27 @@ mod tests {
         request.params = test_params("user", pairs);
         request.flags.allow_params_authentication = true;
         request
+    }
+
+    #[test]
+    fn test_strategy_chain_order() {
+        let plain = strategies_for(&test_mapping(), false);
+        let plain_ids: Vec<&str> = plain.iter().map(Strategy::id).collect();
+        assert_eq!(plain_ids, vec!["params", "http_basic"]);
+
+        let mut with_remember = test_mapping();
+        with_remember.modules = vec![
+            crate::scope::Module::DatabaseAuthenticatable,
+            crate::scope::Module::Rememberable,
+        ];
+        let ordered = strategies_for(&with_remember, false);
+        let ordered_ids: Vec<&str> = ordered.iter().map(Strategy::id).collect();
+        assert_eq!(ordered_ids, vec!["rememberable", "params", "http_basic"]);
+
+        // Paranoid wrapping preserves order and ids.
+        let paranoid = strategies_for(&with_remember, true);
+        let paranoid_ids: Vec<&str> = paranoid.iter().map(Strategy::id).collect();
+        assert_eq!(paranoid_ids, ordered_ids);
     }
 
     #[tokio::test]

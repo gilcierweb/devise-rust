@@ -411,6 +411,23 @@ mod tests {
             "/users"
         );
 
+        // Stored location wins over the scope root, then is consumed.
+        crate::failure::store_location(
+            &AuthRequest::new(HttpMethod::Get, "/protected".to_string()),
+            "user",
+            &crate::config::DeviseConfig::default(),
+            proxy.session_store(),
+        )
+        .await;
+        assert_eq!(
+            after_sign_in_path_for("user", &proxy, &request).await,
+            "/protected"
+        );
+        assert_eq!(
+            after_sign_in_path_for("user", &proxy, &request).await,
+            "/users"
+        );
+
         let group = Group::new("blogger", vec!["user".to_string(), "admin".to_string()]);
         assert!(!group_signed_in(&group, &proxy));
         let opts = AuthenticateOpts::default();
