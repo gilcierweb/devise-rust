@@ -195,6 +195,8 @@ pub trait Mailer<M>: Send + Sync {
 pub struct SentMail {
     /// Recipient (`headers[:to]`).
     pub to: String,
+    /// Sender (`headers[:from]` = `config.mailer_sender`, `None` when unset).
+    pub from: Option<String>,
     /// Subject line from the I18n catalog (`devise.mailer.<action>.subject`).
     pub subject: String,
     /// Rendered template body.
@@ -208,6 +210,7 @@ pub struct SentMail {
 #[derive(Debug, Default)]
 pub struct TestMailer {
     sent: Mutex<Vec<SentMail>>,
+    mailer_sender: Option<String>,
 }
 
 impl TestMailer {
@@ -220,6 +223,14 @@ impl TestMailer {
         self.sent.lock().expect("TestMailer mutex poisoned").clone()
     }
 
+    /// Set the sender (`Devise.mailer_sender` - per-scope variants resolve
+    /// through the config cascade before reaching the mailer).
+    #[must_use]
+    pub fn with_sender(mut self, mailer_sender: Option<String>) -> Self {
+        self.mailer_sender = mailer_sender;
+        self
+    }
+
     fn deliver(
         &self,
         action: &str,
@@ -230,6 +241,7 @@ impl TestMailer {
             .map_err(|e| DeviseError::Mailer(format!("{action} template render failed: {e}")))?;
         let mail = SentMail {
             to: context.email.clone(),
+            from: self.mailer_sender.clone(),
             subject: translate_simple(&format!("devise.mailer.{action}.subject")),
             body,
             template_vars: context.clone(),
@@ -415,6 +427,31 @@ mod tests {
             .email_changed(&user, None, &direct_ctx)
             .expect("email_changed (direct) renders");
         assert!(direct.contains("has been changed to new@example.com"));
+    }
+
+    #[test]
+    fn mailer_sender_config_flows_to_from_header() {
+        // MAIL-02 parity: from = config.mailer_sender (unset -> None).
+        let user = User {
+            email: "user@example.com".to_string(),
+        };
+        let ctx = MailerContext::from_record(&user);
+
+        let plain = TestMailer::default();
+        plain
+            .confirmation_instructions(&user, Some("t"), &ctx)
+            .expect("renders");
+        assert_eq!(plain.sent_mails()[0].from, None);
+
+        let configured =
+            TestMailer::default().with_sender(Some("no-reply@example.com".to_string()));
+        configured
+            .confirmation_instructions(&user, Some("t"), &ctx)
+            .expect("renders");
+        assert_eq!(
+            configured.sent_mails()[0].from.as_deref(),
+            Some("no-reply@example.com")
+        );
     }
 
     #[test]

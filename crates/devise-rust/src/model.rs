@@ -801,6 +801,13 @@ pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
     fn clear_reset_password_token(&mut self) {
         self.set_reset_password_token_fields(None, None);
     }
+
+    /// `sign_in_after_reset_password` (RCV-02 switch): whether a successful
+    /// `reset_password_by_token` should sign the user in. Model-level decision;
+    /// the controller/framework layer performs the actual sign-in.
+    fn sign_in_after_reset_password(&self, config: &DeviseConfig) -> bool {
+        config.sign_in_after_reset_password
+    }
 }
 
 // ============================================================================
@@ -2581,6 +2588,20 @@ mod tests {
                 .map(Vec::as_slice),
             Some(&[":confirmation".to_string()][..])
         );
+
+        // RCV-02 switch: sign_in_after_reset_password reads config (Warden-side
+        // sign-in itself is the controller/integration layer).
+        let saved = adapter.get(&DeviseKey::from_i64(1)).await.unwrap().unwrap();
+        assert!(Recoverable::sign_in_after_reset_password(&saved, &config));
+        let config_off = DeviseConfig {
+            stretches: 4,
+            sign_in_after_reset_password: false,
+            ..DeviseConfig::default()
+        };
+        assert!(!Recoverable::sign_in_after_reset_password(
+            &saved,
+            &config_off
+        ));
     }
 
     #[test]
