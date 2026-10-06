@@ -301,6 +301,77 @@ pub trait DatabaseAuthenticatable: Authenticatable {
 }
 
 // ============================================================================
+// Registerable (REGS-01..04)
+// Mirrors devise/lib/devise/models/registerable.rb
+// ============================================================================
+
+/// `Registerable` module: building records from sign-up params and the
+/// post-sign-up / post-change-password decisions. The flow orchestration
+/// (controllers in Devise) consumes these model-level decisions.
+///
+/// == Options
+///
+/// * `sign_in_after_change_password` - sign the user back in after a
+///   password-changing account update (Devise default: true)
+///
+/// == Examples
+///
+/// ```ignore
+/// let user = TestUser::new_with_session(&params, &session, &config);
+/// // save via adapter; then:
+/// match user.post_sign_up_message() {
+///     None => { /* active_for_authentication: sign in (flash :signed_up) */ }
+///     Some(key) => { /* flash "signed_up_but_{key}", no session data */ }
+/// }
+/// ```
+pub trait Registerable: DatabaseAuthenticatable {
+    /// `new_with_session(params, session)` (REGS-01): build a record from
+    /// sign-up params. Devise merges `session["resource.data"]` (OAuth
+    /// first-visit handoffs); the default port applies params, and password
+    /// keys go through the hashing [`set_password`](DatabaseAuthenticatable::set_password).
+    fn new_with_session(
+        params: &serde_json::Map<String, JsonValue>,
+        session: &JsonValue,
+        config: &DeviseConfig,
+    ) -> Self
+    where
+        Self: Default + Sized,
+    {
+        let _ = session;
+        let mut record = Self::default();
+        record.assign_attributes(params);
+        if let Some(password) = params.get("password").and_then(JsonValue::as_str) {
+            record.set_password(Some(password.to_string()), config);
+        }
+        if let Some(confirmation) = params
+            .get("password_confirmation")
+            .and_then(JsonValue::as_str)
+        {
+            record.set_password_confirmation(Some(confirmation.to_string()));
+        }
+        record
+    }
+
+    /// `sign_in_after_change_password` (REGS-04): config-controlled decision
+    /// for re-sign-in after a password-changing account update (the controller
+    /// may use `bypass_sign_in` when true).
+    fn sign_in_after_change_password(&self, config: &DeviseConfig) -> bool {
+        config.sign_in_after_change_password
+    }
+
+    /// Post-sign-up decision (REGS-02): `None` when `active_for_authentication`
+    /// (caller signs in, flash `:signed_up`); `Some(key)` flashes
+    /// `signed_up_but_<key>` (Devise `inactive_message`) with no session data.
+    fn post_sign_up_message(&self) -> Option<&'static str> {
+        if self.active_for_authentication() {
+            None
+        } else {
+            Some(self.inactive_message())
+        }
+    }
+}
+
+// ============================================================================
 // Validatable (VAL-01, VAL-02)
 // Mirrors devise/lib/devise/models/validatable.rb
 // ============================================================================
@@ -665,6 +736,8 @@ mod tests {
         skip_email_notification: bool,
         #[serde(skip)]
         skip_password_notification: bool,
+        #[serde(skip)]
+        inactive: bool,
     }
 
     impl TestUser {
@@ -677,6 +750,7 @@ mod tests {
                 password_confirmation: None,
                 skip_email_notification: false,
                 skip_password_notification: false,
+                inactive: false,
             }
         }
     }
@@ -709,7 +783,21 @@ mod tests {
         fn serializable_hash(&self) -> JsonValue {
             serde_json::json!({ "id": self.id, "email": self.email })
         }
+
+        fn active_for_authentication(&self) -> bool {
+            !self.inactive
+        }
+
+        fn inactive_message(&self) -> &'static str {
+            if self.inactive {
+                "unconfirmed"
+            } else {
+                "inactive"
+            }
+        }
     }
+
+    impl Registerable for TestUser {}
 
     impl crate::mailer::HasEmail for TestUser {
         fn email(&self) -> &str {
@@ -1244,6 +1332,85 @@ mod tests {
         let mut errors = ValidationErrors::new();
         Validatable::validate_email_uniqueness(&self_update, &adapter, &mut errors).await;
         assert!(errors.is_empty(), "self-update must not be :taken");
+    }
+
+    #[test]
+    fn registerable_tests() {
+        let config = test_config();
+
+        // REGS-01: new_with_session builds from params; password hashed.
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "email".to_string(),
+            JsonValue::String("signup@example.com".to_string()),
+        );
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("secret123".to_string()),
+        );
+        params.insert(
+            "password_confirmation".to_string(),
+            JsonValue::String("secret123".to_string()),
+        );
+        let user = TestUser::new_with_session(
+            &params,
+            &JsonValue::Object(serde_json::Map::new()),
+            &config,
+        );
+        assert_eq!(user.email, "signup@example.com");
+        assert!(user.encrypted_password.starts_with("$2"));
+        assert!(DatabaseAuthenticatable::valid_password(
+            &user,
+            "secret123",
+            &config
+        ));
+        let errors = Validatable::validate(&user, &config);
+        assert!(errors.is_empty(), "sign-up record validates: {errors:?}");
+
+        // Blank password param: never resets encrypted_password.
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "email".to_string(),
+            JsonValue::String("nobody@example.com".to_string()),
+        );
+        params.insert("password".to_string(), JsonValue::String(String::new()));
+        let user = TestUser::new_with_session(&params, &JsonValue::Null, &config);
+        assert!(user.encrypted_password().is_none());
+
+        // REGS-02: post-sign-up decision - active signs in, inactive flashes.
+        let active = TestUser::testing("secret123", &config);
+        assert_eq!(Registerable::post_sign_up_message(&active), None);
+        let inactive = TestUser {
+            inactive: true,
+            ..TestUser::testing("secret123", &config)
+        };
+        assert_eq!(
+            Registerable::post_sign_up_message(&inactive),
+            Some("unconfirmed")
+        );
+
+        // REGS-03: clean_up_passwords clears fields on failure re-render.
+        let mut failed = TestUser::default();
+        failed.set_password_virtual(Some("secret123".to_string()));
+        failed.set_password_confirmation(Some("secret123".to_string()));
+        DatabaseAuthenticatable::clean_up_passwords(&mut failed);
+        assert_eq!(
+            (failed.password(), failed.password_confirmation()),
+            (None, None)
+        );
+
+        // REGS-04: sign_in_after_change_password reads config (default true).
+        let user = TestUser::testing("secret123", &config);
+        assert!(Registerable::sign_in_after_change_password(&user, &config));
+        let config_off = DeviseConfig {
+            stretches: 4,
+            sign_in_after_change_password: false,
+            ..DeviseConfig::default()
+        };
+        assert!(!Registerable::sign_in_after_change_password(
+            &user,
+            &config_off
+        ));
     }
 
     #[test]
