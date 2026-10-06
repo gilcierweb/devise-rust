@@ -17,7 +17,7 @@
 //! - `failure` - `Failure` enum, `AuthOutcome`, `AnyDeviseModel` trait
 //! - `helpers` - per-scope auth helpers, path helpers, groups, `devise_helpers!`
 //! - `hooks` - `HookRegistry`, `HookFilter`, `Event`, bridge traits
-//! - `model` - `Authenticatable` trait, `PasswordVerifiable`, `ModelFinder` bridge
+//! - `model` - `Authenticatable` base, `DatabaseAuthenticatable` (password handling + notifications decisions), `Validatable`, `Registerable`, `PasswordVerifiable`, `ModelFinder` bridge
 //! - `mailer` - `Mailer` trait (5 actions), `MailerContext`, `TestMailer`, Tera templates
 //! - `proxy` - `AuthProxy` session and strategy execution
 //! - `request` - `AuthRequest`, `RequestFlags`, `HttpMethod`
