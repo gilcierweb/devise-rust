@@ -40,8 +40,7 @@ pub fn normalize_credential_value(
     value
 }
 
-/// Normalize auth conditions per Devise config (AUTH-06).
-///
+/// Normalize auth conditions per Devise config (AUTH-06).///
 /// Applies [`normalize_credential_value`] to every string entry, returning
 /// a new map. Concrete models call this on their condition maps before
 /// validation and lookup.
@@ -651,9 +650,19 @@ pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
                 conditions.insert((*key).to_string(), Value::String(value.to_string()));
             }
         }
-        let mut resource =
+        // Missing all lookup keys must take Devise's :not_found path directly:
+        // an empty condition set would match an ARBITRARY record in adapters
+        // where "empty conditions match any record" holds.
+        let mut resource = if conditions.iter().next().is_none() {
+            let mut errors = ValidationErrors::new();
+            for key in &keys {
+                errors.add(key, ":not_found");
+            }
+            ResourceWithErrors::new(Self::default(), errors)
+        } else {
             Self::find_or_initialize_with_errors(&keys, &conditions, ":not_found", adapter, config)
-                .await;
+                .await
+        };
         if resource.is_valid() {
             resource
                 .record
@@ -2306,6 +2315,29 @@ mod tests {
             Some(&[":not_found".to_string()][..])
         );
         assert_eq!(mailer.sent_mails().len(), 1, "no email for unknown record");
+
+        // No lookup keys at all: :not_found on every configured key, nothing
+        // sent (regression: empty conditions must not match an arbitrary record).
+        let empty_attributes = serde_json::Map::new();
+        let outcome = TestUser::send_reset_password_instructions_for(
+            &empty_attributes,
+            &adapter,
+            &mailer,
+            &config,
+            &clock,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_valid());
+        assert_eq!(
+            outcome.errors.get("email").map(Vec::as_slice),
+            Some(&[":not_found".to_string()][..])
+        );
+        assert_eq!(
+            mailer.sent_mails().len(),
+            1,
+            "no email for empty attributes"
+        );
     }
 
     #[tokio::test]
