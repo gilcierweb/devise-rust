@@ -404,7 +404,9 @@ pub trait RememberableBridge: Send + Sync {
 mod tests {
     use super::*;
     use crate::scope::{Mapping, Module, PathNames, SignOutVia};
+    use crate::session::SessionStore;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     struct MockProxy;
     impl HookProxy for MockProxy {
@@ -418,6 +420,123 @@ mod tests {
             None
         }
         fn lock(&mut self) {}
+    }
+
+    #[derive(Debug, Clone)]
+    struct HookUser {
+        id: i64,
+        valid: bool,
+    }
+
+    impl AnyDeviseModel for HookUser {
+        fn to_key(&self) -> crate::adapter::DeviseKey {
+            crate::adapter::DeviseKey::from_i64(self.id)
+        }
+
+        fn authenticatable_salt(&self) -> Option<String> {
+            Some("$2a$12$hooktestsalt123456789012".to_string())
+        }
+
+        fn valid_for_authentication(&self, _rules: Option<&crate::failure::AuthRules>) -> bool {
+            self.valid
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TrackingStore {
+        data: std::sync::Arc<std::sync::RwLock<HashMap<String, serde_json::Value>>>,
+        renewed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::session::SessionStore for TrackingStore {
+        async fn get_value(&self, key: &str) -> Option<serde_json::Value> {
+            self.data.read().unwrap().get(key).cloned()
+        }
+
+        async fn insert_value(&self, key: &str, value: serde_json::Value) {
+            self.data.write().unwrap().insert(key.to_string(), value);
+        }
+
+        async fn remove(&self, key: &str) {
+            self.data.write().unwrap().remove(key);
+        }
+
+        async fn remove_prefix(&self, prefix: &str) {
+            let mut data = self.data.write().unwrap();
+            let doomed: Vec<String> = data
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect();
+            for key in doomed {
+                data.remove(&key);
+            }
+        }
+
+        async fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+            self.data
+                .read()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect()
+        }
+
+        async fn renew(&self) -> Result<(), crate::error::DeviseError> {
+            self.renewed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn reset(&self) -> Result<(), crate::error::DeviseError> {
+            self.data.write().unwrap().clear();
+            Ok(())
+        }
+    }
+
+    fn hook_test_proxy(
+        renewed: &Arc<std::sync::atomic::AtomicBool>,
+        modules: Vec<Module>,
+    ) -> (crate::proxy::AuthProxy, Arc<TrackingStore>) {
+        let store = Arc::new(TrackingStore {
+            data: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            renewed: renewed.clone(),
+        });
+        let mut scope_registry = crate::scope::ScopeRegistry::new();
+        let mapping = Mapping {
+            name: "user".to_string(),
+            class_name: "User".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: PathNames::default(),
+            controllers: HashMap::new(),
+            modules,
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: SignOutVia::Delete,
+            failure_app: None,
+        };
+        let mut hooks = HookRegistry::new();
+        register_devise_hooks(&mut hooks, &mapping);
+        scope_registry.register(mapping);
+        let proxy = crate::proxy::AuthProxy::new(
+            store.clone(),
+            Arc::new(scope_registry),
+            Arc::new(hooks),
+            Arc::new(crate::config::DeviseConfig::default()),
+        );
+        (proxy, store)
     }
 
     fn test_mapping() -> Mapping {
@@ -514,6 +633,82 @@ mod tests {
 
         // Should have activatable + csrf + trackable (3 hooks for this mapping)
         assert_eq!(registry.len(), 3);
+    }
+
+    #[test]
+    fn test_hook_registry_all_hooks() {
+        // Full module list registers all 7 hooks in Devise order.
+        let mut full_mapping = test_mapping();
+        full_mapping.modules = Module::all();
+        let mut full = HookRegistry::new();
+        register_devise_hooks(&mut full, &full_mapping);
+        assert_eq!(full.len(), 7);
+
+        // Database-only mapping gets activatable + csrf.
+        let mut minimal_mapping = test_mapping();
+        minimal_mapping.modules = vec![Module::DatabaseAuthenticatable];
+        let mut minimal = HookRegistry::new();
+        register_devise_hooks(&mut minimal, &minimal_mapping);
+        assert_eq!(minimal.len(), 2);
+
+        // Rememberable adds set + forget hooks.
+        let mut remember_mapping = test_mapping();
+        remember_mapping.modules = vec![Module::DatabaseAuthenticatable, Module::Rememberable];
+        let mut remember = HookRegistry::new();
+        register_devise_hooks(&mut remember, &remember_mapping);
+        assert_eq!(remember.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_hook_registry_activatable_csrf() {
+        use crate::proxy::{SetUserEvent, SetUserOpts};
+        use std::sync::atomic::Ordering;
+
+        let renewed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut proxy, store) = hook_test_proxy(&renewed, vec![Module::DatabaseAuthenticatable]);
+        assert_eq!(proxy.hooks().len(), 2);
+
+        // Invalid user: activatable rejects before anything is persisted.
+        let rejected = proxy
+            .set_user(
+                "user",
+                Some(Box::new(HookUser {
+                    id: 1,
+                    valid: false,
+                })),
+                SetUserOpts {
+                    event: SetUserEvent::Authentication,
+                    store: true,
+                    run_callbacks: true,
+                    force: false,
+                },
+            )
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(crate::error::DeviseError::Internal(_))
+        ));
+        let session_key = crate::session::keys::scope_session_key("user");
+        assert!(store.get_value(&session_key).await.is_none());
+        assert!(!renewed.load(Ordering::SeqCst));
+
+        // Valid user: activatable passes, csrf renews, session persists.
+        let accepted = proxy
+            .set_user(
+                "user",
+                Some(Box::new(HookUser { id: 1, valid: true })),
+                SetUserOpts {
+                    event: SetUserEvent::Authentication,
+                    store: true,
+                    run_callbacks: true,
+                    force: false,
+                },
+            )
+            .await;
+        assert!(accepted.expect("valid user is set"));
+        assert!(renewed.load(Ordering::SeqCst));
+        assert!(store.get_value(&session_key).await.is_some());
+        assert!(proxy.authenticated("user"));
     }
 
     #[test]
