@@ -42,6 +42,18 @@ pub mod templates {
     /// `confirmation_instructions` - welcome + confirmation link.
     pub const CONFIRMATION_INSTRUCTIONS: &str =
         include_str!("../templates/devise/mailer/confirmation_instructions.email.tera");
+    /// `reset_password_instructions` - reset-password link.
+    pub const RESET_PASSWORD_INSTRUCTIONS: &str =
+        include_str!("../templates/devise/mailer/reset_password_instructions.email.tera");
+    /// `unlock_instructions` - unlock link.
+    pub const UNLOCK_INSTRUCTIONS: &str =
+        include_str!("../templates/devise/mailer/unlock_instructions.email.tera");
+    /// `email_changed` - change notification to the original address.
+    pub const EMAIL_CHANGED: &str =
+        include_str!("../templates/devise/mailer/email_changed.email.tera");
+    /// `password_change` - change notification.
+    pub const PASSWORD_CHANGE: &str =
+        include_str!("../templates/devise/mailer/password_change.email.tera");
 }
 
 /// Template variables shared by all 5 mailer actions (MAIL-02).
@@ -253,7 +265,7 @@ impl<M> Mailer<M> for TestMailer {
     ) -> Result<String, DeviseError> {
         self.deliver(
             "reset_password_instructions",
-            templates::CONFIRMATION_INSTRUCTIONS,
+            templates::RESET_PASSWORD_INSTRUCTIONS,
             context,
         )
     }
@@ -266,7 +278,7 @@ impl<M> Mailer<M> for TestMailer {
     ) -> Result<String, DeviseError> {
         self.deliver(
             "unlock_instructions",
-            templates::CONFIRMATION_INSTRUCTIONS,
+            templates::UNLOCK_INSTRUCTIONS,
             context,
         )
     }
@@ -277,11 +289,7 @@ impl<M> Mailer<M> for TestMailer {
         _token: Option<&str>,
         context: &MailerContext,
     ) -> Result<String, DeviseError> {
-        self.deliver(
-            "email_changed",
-            templates::CONFIRMATION_INSTRUCTIONS,
-            context,
-        )
+        self.deliver("email_changed", templates::EMAIL_CHANGED, context)
     }
 
     fn password_change(
@@ -290,11 +298,7 @@ impl<M> Mailer<M> for TestMailer {
         _token: Option<&str>,
         context: &MailerContext,
     ) -> Result<String, DeviseError> {
-        self.deliver(
-            "password_change",
-            templates::CONFIRMATION_INSTRUCTIONS,
-            context,
-        )
+        self.deliver("password_change", templates::PASSWORD_CHANGE, context)
     }
 }
 
@@ -356,6 +360,61 @@ mod tests {
             ]
         );
         assert!(sent.iter().all(|m| m.to == "user@example.com"));
+    }
+
+    #[test]
+    fn mailer_templates_compile() {
+        // All 5 embedded templates compile and render the Devise content with
+        // Tera syntax (MAIL-02).
+        let user = User {
+            email: "user@example.com".to_string(),
+        };
+        let mailer = TestMailer::default();
+        let ctx = MailerContext::from_record(&user)
+            .with_token("tok-1")
+            .with_url("https://example.com/action?token=tok-1");
+
+        let confirm = mailer
+            .confirmation_instructions(&user, Some("tok-1"), &ctx)
+            .expect("confirmation renders");
+        assert!(confirm.contains("Welcome user@example.com!"));
+        assert!(confirm.contains("Confirm my account"));
+
+        let reset = mailer
+            .reset_password_instructions(&user, Some("tok-1"), &ctx)
+            .expect("reset renders");
+        assert!(reset.contains("Hello user@example.com!"));
+        assert!(reset.contains("Change my password"));
+        assert!(reset.contains("If you didn't request this, please ignore this email."));
+
+        let unlock = mailer
+            .unlock_instructions(&user, Some("tok-1"), &ctx)
+            .expect("unlock renders");
+        assert!(unlock.contains("excessive number of unsuccessful sign in attempts"));
+        assert!(unlock.contains("Unlock my account"));
+
+        let password = mailer
+            .password_change(&user, None, &ctx)
+            .expect("password_change renders");
+        assert!(password.contains("your password has been changed"));
+
+        // email_changed: both Devise branches (reconfirmable vs direct change).
+        let reconfirm_ctx = MailerContext::from_record(&user).with_resource(serde_json::json!({
+            "email": "new@example.com",
+            "unconfirmed_email": "new@example.com"
+        }));
+        let reconfirm = mailer
+            .email_changed(&user, None, &reconfirm_ctx)
+            .expect("email_changed (reconfirm) renders");
+        assert!(reconfirm.contains("being changed to new@example.com"));
+
+        let direct_ctx = MailerContext::from_record(&user).with_resource(serde_json::json!({
+            "email": "new@example.com"
+        }));
+        let direct = mailer
+            .email_changed(&user, None, &direct_ctx)
+            .expect("email_changed (direct) renders");
+        assert!(direct.contains("has been changed to new@example.com"));
     }
 
     #[test]
