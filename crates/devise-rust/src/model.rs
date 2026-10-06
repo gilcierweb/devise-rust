@@ -2321,6 +2321,169 @@ mod tests {
         assert_eq!(Recoverable::reset_password_sent_at(&cleared), None);
     }
 
+    fn reset_attrs(
+        token: &str,
+        password: &str,
+        confirmation: &str,
+    ) -> serde_json::Map<String, JsonValue> {
+        let mut attrs = serde_json::Map::new();
+        attrs.insert(
+            "reset_password_token".to_string(),
+            JsonValue::String(token.to_string()),
+        );
+        attrs.insert(
+            "password".to_string(),
+            JsonValue::String(password.to_string()),
+        );
+        attrs.insert(
+            "password_confirmation".to_string(),
+            JsonValue::String(confirmation.to_string()),
+        );
+        attrs
+    }
+
+    async fn issue_reset_token(
+        adapter: &MemoryAdapter<TestUser>,
+        mailer: &crate::mailer::TestMailer,
+        config: &DeviseConfig,
+        clock: &crate::time::FixedClock,
+    ) -> String {
+        let mut stored = adapter.get(&DeviseKey::from_i64(1)).await.unwrap().unwrap();
+        stored
+            .send_reset_password_instructions(adapter, mailer, config, clock)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reset_password_by_token_guards() {
+        use crate::time::FixedClock;
+
+        let config = test_config();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let clock = FixedClock::now();
+        adapter
+            .create(TestUser::testing("secret123", &config))
+            .await
+            .unwrap();
+
+        // Blank token: :reset_password_token :blank on a fresh record (RCV-03).
+        let mut attrs = serde_json::Map::new();
+        attrs.insert(
+            "reset_password_token".to_string(),
+            JsonValue::String(String::new()),
+        );
+        attrs.insert(
+            "password".to_string(),
+            JsonValue::String("freshpass1".to_string()),
+        );
+        let outcome = TestUser::reset_password_by_token(&attrs, &adapter, &config, &clock)
+            .await
+            .unwrap();
+        assert!(!outcome.is_valid());
+        assert_eq!(
+            outcome
+                .errors
+                .get("reset_password_token")
+                .map(Vec::as_slice),
+            Some(&[":blank".to_string()][..])
+        );
+
+        // Unknown token: :not_found, nothing changes.
+        let mut attrs = serde_json::Map::new();
+        attrs.insert(
+            "reset_password_token".to_string(),
+            JsonValue::String("bogus".to_string()),
+        );
+        attrs.insert(
+            "password".to_string(),
+            JsonValue::String("freshpass1".to_string()),
+        );
+        let outcome = TestUser::reset_password_by_token(&attrs, &adapter, &config, &clock)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome
+                .errors
+                .get("reset_password_token")
+                .map(Vec::as_slice),
+            Some(&[":not_found".to_string()][..])
+        );
+        assert!(DatabaseAuthenticatable::valid_password(
+            &TestUser::testing("secret123", &config),
+            "secret123",
+            &config
+        ));
+    }
+
+    #[tokio::test]
+    async fn reset_password_by_token_window() {
+        use crate::time::FixedClock;
+
+        let config = test_config();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = crate::mailer::TestMailer::default();
+        let mut clock = FixedClock::now();
+        adapter
+            .create(TestUser::testing("secret123", &config))
+            .await
+            .unwrap();
+
+        // Expired window: advance past reset_password_within (6h) -> :expired.
+        let raw = issue_reset_token(&adapter, &mailer, &config, &clock).await;
+        clock.advance(chrono::TimeDelta::hours(6) + chrono::TimeDelta::minutes(1));
+        let outcome = TestUser::reset_password_by_token(
+            &reset_attrs(&raw, "freshpass1", "freshpass1"),
+            &adapter,
+            &config,
+            &clock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome
+                .errors
+                .get("reset_password_token")
+                .map(Vec::as_slice),
+            Some(&[":expired".to_string()][..])
+        );
+
+        // Inside the window the same kind of token succeeds.
+        let raw = issue_reset_token(&adapter, &mailer, &config, &clock).await;
+        clock.advance(chrono::TimeDelta::hours(1));
+        let outcome = TestUser::reset_password_by_token(
+            &reset_attrs(&raw, "freshpass1", "freshpass1"),
+            &adapter,
+            &config,
+            &clock,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_valid(), "in-window reset: {:?}", outcome.errors);
+        assert_eq!(
+            outcome.record.raw_reset_password_token(),
+            Some(raw.as_str())
+        );
+
+        // Mismatched confirmation surfaces :confirmation (validation path).
+        let raw = issue_reset_token(&adapter, &mailer, &config, &clock).await;
+        let outcome = TestUser::reset_password_by_token(
+            &reset_attrs(&raw, "freshpass1", "different9"),
+            &adapter,
+            &config,
+            &clock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome
+                .errors
+                .get("password_confirmation")
+                .map(Vec::as_slice),
+            Some(&[":confirmation".to_string()][..])
+        );
+    }
+
     #[test]
     fn test_normalize_auth_conditions() {
         let config = DeviseConfig {
