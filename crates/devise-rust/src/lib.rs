@@ -18,6 +18,7 @@
 //! - `helpers` - per-scope auth helpers, path helpers, groups, `devise_helpers!`
 //! - `hooks` - `HookRegistry`, `HookFilter`, `Event`, bridge traits
 //! - `model` - `Authenticatable` trait, `PasswordVerifiable`, `ModelFinder` bridge
+//! - `mailer` - `Mailer` trait (5 actions), `MailerContext`, `TestMailer`, Tera templates
 //! - `proxy` - `AuthProxy` session and strategy execution
 //! - `request` - `AuthRequest`, `RequestFlags`, `HttpMethod`
 //! - `routes` - scope route tables and guard descriptors for bridges
@@ -39,6 +40,7 @@ pub mod failure;
 pub mod helpers;
 pub mod hooks;
 pub mod i18n;
+pub mod mailer;
 pub mod model;
 pub mod parameter;
 pub mod proxy;

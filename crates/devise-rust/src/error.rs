@@ -49,6 +49,9 @@ pub enum DeviseError {
     /// Internal error (should not happen in normal operation)
     #[error("Internal error: {0}")]
     Internal(String),
+    /// Mailer/rendering error (template render failure, delivery failure)
+    #[error("Mailer error: {0}")]
+    Mailer(String),
 }
 
 /// Validation errors container - field -> list of I18n error keys
