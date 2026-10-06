@@ -29,6 +29,7 @@ base64.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 subtle.workspace = true
+tera.workspace = true
 
 [features]
 test-utils = []
