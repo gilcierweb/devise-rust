@@ -1,4 +1,4 @@
-//! Parameter filtering and sanitization — `ParameterFilter` and `ParameterSanitizer`
+//! Parameter filtering and sanitization - `ParameterFilter` and `ParameterSanitizer`
 
 use crate::config::DeviseConfig;
 use serde_json::{Map, Value};
@@ -105,7 +105,7 @@ impl ParameterSanitizer {
     /// # Panics
     ///
     /// Panics if `action` has not been registered via [`Self::new`] or [`Self::permit`].
-    /// Unknown actions are a programmer error, not a runtime condition — call sites
+    /// Unknown actions are a programmer error, not a runtime condition - call sites
     /// must use the known action names (`sign_in`, `sign_up`, `account_update`).
     #[must_use]
     pub fn sanitize(&self, action: &str, params: &Map<String, Value>) -> Map<String, Value> {

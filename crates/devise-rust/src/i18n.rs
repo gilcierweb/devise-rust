@@ -1,6 +1,6 @@
-//! I18n catalog — Devise message keys via `rust-i18n` (compile-time YAML codegen)
+//! I18n catalog - Devise message keys via `rust-i18n` (compile-time YAML codegen)
 //!
-//! Translations live in `crates/devise-rust/locales/en.yml` — the vendored Devise
+//! Translations live in `crates/devise-rust/locales/en.yml` - the vendored Devise
 //! catalog adapted to rust-i18n `_version: 1` layout (filename = locale, no
 //! top-level `en:` wrapper). Message keys, `%{placeholder}` interpolation, and
 //! copy are identical to Devise's `config/locales/en.yml`.

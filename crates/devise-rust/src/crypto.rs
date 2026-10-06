@@ -1,4 +1,4 @@
-//! Crypto primitives — bcrypt Encryptor, HMAC-SHA256 `TokenGenerator`, `secure_compare`, `friendly_token`
+//! Crypto primitives - bcrypt Encryptor, HMAC-SHA256 `TokenGenerator`, `secure_compare`, `friendly_token`
 
 use crate::config::DeviseConfig;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -18,7 +18,7 @@ pub mod encryptor {
     ///
     /// # Panics
     ///
-    /// Panics if bcrypt fails with the clamped cost (should not happen — cost is clamped to ≤ 31).
+    /// Panics if bcrypt fails with the clamped cost (should not happen - cost is clamped to ≤ 31).
     #[must_use]
     pub fn digest(password: &str, config: &DeviseConfig) -> String {
         let mut password_with_pepper = password.to_string();
@@ -40,7 +40,7 @@ pub mod encryptor {
     }
 }
 
-/// HMAC-SHA256 token generation — stores only digest, emails carry raw token
+/// HMAC-SHA256 token generation - stores only digest, emails carry raw token
 pub mod token_generator {
     use super::{HmacSha256, KeyInit, Mac};
 
@@ -57,7 +57,7 @@ pub mod token_generator {
     ///
     /// # Panics
     ///
-    /// Panics if the HMAC key is rejected (should not happen — HMAC accepts any key length).
+    /// Panics if the HMAC key is rejected (should not happen - HMAC accepts any key length).
     #[must_use]
     pub fn digest(secret_key: &str, column: &str, value: &str) -> String {
         let key = column_key(secret_key, column);
@@ -112,7 +112,7 @@ pub fn secure_compare(a: &str, b: &str) -> bool {
 }
 
 /// Generate a URL-safe base64 token with Devise's exact character translation:
-/// `SecureRandom.urlsafe_base64(len*3/4).tr('lIO0', 'sxyz')` — i.e. l→s, I→x, O→y, 0→z.
+/// `SecureRandom.urlsafe_base64(len*3/4).tr('lIO0', 'sxyz')` - i.e. l→s, I→x, O→y, 0→z.
 /// `_` is preserved, matching Devise (`tr` only remaps the four ambiguous alphanumerics).
 ///
 /// # Panics

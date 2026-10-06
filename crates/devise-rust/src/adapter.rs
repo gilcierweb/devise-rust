@@ -1,4 +1,4 @@
-//! Persistence abstractions — `OrmAdapter` trait, `OrmError`, `Conditions`, `ChangeSet`, `DeviseKey`, in-memory adapter
+//! Persistence abstractions - `OrmAdapter` trait, `OrmError`, `Conditions`, `ChangeSet`, `DeviseKey`, in-memory adapter
 //!
 //! Mirrors the `orm_adapter` gem layer Devise programs against
 //! (`to_adapter.get`, `to_adapter.find_first`): every persistence call a Devise
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Backend failure taxonomy — every adapter maps its driver errors into this enum.
+/// Backend failure taxonomy - every adapter maps its driver errors into this enum.
 ///
 /// Renamed from `AdapterError` (the Phase-1 shipped name) to `OrmError` per the
 /// locked Phase-1 error-model decision (D-20): core never names
@@ -20,7 +20,7 @@ use uuid::Uuid;
 ///
 /// # Privacy contract
 ///
-/// `Display` output carries category and constraint/column metadata only —
+/// `Display` output carries category and constraint/column metadata only -
 /// never a record field value (email, token) nor a connection URL. The diesel
 /// backend's error mapper (plan 02-03) is specified against this contract and
 /// its tests assert value-absence.
@@ -32,7 +32,7 @@ pub enum OrmError {
     MultipleFound,
     /// A uniqueness constraint rejected the write (duplicate email, token
     /// collision). Carries the constraint/index name when the driver reports
-    /// one — never the conflicting value.
+    /// one - never the conflicting value.
     UniqueViolation {
         /// Database constraint or index name, when the driver reports one.
         constraint: Option<String>,
@@ -83,7 +83,7 @@ impl std::fmt::Display for OrmError {
     }
 }
 
-/// Key type for session serialization — supports both i64 and UUID
+/// Key type for session serialization - supports both i64 and UUID
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DeviseKey {
@@ -140,7 +140,7 @@ pub struct ParseDeviseKeyError(String);
 impl std::str::FromStr for DeviseKey {
     type Err = ParseDeviseKeyError;
 
-    /// Parse either an `i64` or a UUID — the two session-serializable key forms.
+    /// Parse either an `i64` or a UUID - the two session-serializable key forms.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Ok(i) = s.parse::<i64>() {
             return Ok(DeviseKey::Integer(i));
@@ -324,7 +324,7 @@ impl ChangeSet {
     }
 }
 
-/// Core persistence contract — every backend implements this.
+/// Core persistence contract - every backend implements this.
 ///
 /// Mirrors the `orm_adapter` gem surface Devise programs against
 /// (`to_adapter.get`, `to_adapter.get!`, `to_adapter.find_first`): `get` is the
@@ -332,17 +332,17 @@ impl ChangeSet {
 /// below the `save(validate: false)`-style persistence Devise modules rely on.
 ///
 /// `blank_record` is deliberately NOT part of this trait (D-14): constructing
-/// an empty record is construction, not persistence — it lands with Phase 3's
+/// an empty record is construction, not persistence - it lands with Phase 3's
 /// authenticatable model trait, which the paranoid-mode dummy hash consumes.
 #[async_trait]
 pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
-    /// The insert shape consumed by [`create`](OrmAdapter::create) (D-03) —
+    /// The insert shape consumed by [`create`](OrmAdapter::create) (D-03) -
     /// e.g. a diesel `Insertable` struct without id/timestamps (`NewUser` for
     /// `User`). Kept separate from `M` because the database owns generated
     /// columns; the caller never supplies them.
     type New: Send + Sync + 'static;
 
-    /// Fetch a record by primary key — mirrors `to_adapter.get`.
+    /// Fetch a record by primary key - mirrors `to_adapter.get`.
     ///
     /// # Errors
     ///
@@ -350,7 +350,7 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
     /// `Ok(None)`, never an error.
     async fn get(&self, id: &DeviseKey) -> Result<Option<M>, OrmError>;
 
-    /// Fetch a record by primary key, refusing absence — mirrors
+    /// Fetch a record by primary key, refusing absence - mirrors
     /// `to_adapter.get!` (which raises on a miss).
     ///
     /// # Errors
@@ -361,7 +361,7 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
         self.get(id).await?.ok_or(OrmError::NotFound)
     }
 
-    /// Find the first record matching `conditions` — mirrors `orm_adapter`'s
+    /// Find the first record matching `conditions` - mirrors `orm_adapter`'s
     /// `find_first`, the finder behind Devise's
     /// `find_for_database_authentication` and every `*_by_token` lookup
     /// (recoverable, confirmable, lockable).
@@ -381,7 +381,7 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
         self.find_first(conditions).await?.ok_or(OrmError::NotFound)
     }
 
-    /// Persist a new record from its insert shape — mirrors
+    /// Persist a new record from its insert shape - mirrors
     /// `to_adapter.create!`, Devise's registration path.
     ///
     /// # Examples
@@ -408,7 +408,7 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
 
     /// Alias of [`create`](OrmAdapter::create) (D-15): reconciles the roadmap's
     /// `insert` wording with `ActiveRecord` parity, where the canonical write
-    /// verb stays `create`. Free default — backends implement `create` only.
+    /// verb stays `create`. Free default - backends implement `create` only.
     ///
     /// # Errors
     ///
@@ -417,7 +417,7 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
         self.create(model).await
     }
 
-    /// Partial update writing only the [`ChangeSet`] diff (D-04/D-12) —
+    /// Partial update writing only the [`ChangeSet`] diff (D-04/D-12) -
     /// Devise's `save(validate: false)` path: lockable counters, token
     /// clearing, and every module persistence that must not run validations.
     /// Identity travels as [`DeviseKey`] so core needs no key-extraction glue;
@@ -453,7 +453,7 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
     /// failures propagate unchanged.
     async fn update(&self, key: &DeviseKey, changes: &ChangeSet) -> Result<M, OrmError>;
 
-    /// Always writes the named fields regardless of diff — mirrors
+    /// Always writes the named fields regardless of diff - mirrors
     /// `ActiveRecord::Persistence#update_columns` (D-12): skips validations
     /// and callbacks, and never touches `updated_at`. This is the verb for
     /// forced re-writes of an unchanged value (devise #5783) and for
@@ -476,7 +476,7 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
     /// rt.block_on(async {
     ///     let adapter = MemoryAdapter::<Widget>::new();
     ///     adapter.create(Widget { id: 0, name: "a".into() }).await.expect("create works");
-    ///     // Same value, still written — the #5783 force-write.
+    ///     // Same value, still written - the #5783 force-write.
     ///     let fields = HashMap::from([("name".to_owned(), Value::from("a"))]);
     ///     let updated = adapter.update_columns(&DeviseKey::from_i64(1), &fields).await.expect("update_columns works");
     ///     assert_eq!(updated.name, "a");
@@ -493,7 +493,7 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
         fields: &HashMap<String, Value>,
     ) -> Result<M, OrmError>;
 
-    /// Reports whether `column = value` matches no record (D-13) — the
+    /// Reports whether `column = value` matches no record (D-13) - the
     /// uniqueness probe behind `crypto::token_generator::generate_with`'s
     /// `is_unique` loop (PLAT-06). Default method composed from
     /// [`find_first`](OrmAdapter::find_first), so no backend implements it
@@ -531,7 +531,7 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
             .is_none())
     }
 
-    /// Delete the record under `key`; deleting a missing key is a no-op —
+    /// Delete the record under `key`; deleting a missing key is a no-op -
     /// mirrors `to_adapter.destroy`.
     ///
     /// # Errors
@@ -540,7 +540,7 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
     async fn delete(&self, id: &DeviseKey) -> Result<(), OrmError>;
 }
 
-/// In-memory adapter for testing — the behavioral oracle later backends are
+/// In-memory adapter for testing - the behavioral oracle later backends are
 /// checked against.
 pub mod memory {
     use super::{
@@ -593,7 +593,7 @@ pub mod memory {
         /// # Panics
         ///
         /// Panics when the storage lock is poisoned (a prior holder panicked
-        /// while holding it — unrecoverable by design in this test oracle).
+        /// while holding it - unrecoverable by design in this test oracle).
         fn apply_fields(
             &self,
             key: &DeviseKey,
@@ -692,7 +692,7 @@ pub mod memory {
     }
 }
 
-// Time abstraction lives in the top-level `time` module (single definition — DRY).
+// Time abstraction lives in the top-level `time` module (single definition - DRY).
 pub use crate::time::{Clock, FixedClock, SystemClock};
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! Test utilities — available with `test-utils` feature
+//! Test utilities - available with `test-utils` feature
 
 use crate::adapter::memory::MemoryAdapter;
 use crate::config::DeviseConfig;

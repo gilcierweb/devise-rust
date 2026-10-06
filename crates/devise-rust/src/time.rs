@@ -1,8 +1,8 @@
-//! Time abstraction — Clock trait with `SystemClock` and `FixedClock` implementations
+//! Time abstraction - Clock trait with `SystemClock` and `FixedClock` implementations
 
 use chrono::{DateTime, TimeDelta, Utc};
 
-/// Clock trait for time operations — enables time-freezing in tests
+/// Clock trait for time operations - enables time-freezing in tests
 pub trait Clock: Send + Sync {
     /// Get current UTC time
     fn now(&self) -> DateTime<Utc>;

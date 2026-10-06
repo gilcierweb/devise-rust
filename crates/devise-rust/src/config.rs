@@ -1,4 +1,4 @@
-//! Configuration module — `DeviseConfig` with all Devise options and per-scope overrides
+//! Configuration module - `DeviseConfig` with all Devise options and per-scope overrides
 
 use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ mod serde_time_delta_option {
     use chrono::TimeDelta;
     use serde::{Deserialize, Deserializer, Serializer};
 
-    // serde's `with` attribute requires `&Option<T>` — the lint suggestion is incompatible
+    // serde's `with` attribute requires `&Option<T>` - the lint suggestion is incompatible
     #[allow(clippy::ref_option)]
     pub fn serialize<S>(td: &Option<TimeDelta>, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -144,7 +144,7 @@ pub struct DeviseConfig {
     pub timeout_in: TimeDelta,
 
     // Sessions / scopes
-    /// Default scope (default: nil — Devise has no implicit default scope)
+    /// Default scope (default: nil - Devise has no implicit default scope)
     pub default_scope: Option<String>,
     /// Sign out all scopes on sign out (default: true)
     pub sign_out_all_scopes: bool,
@@ -176,7 +176,7 @@ pub struct DeviseConfig {
     pub omniauth_path_prefix: Option<String>,
 
     // Behavior flags
-    /// Paranoid mode — uniform failure messages + dummy password hash on missing users
+    /// Paranoid mode - uniform failure messages + dummy password hash on missing users
     /// (default: false, matching Devise 5.0.4 `@@paranoid = false`)
     pub paranoid: bool,
     /// Send email changed notification (default: false)
@@ -248,7 +248,7 @@ impl Default for DeviseConfig {
     }
 }
 
-/// Per-scope configuration override — all fields optional, cascade over global
+/// Per-scope configuration override - all fields optional, cascade over global
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeviseConfigOverride {
     pub secret_key: Option<String>,
@@ -423,7 +423,7 @@ impl DeviseConfigOverride {
 mod tests {
     use super::*;
 
-    /// Ported from `devise/test/devise_test.rb` — `Devise.email_regexp` matrix.
+    /// Ported from `devise/test/devise_test.rb` - `Devise.email_regexp` matrix.
     #[test]
     fn test_email_regexp_matches_devise_matrix() {
         let config = DeviseConfig::default();
