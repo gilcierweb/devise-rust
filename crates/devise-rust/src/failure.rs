@@ -5,6 +5,7 @@
 //! vs Recall) is added in Plan 04; this file defines the enum variants only.
 
 use crate::adapter::DeviseKey;
+use crate::request::AuthRequest;
 use serde::{Deserialize, Serialize};
 
 /// Type alias for authentication rules closure
@@ -215,6 +216,156 @@ impl std::fmt::Debug for dyn AnyDeviseModel {
     }
 }
 
+/// Bridges must NOT route application 401s through Devise failure handling.
+pub const INTERCEPT_401: bool = false;
+
+/// Why authentication failed - maps to `devise.failure.*` I18n keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureReason {
+    /// No session or credentials presented.
+    Unauthenticated,
+    /// Wrong credentials.
+    Invalid,
+    /// Email not confirmed.
+    Unconfirmed,
+    /// Account locked.
+    Locked,
+    /// Session timed out.
+    Timeout,
+    /// Already signed in (for `require_no_authentication`).
+    AlreadyAuthenticated,
+}
+
+impl FailureReason {
+    /// I18n key under `devise.failure.*`.
+    #[must_use]
+    pub fn flash_key(self) -> &'static str {
+        match self {
+            FailureReason::Unauthenticated => "unauthenticated",
+            FailureReason::Invalid => "invalid",
+            FailureReason::Unconfirmed => "unconfirmed",
+            FailureReason::Locked => "locked",
+            FailureReason::Timeout => "timeout",
+            FailureReason::AlreadyAuthenticated => "already_authenticated",
+        }
+    }
+}
+
+/// Check the request format against configured navigational formats.
+///
+/// Delegates to [`AuthRequest::is_navigational_format`](crate::request::AuthRequest::is_navigational_format).
+#[must_use]
+pub fn is_navigational_format(
+    request: &crate::request::AuthRequest,
+    config: &crate::config::DeviseConfig,
+) -> bool {
+    request.is_navigational_format(config)
+}
+
+/// Whether the request uses HTTP Basic auth that Devise should answer.
+#[must_use]
+pub fn http_auth(
+    request: &crate::request::AuthRequest,
+    config: &crate::config::DeviseConfig,
+) -> bool {
+    config.http_authenticatable && request.has_http_basic()
+}
+
+/// Core failure decision, mirroring `failure_app.rb`.
+///
+/// Priority: recall target, HTTP Basic, navigational redirect, API 401.
+/// The stored location is kept only for `GET` navigational non-XHR
+/// requests, per `store_location.rb`.
+#[must_use]
+pub fn build_failure(
+    request: &crate::request::AuthRequest,
+    mapping: &crate::scope::Mapping,
+    config: &crate::config::DeviseConfig,
+    reason: FailureReason,
+) -> Failure {
+    if let Some((controller, action)) = request.recall_target() {
+        return Failure::Recall { controller, action };
+    }
+    if http_auth(request, config) {
+        return Failure::ApiUnauthorized {
+            status: 401,
+            www_authenticate: Some(format!("Basic realm={}", config.http_authentication_realm)),
+        };
+    }
+    if is_navigational_format(request, config) {
+        let stored_location =
+            if request.method == crate::request::HttpMethod::Get && !request.is_xhr() {
+                AuthRequest::parse_stored_uri(&request.path)
+            } else {
+                None
+            };
+        return Failure::NavigationalRedirect {
+            location: mapping.sign_in_path(),
+            flash_key: reason.flash_key(),
+            stored_location,
+        };
+    }
+    Failure::ApiUnauthorized {
+        status: 401,
+        www_authenticate: None,
+    }
+}
+
+/// Session key holding the post-sign-in redirect target.
+#[must_use]
+pub fn stored_location_key(scope: &str) -> String {
+    format!("{scope}_return_to")
+}
+
+/// Save the attempted path for redirect-after-sign-in.
+///
+/// Only `GET` navigational non-XHR requests are stored, and only relative
+/// paths survive [`parse_stored_uri`](crate::request::AuthRequest::parse_stored_uri),
+/// which blocks open redirects.
+pub async fn store_location(
+    request: &crate::request::AuthRequest,
+    scope: &str,
+    config: &crate::config::DeviseConfig,
+    session_store: &dyn crate::session::SessionStore,
+) {
+    if request.method != crate::request::HttpMethod::Get
+        || request.is_xhr()
+        || !is_navigational_format(request, config)
+    {
+        return;
+    }
+    if let Some(location) = crate::request::AuthRequest::parse_stored_uri(&request.path) {
+        session_store
+            .insert_value(
+                &stored_location_key(scope),
+                serde_json::Value::String(location),
+            )
+            .await;
+    }
+}
+
+/// Take and clear the stored location for a scope.
+pub async fn stored_location_for(
+    scope: &str,
+    session_store: &dyn crate::session::SessionStore,
+) -> Option<String> {
+    let key = stored_location_key(scope);
+    let location = session_store.get_value(&key).await?;
+    session_store.remove(&key).await;
+    location.as_str().map(str::to_string)
+}
+
+/// Framework rendering contract for failures (S-13).
+///
+/// Core decides the `Failure`; bridges render it. Core never constructs
+/// HTTP responses.
+pub trait FailureRenderer: Send + Sync {
+    /// The framework response type (opaque to core).
+    type Response;
+    /// Render a failure for a scope mapping.
+    fn render(&self, failure: &Failure, mapping: &crate::scope::Mapping) -> Self::Response;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +415,230 @@ mod tests {
         let f3 = Failure::InvalidCredentials { message: "invalid" };
         let f4 = Failure::InvalidCredentials { message: "invalid" };
         assert_eq!(f3, f4);
+    }
+
+    #[derive(Debug, Default)]
+    struct FailureTestStore {
+        data:
+            std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, serde_json::Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::session::SessionStore for FailureTestStore {
+        async fn get_value(&self, key: &str) -> Option<serde_json::Value> {
+            self.data.read().unwrap().get(key).cloned()
+        }
+
+        async fn insert_value(&self, key: &str, value: serde_json::Value) {
+            self.data.write().unwrap().insert(key.to_string(), value);
+        }
+
+        async fn remove(&self, key: &str) {
+            self.data.write().unwrap().remove(key);
+        }
+
+        async fn remove_prefix(&self, prefix: &str) {
+            let mut data = self.data.write().unwrap();
+            let doomed: Vec<String> = data
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect();
+            for key in doomed {
+                data.remove(&key);
+            }
+        }
+
+        async fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+            self.data
+                .read()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect()
+        }
+
+        async fn renew(&self) -> Result<(), crate::error::DeviseError> {
+            Ok(())
+        }
+
+        async fn reset(&self) -> Result<(), crate::error::DeviseError> {
+            self.data.write().unwrap().clear();
+            Ok(())
+        }
+    }
+
+    fn failure_test_mapping() -> crate::scope::Mapping {
+        crate::scope::Mapping {
+            name: "user".to_string(),
+            class_name: "User".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: crate::scope::PathNames::default(),
+            controllers: std::collections::HashMap::new(),
+            modules: vec![crate::scope::Module::DatabaseAuthenticatable],
+            only: vec![],
+            skip: vec![],
+            constraints: std::collections::HashMap::new(),
+            defaults: std::collections::HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: crate::scope::SignOutVia::Delete,
+            failure_app: None,
+        }
+    }
+
+    fn html_request(path: &str) -> crate::request::AuthRequest {
+        let mut request =
+            crate::request::AuthRequest::new(crate::request::HttpMethod::Get, path.to_string());
+        request
+            .headers
+            .insert("accept".to_string(), "text/html".to_string());
+        request
+    }
+
+    #[test]
+    fn test_failure_decision() {
+        use crate::config::DeviseConfig;
+        let config = DeviseConfig::default();
+        let mapping = failure_test_mapping();
+
+        let navigational = build_failure(
+            &html_request("/protected"),
+            &mapping,
+            &config,
+            FailureReason::Unauthenticated,
+        );
+        assert!(matches!(
+            navigational,
+            Failure::NavigationalRedirect {
+                ref location,
+                flash_key: "unauthenticated",
+                ref stored_location,
+            } if location == "/users/sign_in" && stored_location.as_deref() == Some("/protected")
+        ));
+
+        let mut api = crate::request::AuthRequest::new(
+            crate::request::HttpMethod::Get,
+            "/api/resource".to_string(),
+        );
+        api.headers
+            .insert("accept".to_string(), "application/json".to_string());
+        // Default config includes */* as navigational, so override formats.
+        let api_config = DeviseConfig {
+            navigational_formats: vec!["html".to_string()],
+            ..DeviseConfig::default()
+        };
+        let unauthorized = build_failure(&api, &mapping, &api_config, FailureReason::Invalid);
+        assert!(matches!(
+            unauthorized,
+            Failure::ApiUnauthorized {
+                status: 401,
+                www_authenticate: None
+            }
+        ));
+
+        assert_eq!(FailureReason::Locked.flash_key(), "locked");
+        assert_eq!(
+            FailureReason::AlreadyAuthenticated.flash_key(),
+            "already_authenticated"
+        );
+        let intercept = INTERCEPT_401;
+        assert!(!intercept);
+    }
+
+    #[tokio::test]
+    async fn test_failure_decision_nav_api_recall() {
+        use crate::config::DeviseConfig;
+        let config = DeviseConfig::default();
+        let mapping = failure_test_mapping();
+
+        // Navigational: redirect with stored location.
+        let navigational = build_failure(
+            &html_request("/protected"),
+            &mapping,
+            &config,
+            FailureReason::Unauthenticated,
+        );
+        assert!(matches!(
+            navigational,
+            Failure::NavigationalRedirect {
+                flash_key: "unauthenticated",
+                ..
+            }
+        ));
+        assert_eq!(navigational.stored_location(), Some("/protected"));
+
+        // API: 401 without redirect or stored location.
+        let mut api = crate::request::AuthRequest::new(
+            crate::request::HttpMethod::Get,
+            "/api/resource".to_string(),
+        );
+        api.headers
+            .insert("accept".to_string(), "application/json".to_string());
+        let api_config = DeviseConfig {
+            navigational_formats: vec!["html".to_string()],
+            ..DeviseConfig::default()
+        };
+        let unauthorized = build_failure(&api, &mapping, &api_config, FailureReason::Invalid);
+        assert_eq!(unauthorized.status_code(), 401);
+        assert!(unauthorized.stored_location().is_none());
+
+        // HTTP Basic + API: WWW-Authenticate header present.
+        let mut basic_config = api_config.clone();
+        basic_config.http_authenticatable = true;
+        let mut basic = api.clone();
+        basic.headers.insert(
+            "authorization".to_string(),
+            "Basic dXNlcjpwYXNz".to_string(),
+        );
+        let challenged = build_failure(&basic, &mapping, &basic_config, FailureReason::Invalid);
+        assert_eq!(
+            challenged.www_authenticate(),
+            Some("Basic realm=Application")
+        );
+
+        // Recall: re-dispatch data preserved.
+        let mut recall = html_request("/users/sign_in");
+        recall
+            .params
+            .insert("recall_controller".to_string(), "sessions".to_string());
+        recall
+            .params
+            .insert("recall_action".to_string(), "new".to_string());
+        let recalled = build_failure(&recall, &mapping, &config, FailureReason::Invalid);
+        assert!(matches!(recalled, Failure::Recall { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_stored_location() {
+        use crate::config::DeviseConfig;
+        let config = DeviseConfig::default();
+        let store = FailureTestStore::default();
+
+        // GET navigational request is stored.
+        store_location(&html_request("/protected"), "user", &config, &store).await;
+        assert_eq!(
+            stored_location_for("user", &store).await.as_deref(),
+            Some("/protected")
+        );
+        // Take clears the key.
+        assert!(stored_location_for("user", &store).await.is_none());
+
+        // POST is never stored.
+        let mut post = crate::request::AuthRequest::new(
+            crate::request::HttpMethod::Post,
+            "/protected".to_string(),
+        );
+        post.headers
+            .insert("accept".to_string(), "text/html".to_string());
+        store_location(&post, "user", &config, &store).await;
+        assert!(stored_location_for("user", &store).await.is_none());
+
+        // Absolute URLs are rejected by the parser.
+        assert!(crate::request::AuthRequest::parse_stored_uri("http://evil.example/x").is_none());
+        assert_eq!(stored_location_key("user"), "user_return_to");
     }
 }

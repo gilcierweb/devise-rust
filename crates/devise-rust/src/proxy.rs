@@ -127,6 +127,12 @@ impl AuthProxy {
         &self.hooks
     }
 
+    /// Borrow the Devise config.
+    #[must_use]
+    pub fn config(&self) -> &DeviseConfig {
+        &self.config
+    }
+
     /// Whether the proxy is locked for this request.
     #[must_use]
     pub fn locked(&self) -> bool {
