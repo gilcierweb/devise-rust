@@ -423,6 +423,323 @@ pub enum SignUpOutcome<M> {
 }
 
 // ============================================================================
+// Recoverable (RCV-01..04)
+// Mirrors devise/lib/devise/models/recoverable.rb
+// ============================================================================
+
+/// `Recoverable` module: password reset tokens. The DB stores the HMAC
+/// digest and `reset_password_sent_at`; the RAW token only exists in the
+/// email link and in memory on the record that just received it.
+///
+/// == Options
+///
+/// * `reset_password_keys` - attributes used for instructions lookup (default `[:email]`)
+/// * `reset_password_within` - token validity window (default 6 hours)
+/// * `sign_in_after_reset_password` - controller-side sign-in decision
+///
+/// == Examples
+///
+/// ```ignore
+/// let raw = user.send_reset_password_instructions(&adapter, &mailer, &config, &clock).await?;
+/// let outcome = TestUser::reset_password_by_token(&attrs, &adapter, &config, &clock).await?;
+/// ```
+#[async_trait]
+pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
+    /// Stored `reset_password_token` column - always the HMAC digest, never raw.
+    fn reset_password_token(&self) -> Option<&str>;
+    /// `reset_password_sent_at` timestamp column.
+    fn reset_password_sent_at(&self) -> Option<chrono::DateTime<chrono::Utc>>;
+    /// Write the token columns (digest + `sent_at`).
+    fn set_reset_password_token_fields(
+        &mut self,
+        token: Option<String>,
+        sent_at: Option<chrono::DateTime<chrono::Utc>>,
+    );
+    /// Transient raw token, restored on the record after
+    /// `reset_password_by_token` (Devise restores the attribute in memory).
+    /// Never persisted.
+    fn raw_reset_password_token(&self) -> Option<&str> {
+        None
+    }
+    /// Restore the transient raw token (memory only).
+    fn set_raw_reset_password_token(&mut self, _raw: Option<String>) {}
+
+    /// `reset_password_period_valid` (RCV-02): the token was sent within
+    /// `reset_password_within`. Locked decision: takes `&dyn Clock`
+    /// (`FixedClock` in tests, `SystemClock` by default).
+    fn reset_password_period_valid(
+        &self,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> bool {
+        self.reset_password_sent_at()
+            .is_some_and(|sent_at| sent_at >= clock.ago(config.reset_password_within))
+    }
+
+    /// `send_reset_password_instructions` (RCV-01): generate a raw token via
+    /// `TokenGenerator`, persist the DIGEST + `reset_password_sent_at`
+    /// (`update_columns` = Devise `save(validate: false)`), email the RAW
+    /// token, and return the raw token.
+    ///
+    /// # Errors
+    /// `DeviseError::Adapter` on persistence failure, `DeviseError::Mailer`
+    /// when the notification cannot render.
+    async fn send_reset_password_instructions<A, L>(
+        &mut self,
+        adapter: &A,
+        mailer: &L,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> Result<String, crate::error::DeviseError>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+        L: crate::mailer::Mailer<Self>,
+    {
+        // Devise's TokenGenerator.generate loops until the digest is unique.
+        let (raw, enc) = loop {
+            let (raw, enc) = crate::crypto::token_generator::generate(
+                &config.secret_key,
+                "reset_password_token",
+            );
+            let mut conditions = Conditions::new();
+            conditions.insert("reset_password_token", Value::String(enc.clone()));
+            if adapter
+                .find_first(&conditions)
+                .await
+                .map_err(crate::error::DeviseError::Adapter)?
+                .is_none()
+            {
+                break (raw, enc);
+            }
+        };
+
+        let now = clock.now();
+        let current = std::collections::HashMap::from([
+            (
+                "reset_password_token".to_string(),
+                Value::String(enc.clone()),
+            ),
+            (
+                "reset_password_sent_at".to_string(),
+                Value::String(now.to_rfc3339()),
+            ),
+        ]);
+        adapter
+            .update_columns(&self.to_key(), &current)
+            .await
+            .map_err(crate::error::DeviseError::Adapter)?;
+        self.set_reset_password_token_fields(Some(enc), Some(now));
+
+        let context = crate::mailer::MailerContext::from_record(self)
+            .with_token(raw.clone())
+            .with_resource(self.serializable_hash());
+        mailer.reset_password_instructions(self, Some(&raw), &context)?;
+        Ok(raw)
+    }
+
+    /// `with_reset_password_token(token)` (RCV-02): digest the token and look
+    /// up the record by digest.
+    ///
+    /// # Errors
+    /// `DeviseError::Adapter` on lookup failure.
+    async fn with_reset_password_token<A>(
+        token: &str,
+        adapter: &A,
+        config: &DeviseConfig,
+    ) -> Result<Option<Self>, crate::error::DeviseError>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+    {
+        let enc = crate::crypto::token_generator::digest(
+            &config.secret_key,
+            "reset_password_token",
+            token,
+        );
+        let mut conditions = Conditions::new();
+        conditions.insert("reset_password_token", Value::String(enc));
+        adapter
+            .find_first(&conditions)
+            .await
+            .map_err(crate::error::DeviseError::Adapter)
+    }
+
+    /// Devise class method `send_reset_password_instructions(attributes)`:
+    /// find-or-initialize by `reset_password_keys` (paranoid-safe -
+    /// `:not_found` errors on a blank record when nothing matches), send on
+    /// hit.
+    ///
+    /// # Errors
+    /// `DeviseError::Adapter` on lookup/persistence failure, `DeviseError::Mailer`
+    /// when the notification cannot render.
+    async fn send_reset_password_instructions_for<A, L>(
+        attributes: &serde_json::Map<String, JsonValue>,
+        adapter: &A,
+        mailer: &L,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> Result<ResourceWithErrors<Self>, crate::error::DeviseError>
+    where
+        Self: Sized + Default,
+        A: OrmAdapter<Self> + Send + Sync,
+        L: crate::mailer::Mailer<Self>,
+    {
+        let keys: Vec<&str> = config
+            .reset_password_keys
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut conditions = Conditions::new();
+        for key in &keys {
+            if let Some(value) = attributes.get(*key).and_then(JsonValue::as_str) {
+                conditions.insert((*key).to_string(), Value::String(value.to_string()));
+            }
+        }
+        let mut resource =
+            Self::find_or_initialize_with_errors(&keys, &conditions, ":not_found", adapter, config)
+                .await;
+        if resource.is_valid() {
+            resource
+                .record
+                .send_reset_password_instructions(adapter, mailer, config, clock)
+                .await?;
+        }
+        Ok(resource)
+    }
+
+    /// `reset_password(new_password, new_password_confirmation)`: blank new
+    /// password -> `:password :blank`, no save. Otherwise assign virtuals,
+    /// validate, clear the token fields, persist
+    /// (Devise: `clear_reset_password_token` + `save`).
+    ///
+    /// # Errors
+    /// Outer: `DeviseError::Adapter` on persistence failure. Inner
+    /// `Err(ValidationErrors)`: Devise's `false` + populated `errors`.
+    async fn reset_password<A>(
+        &mut self,
+        new_password: Option<String>,
+        new_password_confirmation: Option<String>,
+        adapter: &A,
+        config: &DeviseConfig,
+    ) -> Result<Result<(), ValidationErrors>, crate::error::DeviseError>
+    where
+        Self: Validatable + Sized,
+        A: OrmAdapter<Self, New = Self> + Send + Sync,
+    {
+        let mut errors = ValidationErrors::new();
+        let Some(plain) = new_password.filter(|p| !p.is_empty()) else {
+            errors.add("password", ":blank");
+            return Ok(Err(errors));
+        };
+        self.set_password(Some(plain), config);
+        self.set_password_confirmation(new_password_confirmation);
+
+        let errors = self.validate(config);
+        if !errors.is_empty() {
+            return Ok(Err(errors));
+        }
+
+        self.clear_reset_password_token();
+        let current = std::collections::HashMap::from([
+            (
+                "encrypted_password".to_string(),
+                Value::String(self.encrypted_password().unwrap_or_default().to_string()),
+            ),
+            ("reset_password_token".to_string(), Value::Null),
+            ("reset_password_sent_at".to_string(), Value::Null),
+        ]);
+        adapter
+            .update_columns(&self.to_key(), &current)
+            .await
+            .map_err(crate::error::DeviseError::Adapter)?;
+        Ok(Ok(()))
+    }
+
+    /// `reset_password_by_token(attributes)` (RCV-02/03): blank token ->
+    /// `:reset_password_token :blank` on a fresh record; unknown token ->
+    /// `:not_found`; expired window -> `:expired`; otherwise reset, clear,
+    /// and restore the RAW token on the returned record (in memory).
+    ///
+    /// # Errors
+    /// `DeviseError::Adapter` on lookup/persistence failure.
+    async fn reset_password_by_token<A>(
+        attributes: &serde_json::Map<String, JsonValue>,
+        adapter: &A,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> Result<ResourceWithErrors<Self>, crate::error::DeviseError>
+    where
+        Self: Validatable + Sized + Default,
+        A: OrmAdapter<Self, New = Self> + Send + Sync,
+    {
+        let original = attributes
+            .get("reset_password_token")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        if original.is_empty() {
+            let mut errors = ValidationErrors::new();
+            errors.add("reset_password_token", ":blank");
+            return Ok(ResourceWithErrors::new(Self::default(), errors));
+        }
+
+        let Some(mut record) = Self::with_reset_password_token(&original, adapter, config).await?
+        else {
+            let mut errors = ValidationErrors::new();
+            errors.add("reset_password_token", ":not_found");
+            return Ok(ResourceWithErrors::new(Self::default(), errors));
+        };
+
+        if !record.reset_password_period_valid(config, clock) {
+            let mut errors = ValidationErrors::new();
+            errors.add("reset_password_token", ":expired");
+            return Ok(ResourceWithErrors::new(record, errors));
+        }
+
+        let password = attributes
+            .get("password")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        let confirmation = attributes
+            .get("password_confirmation")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        match record
+            .reset_password(password, confirmation, adapter, config)
+            .await?
+        {
+            Ok(()) => {
+                // Devise restores the raw token on the returned record.
+                record.set_raw_reset_password_token(Some(original));
+                Ok(ResourceWithErrors::new(record, ValidationErrors::new()))
+            }
+            Err(errors) => Ok(ResourceWithErrors::new(record, errors)),
+        }
+    }
+
+    /// RCV-04 (Devise `before_update` decision): reset token columns must be
+    /// cleared when the update changes `encrypted_password` or any
+    /// `authentication_keys` field.
+    fn pending_reset_token_clear(
+        &self,
+        changes: &crate::adapter::ChangeSet,
+        config: &DeviseConfig,
+    ) -> bool {
+        changes.has_changed("encrypted_password")
+            || config
+                .authentication_keys
+                .iter()
+                .any(|key| changes.has_changed(key))
+    }
+
+    /// Devise `clear_reset_password_token`: nil the token columns.
+    fn clear_reset_password_token(&mut self) {
+        self.set_reset_password_token_fields(None, None);
+    }
+}
+
+// ============================================================================
 // Validatable (VAL-01, VAL-02)
 // Mirrors devise/lib/devise/models/validatable.rb
 // ============================================================================
@@ -774,7 +1091,7 @@ mod tests {
     use crate::adapter::Value as AdapterValue;
     use crate::adapter::memory::MemoryAdapter;
 
-    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
     struct TestUser {
         id: i64,
         email: String,
@@ -789,6 +1106,11 @@ mod tests {
         skip_password_notification: bool,
         #[serde(skip)]
         inactive: bool,
+        reset_password_token: Option<String>,
+        reset_password_sent_at: Option<chrono::DateTime<chrono::Utc>>,
+        unconfirmed_email: Option<String>,
+        #[serde(skip)]
+        raw_reset_token: Option<String>,
     }
 
     impl TestUser {
@@ -802,6 +1124,10 @@ mod tests {
                 skip_email_notification: false,
                 skip_password_notification: false,
                 inactive: false,
+                reset_password_token: None,
+                reset_password_sent_at: None,
+                unconfirmed_email: None,
+                raw_reset_token: None,
             }
         }
     }
@@ -923,6 +1249,34 @@ mod tests {
 
         fn uniqueness_scope_id(&self) -> Option<String> {
             self.persisted().then(|| self.id.to_string())
+        }
+    }
+
+    #[async_trait]
+    impl Recoverable for TestUser {
+        fn reset_password_token(&self) -> Option<&str> {
+            self.reset_password_token.as_deref()
+        }
+
+        fn reset_password_sent_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+            self.reset_password_sent_at
+        }
+
+        fn set_reset_password_token_fields(
+            &mut self,
+            token: Option<String>,
+            sent_at: Option<chrono::DateTime<chrono::Utc>>,
+        ) {
+            self.reset_password_token = token;
+            self.reset_password_sent_at = sent_at;
+        }
+
+        fn raw_reset_password_token(&self) -> Option<&str> {
+            self.raw_reset_token.as_deref()
+        }
+
+        fn set_raw_reset_password_token(&mut self, raw: Option<String>) {
+            self.raw_reset_token = raw;
         }
     }
 
@@ -1704,6 +2058,102 @@ mod tests {
         assert!(!Registerable::sign_in_after_change_password(
             &saved,
             &config_off
+        ));
+    }
+
+    #[tokio::test]
+    async fn reset_flow_tracer() {
+        use crate::mailer::TestMailer;
+        use crate::time::FixedClock;
+
+        let config = test_config();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = TestMailer::default();
+        let clock = FixedClock::now();
+        let user = TestUser::testing("secret123", &config);
+        adapter.create(user.clone()).await.unwrap();
+
+        // 1. request reset: digest + timestamp persisted, RAW token emailed.
+        let mut found = TestUser::find_for_authentication(
+            &{
+                let mut c = Conditions::new();
+                c.insert(
+                    "email",
+                    AdapterValue::String("test@example.com".to_string()),
+                );
+                c
+            },
+            &adapter,
+            &config,
+        )
+        .await
+        .expect("user exists");
+        Recoverable::send_reset_password_instructions(
+            &mut found, &adapter, &mailer, &config, &clock,
+        )
+        .await
+        .expect("instructions send");
+
+        let sent = mailer.sent_mails();
+        let captured = sent.last().expect("email captured");
+        assert_eq!(captured.to, "test@example.com");
+        assert_eq!(captured.subject, "Reset password instructions");
+        let raw = captured
+            .template_vars
+            .token
+            .clone()
+            .expect("email delivers the raw token");
+
+        // Stored column holds the DIGEST, not the raw token.
+        assert_ne!(found.reset_password_token().unwrap(), raw);
+        assert_eq!(
+            found.reset_password_token().unwrap(),
+            crate::crypto::token_generator::digest(
+                &config.secret_key,
+                "reset_password_token",
+                &raw
+            )
+        );
+        assert!(found.reset_password_sent_at.is_some());
+
+        // 2. user follows the link: window validated, password reset, token
+        // cleared, raw token restored on the record.
+        let mut attrs = serde_json::Map::new();
+        attrs.insert(
+            "reset_password_token".to_string(),
+            JsonValue::String(raw.clone()),
+        );
+        attrs.insert(
+            "password".to_string(),
+            JsonValue::String("newsecret456".to_string()),
+        );
+        attrs.insert(
+            "password_confirmation".to_string(),
+            JsonValue::String("newsecret456".to_string()),
+        );
+        let outcome = TestUser::reset_password_by_token(&attrs, &adapter, &config, &clock)
+            .await
+            .unwrap();
+        assert!(outcome.is_valid(), "reset succeeds: {:?}", outcome.errors);
+        assert!(DatabaseAuthenticatable::valid_password(
+            &outcome.record,
+            "newsecret456",
+            &config
+        ));
+        assert_eq!(outcome.record.reset_password_token(), None);
+        assert_eq!(outcome.record.reset_password_sent_at, None);
+        assert_eq!(
+            outcome.record.raw_reset_password_token(),
+            Some(raw.as_str())
+        );
+
+        // The cleared state persisted.
+        let reloaded = adapter.get(&DeviseKey::from_i64(1)).await.unwrap().unwrap();
+        assert_eq!(Recoverable::reset_password_token(&reloaded), None);
+        assert!(DatabaseAuthenticatable::valid_password(
+            &reloaded,
+            "newsecret456",
+            &config
         ));
     }
 
