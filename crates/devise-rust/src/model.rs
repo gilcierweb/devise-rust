@@ -298,6 +298,61 @@ pub trait DatabaseAuthenticatable: Authenticatable {
     {
         Self::find_for_authentication(conditions, adapter, config).await
     }
+
+    /// `send_email_changed_notification` (DBAU-08): when enabled and not
+    /// skipped, mail the ORIGINAL address (the `ChangeSet`'s previous email).
+    /// The record's current state rides in the template's `resource` (so an
+    /// in-flight `unconfirmed_email` renders "being changed to", matching
+    /// Devise's conditional template).
+    ///
+    /// # Errors
+    /// `DeviseError::Mailer` when the notification cannot render.
+    fn send_email_changed_notification<L>(
+        &self,
+        changes: &crate::adapter::ChangeSet,
+        mailer: &L,
+        config: &DeviseConfig,
+    ) -> Result<(), crate::error::DeviseError>
+    where
+        L: crate::mailer::Mailer<Self>,
+        Self: crate::mailer::HasEmail + Sized,
+    {
+        let Some(recipient) = self.email_notification_recipient(changes, config) else {
+            return Ok(());
+        };
+        let context = crate::mailer::MailerContext {
+            email: recipient,
+            token: None,
+            url: None,
+            resource: self.serializable_hash(),
+        };
+        mailer.email_changed(self, None, &context)?;
+        Ok(())
+    }
+
+    /// `send_password_change_notification` (DBAU-09): when enabled, not
+    /// skipped, and `encrypted_password` changed, mail the CURRENT email.
+    ///
+    /// # Errors
+    /// `DeviseError::Mailer` when the notification cannot render.
+    fn send_password_change_notification<L>(
+        &self,
+        changes: &crate::adapter::ChangeSet,
+        mailer: &L,
+        config: &DeviseConfig,
+    ) -> Result<(), crate::error::DeviseError>
+    where
+        L: crate::mailer::Mailer<Self>,
+        Self: crate::mailer::HasEmail + Sized,
+    {
+        if !self.password_change_notification_pending(changes, config) {
+            return Ok(());
+        }
+        let context =
+            crate::mailer::MailerContext::from_record(self).with_resource(self.serializable_hash());
+        mailer.password_change(self, None, &context)?;
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -1111,6 +1166,8 @@ mod tests {
         unconfirmed_email: Option<String>,
         #[serde(skip)]
         raw_reset_token: Option<String>,
+        #[serde(skip)]
+        after_auth_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl TestUser {
@@ -1128,6 +1185,7 @@ mod tests {
                 reset_password_sent_at: None,
                 unconfirmed_email: None,
                 raw_reset_token: None,
+                after_auth_count: std::sync::Arc::default(),
             }
         }
     }
@@ -1145,6 +1203,11 @@ mod tests {
             Some(self)
         }
 
+        fn after_database_authentication(&self) {
+            self.after_auth_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
@@ -1158,7 +1221,11 @@ mod tests {
 
     impl Authenticatable for TestUser {
         fn serializable_hash(&self) -> JsonValue {
-            serde_json::json!({ "id": self.id, "email": self.email })
+            let mut map = serde_json::json!({ "id": self.id, "email": self.email });
+            if let Some(unconfirmed) = &self.unconfirmed_email {
+                map["unconfirmed_email"] = JsonValue::String(unconfirmed.clone());
+            }
+            map
         }
 
         fn active_for_authentication(&self) -> bool {

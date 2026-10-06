@@ -188,6 +188,13 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
         None
     }
 
+    /// Devise `after_database_authentication` entrypoint (DBAU-07).
+    ///
+    /// Default no-op; `DatabaseAuthenticatable` models wire it to the trait
+    /// method (strategies call it after a successful password check, exactly
+    /// where Devise's `database_authenticatable` strategy invokes it).
+    fn after_database_authentication(&self) {}
+
     /// Session pair for this model: `(key, salt)`.
     ///
     /// Mirrors Devise's `serialize_into_session(record)` so `AuthProxy` can

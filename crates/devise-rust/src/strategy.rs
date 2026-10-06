@@ -198,6 +198,9 @@ impl Strategy for ParamsStrategy {
             ));
         };
         if check.valid_password(&password, config) {
+            // DBAU-07: Devise fires after_database_authentication after a
+            // successful password check in the database_authenticatable strategy.
+            user.after_database_authentication();
             Ok(AuthOutcome::Success(user))
         } else {
             Err(Failure::InvalidCredentials { message: "invalid" })
@@ -280,6 +283,9 @@ impl Strategy for HttpBasicStrategy {
             ));
         };
         if check.valid_password(&password, config) {
+            // DBAU-07: after_database_authentication fires here (Devise's
+            // database_authenticatable strategy); http_basic is its twin.
+            user.after_database_authentication();
             Ok(AuthOutcome::Success(user))
         } else {
             Err(Failure::InvalidCredentials { message: "invalid" })
