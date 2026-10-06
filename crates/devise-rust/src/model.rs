@@ -347,6 +347,7 @@ pub trait Validatable: DatabaseAuthenticatable {
     /// Match `email` against the configured `email_regexp` (Devise default
     /// `\\A[^@\\s]+@[^@\\s]+\\z`; `\\A`/`\\z` anchors translated for the
     /// `regex` crate).
+    #[must_use]
     fn email_format_valid(email: &str, config: &DeviseConfig) -> bool {
         let pattern = config.email_regexp.replace(r"\A", "^").replace(r"\z", "$");
         regex::Regex::new(&pattern).is_ok_and(|re| re.is_match(email))
@@ -1119,11 +1120,6 @@ mod tests {
     #[tokio::test]
     async fn validatable_tests() {
         let config = test_config();
-        let adapter = MemoryAdapter::<TestUser>::new();
-        adapter
-            .create(TestUser::testing("secret123", &config))
-            .await
-            .unwrap();
 
         // New record: password required; blank email/password flagged.
         let blank = TestUser::default();
@@ -1154,8 +1150,10 @@ mod tests {
         }
 
         // Confirmation mismatch and length bounds (6..128 inclusive, Ruby range).
-        let mut mismatch = TestUser::default();
-        mismatch.email = "fresh@example.com".to_string();
+        let mut mismatch = TestUser {
+            email: "fresh@example.com".to_string(),
+            ..TestUser::default()
+        };
         mismatch.set_password(Some("secret123".to_string()), &config);
         mismatch.set_password_confirmation(Some("different".to_string()));
         let errors = Validatable::validate(&mismatch, &config);
@@ -1164,18 +1162,22 @@ mod tests {
             Some(&[":confirmation".to_string()][..])
         );
 
-        let mut short = TestUser::default();
-        short.email = "fresh@example.com".to_string();
-        short.set_password_virtual(Some("12345".to_string()));
+        let short = TestUser {
+            email: "fresh@example.com".to_string(),
+            password: Some("12345".to_string()),
+            ..TestUser::default()
+        };
         let errors = Validatable::validate(&short, &config);
         assert_eq!(
             errors.get("password").map(Vec::as_slice),
             Some(&[":too_short".to_string()][..])
         );
 
-        let mut long = TestUser::default();
-        long.email = "fresh@example.com".to_string();
-        long.set_password_virtual(Some("x".repeat(129)));
+        let long = TestUser {
+            email: "fresh@example.com".to_string(),
+            password: Some("x".repeat(129)),
+            ..TestUser::default()
+        };
         let errors = Validatable::validate(&long, &config);
         assert_eq!(
             errors.get("password").map(Vec::as_slice),
@@ -1184,9 +1186,11 @@ mod tests {
 
         // 6 and 128 are valid bounds (Ruby inclusive range parity).
         for len in [6usize, 128] {
-            let mut user = TestUser::default();
-            user.email = "bounds@example.com".to_string();
-            user.set_password_virtual(Some("x".repeat(len)));
+            let user = TestUser {
+                email: "bounds@example.com".to_string(),
+                password: Some("x".repeat(len)),
+                ..TestUser::default()
+            };
             let errors = Validatable::validate(&user, &config);
             assert!(errors.is_empty(), "length {len} should pass: {errors:?}");
         }
@@ -1194,6 +1198,16 @@ mod tests {
         // Persisted record with no password fields: password not required.
         let persisted = TestUser::testing("secret123", &config);
         assert!(!Validatable::password_required(&persisted));
+    }
+
+    #[tokio::test]
+    async fn validatable_uniqueness() {
+        let config = test_config();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        adapter
+            .create(TestUser::testing("secret123", &config))
+            .await
+            .unwrap();
 
         // Uniqueness: another record with the same email (case-sensitive at DB).
         let dupe = TestUser {
