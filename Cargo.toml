@@ -49,6 +49,7 @@ hex = "0.4"
 subtle = "2.5"
 # tera: template engine for Devise mailer bodies (RESEARCH.md standard stack; package-audit OK)
 tera = "1.19"
+regex = "1.10"
 insta = "1.49"
 rstest = "0.27"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

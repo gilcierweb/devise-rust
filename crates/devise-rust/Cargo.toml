@@ -30,6 +30,7 @@ getrandom.workspace = true
 hex.workspace = true
 subtle.workspace = true
 tera.workspace = true
+regex.workspace = true
 
 [features]
 test-utils = []
@@ -37,5 +38,3 @@ test-utils = []
 [dev-dependencies]
 pretty_assertions = "1.4"
 tokio = { version = "1", features = ["macros", "rt"] }
-# Dev-only: email_regexp matrix test (runtime use lands with validatable in Phase 4)
-regex = "1.10"
