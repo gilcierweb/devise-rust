@@ -64,7 +64,8 @@ pub struct MailerContext {
     /// application-constructed - which it always is (route helper + raw token).
     pub url: Option<String>,
     /// Serializable record fields available to templates (`@resource`).
-    pub resource: serde_json::Value,}
+    pub resource: serde_json::Value,
+}
 
 impl MailerContext {
     /// Build a context extracting the email from the record (MAIL-03).
@@ -122,6 +123,9 @@ pub trait HasEmail {
 /// and the extracted [`MailerContext`], returning the rendered body.
 pub trait Mailer<M>: Send + Sync {
     /// `confirmation_instructions` - welcome mail with confirmation link.
+    ///
+    /// # Errors
+    /// Returns `DeviseError::Mailer` when the template fails to render.
     fn confirmation_instructions(
         &self,
         record: &M,
@@ -130,6 +134,9 @@ pub trait Mailer<M>: Send + Sync {
     ) -> Result<String, DeviseError>;
 
     /// `reset_password_instructions` - password reset link mail.
+    ///
+    /// # Errors
+    /// Returns `DeviseError::Mailer` when the template fails to render.
     fn reset_password_instructions(
         &self,
         record: &M,
@@ -138,6 +145,9 @@ pub trait Mailer<M>: Send + Sync {
     ) -> Result<String, DeviseError>;
 
     /// `unlock_instructions` - account-unlock link mail.
+    ///
+    /// # Errors
+    /// Returns `DeviseError::Mailer` when the template fails to render.
     fn unlock_instructions(
         &self,
         record: &M,
@@ -146,6 +156,9 @@ pub trait Mailer<M>: Send + Sync {
     ) -> Result<String, DeviseError>;
 
     /// `email_changed` - notification to the ORIGINAL address.
+    ///
+    /// # Errors
+    /// Returns `DeviseError::Mailer` when the template fails to render.
     fn email_changed(
         &self,
         record: &M,
@@ -154,6 +167,9 @@ pub trait Mailer<M>: Send + Sync {
     ) -> Result<String, DeviseError>;
 
     /// `password_change` - notification that the password changed.
+    ///
+    /// # Errors
+    /// Returns `DeviseError::Mailer` when the template fails to render.
     fn password_change(
         &self,
         record: &M,
@@ -294,6 +310,52 @@ mod tests {
         fn email(&self) -> &str {
             &self.email
         }
+    }
+
+    #[test]
+    fn mailer_trait_compiles() {
+        // Generic bound proof: any `Mailer<M>` exposes all 5 Devise actions
+        // taking (&M, Option<&str>, &MailerContext) -> Result<String, DeviseError>.
+        fn send_all<M, T: Mailer<M>>(
+            mailer: &T,
+            record: &M,
+            ctx: &MailerContext,
+        ) -> Result<Vec<String>, DeviseError> {
+            Ok(vec![
+                mailer.confirmation_instructions(record, ctx.token.as_deref(), ctx)?,
+                mailer.reset_password_instructions(record, ctx.token.as_deref(), ctx)?,
+                mailer.unlock_instructions(record, ctx.token.as_deref(), ctx)?,
+                mailer.email_changed(record, ctx.token.as_deref(), ctx)?,
+                mailer.password_change(record, ctx.token.as_deref(), ctx)?,
+            ])
+        }
+
+        let user = User {
+            email: "user@example.com".to_string(),
+        };
+        let mailer = TestMailer::default();
+        let ctx = MailerContext::from_record(&user)
+            .with_token("tok")
+            .with_url("https://example.com/action?token=tok");
+
+        let bodies = send_all(&mailer, &user, &ctx).expect("all 5 actions deliver");
+        assert_eq!(bodies.len(), 5);
+
+        let sent = mailer.sent_mails();
+        assert_eq!(sent.len(), 5);
+        let subjects: Vec<&str> = sent.iter().map(|m| m.subject.as_str()).collect();
+        // Subjects from the vendored Devise catalog (config/locales/en.yml).
+        assert_eq!(
+            subjects,
+            [
+                "Confirmation instructions",
+                "Reset password instructions",
+                "Unlock instructions",
+                "Email Changed",
+                "Password Changed"
+            ]
+        );
+        assert!(sent.iter().all(|m| m.to == "user@example.com"));
     }
 
     #[test]
