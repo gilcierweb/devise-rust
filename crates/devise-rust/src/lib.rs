@@ -16,6 +16,8 @@
 //! - `error` - `DeviseError`, `ValidationErrors`, `ResourceWithErrors`, `BlankRecord`
 //! - `failure` - `Failure` enum, `AuthOutcome`, `AnyDeviseModel` trait
 //! - `request` - `AuthRequest`, `RequestFlags`, `HttpMethod`
+//! - `session` - `SessionStore` trait, serializer, key naming
+//! - `scope` - `Module`, `Mapping`, `ScopeRegistry`, `RouteSpec`
 
 #![warn(clippy::all, clippy::pedantic, unsafe_code)]
 
@@ -31,6 +33,8 @@ pub mod failure;
 pub mod i18n;
 pub mod parameter;
 pub mod request;
+pub mod scope;
+pub mod session;
 pub mod time;
 
 #[cfg(feature = "test-utils")]
