@@ -94,10 +94,7 @@ pub trait Authenticatable: AnyDeviseModel {
     where
         Self: Sized,
     {
-        (
-            self.to_key(),
-            self.authenticatable_salt().unwrap_or_default(),
-        )
+        self.session_pair()
     }
 
     /// Deserialize a session payload back to the record with salt validation.

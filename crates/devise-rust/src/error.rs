@@ -194,6 +194,12 @@ pub fn is_unsafe_attribute(attr: &str) -> bool {
     UNSAFE_ATTRIBUTES_FOR_SERIALIZATION.contains(&attr)
 }
 
+impl From<crate::failure::Failure> for DeviseError {
+    fn from(failure: crate::failure::Failure) -> Self {
+        DeviseError::Internal(format!("{failure:?}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

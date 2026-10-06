@@ -128,7 +128,12 @@ pub struct HookContext<'a> {
 }
 
 /// Trait for hook functions - must be Send + Sync for dyn compatibility
-pub type HookFn = dyn Fn(&mut HookContext<'_>) -> Result<(), Failure> + Send + Sync;
+pub type HookFn = dyn for<'a> Fn(
+        &'a mut HookContext<'_>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), Failure>> + Send + 'a>,
+    > + Send
+    + Sync;
 
 /// Internal hook entry for ordering
 struct HookEntry {
@@ -185,10 +190,10 @@ impl HookRegistry {
     /// # Errors
     ///
     /// Returns the first hook's `Failure`; hooks that pass return `Ok(())`.
-    pub fn run_hooks(&self, ctx: &mut HookContext<'_>) -> Result<(), Failure> {
+    pub async fn run_hooks(&self, ctx: &mut HookContext<'_>) -> Result<(), Failure> {
         for entry in &self.hooks {
             if entry.filter.matches(ctx) {
-                (entry.hook)(ctx)?;
+                (entry.hook)(ctx).await?;
             }
         }
         Ok(())
@@ -240,14 +245,16 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
     registry.add_hook(
         HookFilter::new().only(vec![Event::SetUser, Event::Authentication]),
         Box::new(|ctx| {
-            if let Some(record) = ctx.record {
-                if !record.valid_for_authentication(None) {
-                    return Err(Failure::Unauthenticated {
-                        message: record.unauthenticated_message(),
-                    });
+            Box::pin(async move {
+                if let Some(record) = ctx.record {
+                    if !record.valid_for_authentication(None) {
+                        return Err(Failure::Unauthenticated {
+                            message: record.unauthenticated_message(),
+                        });
+                    }
                 }
-            }
-            Ok(())
+                Ok(())
+            })
         }),
         false,
     );
@@ -255,11 +262,13 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
     // 2. CSRF Cleaner - runs on Authentication for all scopes
     registry.add_hook(
         HookFilter::new().only(vec![Event::Authentication]),
-        Box::new(|_ctx| {
-            // Session renewal and CSRF rotation happen here.
-            // Async renewal lands with the AuthProxy integration (Plan 03-02),
-            // which drives hooks through an async dispatcher.
-            Ok(())
+        Box::new(|ctx| {
+            Box::pin(async move {
+                // Session renewal and CSRF rotation happen here.
+                // Framework bridges rotate their CSRF token inside renew().
+                let _ = ctx.proxy.session_store().renew().await;
+                Ok(())
+            })
         }),
         false,
     );
@@ -269,8 +278,10 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
         registry.add_hook(
             HookFilter::new().only(vec![Event::Authentication]),
             Box::new(|_ctx| {
-                // TODO Phase 5: record.update_tracked_fields(ctx.request.unwrap())
-                Ok(())
+                Box::pin(async move {
+                    // TODO Phase 5: record.update_tracked_fields(ctx.request.unwrap())
+                    Ok(())
+                })
             }),
             false,
         );
@@ -281,8 +292,10 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
         registry.add_hook(
             HookFilter::new().only(vec![Event::Authentication]),
             Box::new(|_ctx| {
-                // TODO Phase 5: if remember_me_flag { record.remember_me!(); RememberableBridge::set_cookie(...) }
-                Ok(())
+                Box::pin(async move {
+                    // TODO Phase 5: if remember_me_flag { record.remember_me!(); RememberableBridge::set_cookie(...) }
+                    Ok(())
+                })
             }),
             false,
         );
@@ -293,8 +306,10 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
         registry.add_hook(
             HookFilter::new().only(vec![Event::Logout]),
             Box::new(|_ctx| {
-                // TODO Phase 5: record.forget_me!(); RememberableBridge::clear_cookie(...)
-                Ok(())
+                Box::pin(async move {
+                    // TODO Phase 5: record.forget_me!(); RememberableBridge::clear_cookie(...)
+                    Ok(())
+                })
             }),
             false,
         );
@@ -305,8 +320,10 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
         registry.add_hook(
             HookFilter::new().only(vec![Event::Authentication]),
             Box::new(|_ctx| {
-                // TODO Phase 5: record.reset_failed_attempts!()
-                Ok(())
+                Box::pin(async move {
+                    // TODO Phase 5: record.reset_failed_attempts!()
+                    Ok(())
+                })
             }),
             false,
         );
@@ -317,8 +334,10 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
         registry.add_hook(
             HookFilter::new().only(vec![Event::Request]),
             Box::new(|_ctx| {
-                // TODO Phase 5: update last_request_at; if record.timedout?(last) { return Err(Failure::Timeout) }
-                Ok(())
+                Box::pin(async move {
+                    // TODO Phase 5: update last_request_at; if record.timedout?(last) { return Err(Failure::Timeout) }
+                    Ok(())
+                })
             }),
             false,
         );
@@ -457,8 +476,8 @@ mod tests {
         assert!(!filter.matches(&ctx3));
     }
 
-    #[test]
-    fn test_hook_registry_dispatch() {
+    #[tokio::test]
+    async fn test_hook_registry_dispatch() {
         let mut registry = HookRegistry::new();
         let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called_clone = called.clone();
@@ -466,8 +485,11 @@ mod tests {
         registry.add_hook(
             HookFilter::new().only(vec![Event::Authentication]),
             Box::new(move |_ctx| {
-                called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
+                let called = called_clone.clone();
+                Box::pin(async move {
+                    called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
             }),
             false,
         );
@@ -479,7 +501,7 @@ mod tests {
             request: None,
             record: None,
         };
-        registry.run_hooks(&mut ctx).unwrap();
+        registry.run_hooks(&mut ctx).await.unwrap();
         assert!(called.load(std::sync::atomic::Ordering::SeqCst));
     }
 

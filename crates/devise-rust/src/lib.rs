@@ -17,9 +17,11 @@
 //! - `failure` - `Failure` enum, `AuthOutcome`, `AnyDeviseModel` trait
 //! - `hooks` - `HookRegistry`, `HookFilter`, `Event`, bridge traits
 //! - `model` - `Authenticatable` trait, `PasswordVerifiable`, `ModelFinder` bridge
+//! - `proxy` - `AuthProxy` session and strategy execution
 //! - `request` - `AuthRequest`, `RequestFlags`, `HttpMethod`
-//! - `session` - `SessionStore` trait, serializer, key naming
 //! - `scope` - `Module`, `Mapping`, `ScopeRegistry`, `RouteSpec`
+//! - `session` - `SessionStore` trait, serializer, key naming
+//! - `strategy` - `Strategy` chain: params, HTTP Basic, rememberable, paranoid
 
 #![warn(clippy::all, clippy::pedantic, unsafe_code)]
 
@@ -36,9 +38,11 @@ pub mod hooks;
 pub mod i18n;
 pub mod model;
 pub mod parameter;
+pub mod proxy;
 pub mod request;
 pub mod scope;
 pub mod session;
+pub mod strategy;
 pub mod time;
 
 #[cfg(feature = "test-utils")]

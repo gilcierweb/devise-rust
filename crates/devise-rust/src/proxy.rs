@@ -1,0 +1,766 @@
+//! `AuthProxy` - warden Proxy port for session and strategy execution
+//!
+//! Manages per-scope memoized users, runs the strategy chain in Devise
+//! order (rememberable, params, HTTP Basic), persists `[key, salt]` session
+//! payloads, and dispatches hooks through `HookRegistry`.
+//!
+//! Ordering note: `set_user` runs hooks *before* persisting the session and
+//! memoizing the user. When a hook rejects (e.g. activatable), nothing is
+//! persisted, so a rejection never leaves a half-written session behind.
+//! Hook observers receive the incoming record through `HookContext.record`.
+
+use crate::adapter::DeviseKey;
+use crate::config::DeviseConfig;
+use crate::error::DeviseError;
+use crate::failure::{AnyDeviseModel, AuthOutcome, Failure};
+use crate::hooks::{Event, HookContext, HookRegistry};
+use crate::model::ModelFinder;
+use crate::request::AuthRequest;
+use crate::scope::{Module, ScopeRegistry};
+use crate::session::{self, SessionStore};
+use crate::strategy::{
+    HttpBasicStrategy, ParamsStrategy, ParanoidStrategy, RememberableStrategy, Strategy,
+};
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
+use std::sync::Arc;
+
+/// Event that triggered `set_user`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetUserEvent {
+    /// User authenticated (sign in, sign up).
+    Authentication,
+    /// User fetched from session.
+    Fetch,
+    /// User explicitly assigned.
+    SetUser,
+}
+
+/// Options for [`AuthProxy::set_user`].
+#[derive(Debug, Clone)]
+pub struct SetUserOpts {
+    /// Event that triggered the call.
+    pub event: SetUserEvent,
+    /// Persist the session (ignored for `Fetch`).
+    pub store: bool,
+    /// Run `HookRegistry` hooks.
+    pub run_callbacks: bool,
+    /// Sign in even when the same user is already present.
+    pub force: bool,
+}
+
+impl Default for SetUserOpts {
+    fn default() -> Self {
+        Self {
+            event: SetUserEvent::Authentication,
+            store: true,
+            run_callbacks: true,
+            force: false,
+        }
+    }
+}
+
+fn boxed<S: Strategy + 'static>(strategy: S, paranoid: bool) -> Box<dyn Strategy> {
+    if paranoid {
+        Box::new(ParanoidStrategy::new(strategy))
+    } else {
+        Box::new(strategy)
+    }
+}
+
+/// Central authentication state for one request.
+pub struct AuthProxy {
+    users: HashMap<String, Option<Box<dyn AnyDeviseModel>>>,
+    performed: HashMap<String, HashSet<String>>,
+    locked: bool,
+    session_store: Arc<dyn SessionStore>,
+    registry: Arc<ScopeRegistry>,
+    hooks: Arc<HookRegistry>,
+    finders: HashMap<String, Arc<dyn ModelFinder>>,
+    config: Arc<DeviseConfig>,
+}
+
+impl AuthProxy {
+    /// Create a proxy over shared request-scoped collaborators.
+    ///
+    /// Per-scope [`ModelFinder`]s are registered separately with
+    /// [`register_finder`](Self::register_finder).
+    #[must_use]
+    pub fn new(
+        session_store: Arc<dyn SessionStore>,
+        registry: Arc<ScopeRegistry>,
+        hooks: Arc<HookRegistry>,
+        config: Arc<DeviseConfig>,
+    ) -> Self {
+        Self {
+            users: HashMap::new(),
+            performed: HashMap::new(),
+            locked: false,
+            session_store,
+            registry,
+            hooks,
+            finders: HashMap::new(),
+            config,
+        }
+    }
+
+    /// Register the model finder backing one scope.
+    pub fn register_finder(&mut self, scope: &str, finder: Arc<dyn ModelFinder>) {
+        self.finders.insert(scope.to_string(), finder);
+    }
+
+    /// Borrow the scope registry.
+    #[must_use]
+    pub fn scope_registry(&self) -> &ScopeRegistry {
+        &self.registry
+    }
+
+    /// Borrow the session store.
+    #[must_use]
+    pub fn session_store(&self) -> &dyn SessionStore {
+        self.session_store.as_ref()
+    }
+
+    /// Borrow the hook registry.
+    #[must_use]
+    pub fn hooks(&self) -> &HookRegistry {
+        &self.hooks
+    }
+
+    /// Whether the proxy is locked for this request.
+    #[must_use]
+    pub fn locked(&self) -> bool {
+        self.locked
+    }
+
+    /// Lock the proxy, blocking further authentication this request.
+    pub fn lock(&mut self) {
+        self.locked = true;
+    }
+
+    /// Authenticate a scope, running session fetch then strategies as needed.
+    ///
+    /// Returns the memoized user, or `None` when unauthenticated.
+    pub async fn authenticate(
+        &mut self,
+        scope: &str,
+        request: &AuthRequest,
+    ) -> Option<&dyn AnyDeviseModel> {
+        match self.try_authenticate(scope, request).await {
+            Ok(()) => self.users.get(scope).and_then(|slot| slot.as_deref()),
+            Err(_) => None,
+        }
+    }
+
+    /// Authenticate strictly, propagating the real `Failure`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the strategy or hook `Failure` when authentication fails.
+    pub async fn authenticate_strict(
+        &mut self,
+        scope: &str,
+        request: &AuthRequest,
+    ) -> Result<&dyn AnyDeviseModel, Failure> {
+        self.try_authenticate(scope, request).await?;
+        self.users
+            .get(scope)
+            .and_then(|slot| slot.as_deref())
+            .ok_or(Failure::Unauthenticated { message: "invalid" })
+    }
+
+    /// Check authentication without running strategies (memo or nothing).
+    #[must_use]
+    pub fn authenticated(&self, scope: &str) -> bool {
+        self.users
+            .get(scope)
+            .and_then(|slot| slot.as_deref())
+            .is_some()
+    }
+
+    /// Downcast the memoized user to its concrete model type.
+    #[must_use]
+    pub fn user<M: 'static>(&self, scope: &str) -> Option<&M> {
+        self.users
+            .get(scope)
+            .and_then(|slot| slot.as_deref())
+            .and_then(|user| user.as_any().downcast_ref::<M>())
+    }
+
+    /// Core warden `set_user` semantics.
+    ///
+    /// Hooks run before persistence: a rejection leaves no session behind.
+    /// No-ops when the same user is already present unless `force` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviseError`] when session renewal or a hook fails.
+    pub async fn set_user(
+        &mut self,
+        scope: &str,
+        user: Option<Box<dyn AnyDeviseModel>>,
+        opts: SetUserOpts,
+    ) -> Result<bool, DeviseError> {
+        let current = self.users.get(scope).and_then(|slot| slot.as_deref());
+        let incoming = user.as_deref();
+        let same = matches!((current, incoming), (Some(old), Some(new)) if old.is_same(new));
+        if same && !opts.force && opts.event == SetUserEvent::Authentication {
+            return Ok(false);
+        }
+
+        if opts.run_callbacks && opts.event != SetUserEvent::Fetch {
+            let hooks = self.hooks.clone();
+            let event = match opts.event {
+                SetUserEvent::Authentication => Event::Authentication,
+                SetUserEvent::SetUser => Event::SetUser,
+                SetUserEvent::Fetch => Event::Fetch,
+            };
+            let mut ctx = HookContext {
+                proxy: self as &mut dyn crate::hooks::HookProxy,
+                scope,
+                event,
+                request: None,
+                record: incoming,
+            };
+            hooks.run_hooks(&mut ctx).await.map_err(DeviseError::from)?;
+        }
+
+        if opts.event != SetUserEvent::Fetch {
+            session::expire_devise_keys(self.session_store.as_ref(), scope).await;
+        }
+        if opts.store && opts.event != SetUserEvent::Fetch {
+            if let Some(ref record) = user {
+                let (key, salt) = record.as_ref().session_pair();
+                let session_key = session::keys::scope_session_key(scope);
+                let session_value = serde_json::json!([key.to_string(), salt]);
+                self.session_store
+                    .insert_value(&session_key, session_value)
+                    .await;
+                // SESS-05: rotate CSRF and extend expiry on sign in.
+                self.session_store.renew().await?;
+            }
+        }
+        self.users.insert(scope.to_string(), user);
+        Ok(true)
+    }
+
+    /// Sign in a user, expiring stale devise keys first (SESS-02).
+    ///
+    /// No-ops when the same user is present unless `force` is set.
+    pub async fn sign_in(
+        &mut self,
+        scope: &str,
+        user: Box<dyn AnyDeviseModel>,
+        force: bool,
+    ) -> bool {
+        let same = self
+            .users
+            .get(scope)
+            .and_then(|slot| slot.as_deref())
+            .is_some_and(|old| old.is_same(user.as_ref()));
+        if same && !force {
+            return true;
+        }
+        let opts = SetUserOpts {
+            event: SetUserEvent::Authentication,
+            store: true,
+            run_callbacks: true,
+            force,
+        };
+        self.set_user(scope, Some(user), opts).await.is_ok()
+    }
+
+    /// Store a session directly without callbacks (SESS-02).
+    ///
+    /// Used after password changes where re-running hooks would be wrong.
+    pub async fn bypass_sign_in(&mut self, scope: &str, user: Box<dyn AnyDeviseModel>) {
+        session::expire_devise_keys(self.session_store.as_ref(), scope).await;
+        let (key, salt) = user.as_ref().session_pair();
+        let session_key = session::keys::scope_session_key(scope);
+        let session_value = serde_json::json!([key.to_string(), salt]);
+        self.session_store
+            .insert_value(&session_key, session_value)
+            .await;
+        self.users.insert(scope.to_string(), Some(user));
+    }
+
+    /// Sign out one scope: logout hooks, session clear, memo clear.
+    ///
+    /// Returns whether a user was present.
+    pub async fn sign_out(&mut self, scope: &str) -> bool {
+        let record = self.users.remove(scope);
+        let had_user = record.as_ref().is_some_and(Option::is_some);
+        if had_user {
+            let hooks = self.hooks.clone();
+            let mut ctx = HookContext {
+                proxy: self as &mut dyn crate::hooks::HookProxy,
+                scope,
+                event: Event::Logout,
+                request: None,
+                record: record.as_ref().and_then(|slot| slot.as_deref()),
+            };
+            let _ = hooks.run_hooks(&mut ctx).await;
+        }
+        let session_key = session::keys::scope_session_key(scope);
+        self.session_store.remove(&session_key).await;
+        self.performed.remove(scope);
+        had_user
+    }
+
+    /// Sign out every scope, optionally locking the proxy.
+    ///
+    /// Returns whether any user was present.
+    pub async fn sign_out_all_scopes(&mut self, lock: bool) -> bool {
+        let scopes: Vec<String> = self.users.keys().cloned().collect();
+        let mut any_user = false;
+        for scope in &scopes {
+            if self.sign_out(scope).await {
+                any_user = true;
+            }
+        }
+        if lock {
+            self.lock();
+        }
+        any_user
+    }
+
+    /// Shared authentication flow returning the real failure on error.
+    async fn try_authenticate(
+        &mut self,
+        scope: &str,
+        request: &AuthRequest,
+    ) -> Result<(), Failure> {
+        if self.locked {
+            return Err(Failure::Config("proxy locked".to_string()));
+        }
+        if self
+            .users
+            .get(scope)
+            .and_then(|slot| slot.as_deref())
+            .is_some()
+        {
+            return Ok(());
+        }
+        if let Some(user) = self.fetch_from_session(scope).await {
+            let opts = SetUserOpts {
+                event: SetUserEvent::Fetch,
+                store: false,
+                run_callbacks: false,
+                force: false,
+            };
+            self.set_user(scope, Some(user), opts)
+                .await
+                .map_err(Failure::from)?;
+            return Ok(());
+        }
+        let (user, store) = self.authenticate_via_strategies(scope, request).await?;
+        let opts = SetUserOpts {
+            event: SetUserEvent::Authentication,
+            store,
+            run_callbacks: true,
+            force: false,
+        };
+        self.set_user(scope, Some(user), opts)
+            .await
+            .map_err(Failure::from)?;
+        Ok(())
+    }
+
+    /// Fetch the session user with salt validation (warden fetch semantics).
+    ///
+    /// A salt mismatch deletes the session key and yields `None`.
+    async fn fetch_from_session(&mut self, scope: &str) -> Option<Box<dyn AnyDeviseModel>> {
+        let finder = self.finders.get(scope).cloned()?;
+        let session_key = session::keys::scope_session_key(scope);
+        let session_value = self.session_store.get_value(&session_key).await?;
+        let payload = session_value.as_array()?;
+        if payload.len() < 2 {
+            return None;
+        }
+        let key = DeviseKey::from_str(payload[0].as_str()?).ok()?;
+        let stored_salt = payload[1].as_str()?;
+        let record = finder.get_boxed(&key).await.ok()??;
+        let current_salt = record.as_ref().authenticatable_salt()?;
+        if !crate::crypto::secure_compare(&current_salt, stored_salt) {
+            self.session_store.remove(&session_key).await;
+            return None;
+        }
+        let hooks = self.hooks.clone();
+        let mut ctx = HookContext {
+            proxy: self as &mut dyn crate::hooks::HookProxy,
+            scope,
+            event: Event::Fetch,
+            request: None,
+            record: Some(record.as_ref()),
+        };
+        let _ = hooks.run_hooks(&mut ctx).await;
+        Some(record)
+    }
+
+    /// Run the strategy chain in Devise order.
+    async fn authenticate_via_strategies(
+        &mut self,
+        scope: &str,
+        request: &AuthRequest,
+    ) -> Result<(Box<dyn AnyDeviseModel>, bool), Failure> {
+        let mapping = self
+            .registry
+            .get(scope)
+            .ok_or_else(|| Failure::Config(format!("unknown scope '{scope}'")))?
+            .clone();
+        let finder = self
+            .finders
+            .get(scope)
+            .cloned()
+            .ok_or_else(|| Failure::Config(format!("no finder for scope '{scope}'")))?;
+        let config = self.config.clone();
+        let paranoid = config.paranoid;
+
+        let mut strategies: Vec<Box<dyn Strategy>> = Vec::new();
+        if mapping.has_module(Module::Rememberable) {
+            strategies.push(boxed(RememberableStrategy::default(), paranoid));
+        }
+        strategies.push(boxed(ParamsStrategy::default(), paranoid));
+        strategies.push(boxed(HttpBasicStrategy::default(), paranoid));
+
+        for strategy in &strategies {
+            let strategy_id = strategy.id();
+            if self.locked {
+                return Err(Failure::Config("proxy locked".to_string()));
+            }
+            if self
+                .performed
+                .get(scope)
+                .is_some_and(|done| done.contains(strategy_id))
+            {
+                continue;
+            }
+            if !strategy.valid(request, &mapping).await {
+                continue;
+            }
+            match strategy
+                .authenticate(request, &mapping, finder.as_ref(), &config)
+                .await
+            {
+                Ok(AuthOutcome::Success(user)) => {
+                    self.performed
+                        .entry(scope.to_string())
+                        .or_default()
+                        .insert(strategy_id.to_string());
+                    return Ok((user, strategy.store()));
+                }
+                Ok(AuthOutcome::Pass) => {}
+                Err(failure) => {
+                    self.performed
+                        .entry(scope.to_string())
+                        .or_default()
+                        .insert(strategy_id.to_string());
+                    return Err(failure);
+                }
+            }
+        }
+        Err(Failure::Unauthenticated { message: "invalid" })
+    }
+}
+
+impl crate::hooks::HookProxy for AuthProxy {
+    fn session_store(&self) -> &dyn SessionStore {
+        self.session_store.as_ref()
+    }
+
+    fn scope_registry(&self) -> &ScopeRegistry {
+        &self.registry
+    }
+
+    fn user_mut(&mut self, scope: &str) -> Option<&mut Option<Box<dyn AnyDeviseModel>>> {
+        self.users.get_mut(scope)
+    }
+
+    fn lock(&mut self) {
+        self.locked = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::OrmAdapter;
+    use crate::adapter::memory::MemoryAdapter;
+    use crate::config::DeviseConfig;
+    use crate::hooks::HookRegistry;
+    use crate::model::{AdapterBridge, PasswordVerifiable};
+    use crate::request::HttpMethod;
+    use crate::scope::{Mapping, PathNames, SignOutVia};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct ProxyUser {
+        id: i64,
+        email: String,
+        encrypted_password: String,
+    }
+
+    impl AnyDeviseModel for ProxyUser {
+        fn to_key(&self) -> DeviseKey {
+            DeviseKey::from_i64(self.id)
+        }
+
+        fn authenticatable_salt(&self) -> Option<String> {
+            self.encrypted_password.get(..29).map(str::to_string)
+        }
+
+        fn as_password_verifiable(&self) -> Option<&dyn PasswordVerifiable> {
+            Some(self)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl PasswordVerifiable for ProxyUser {
+        fn valid_password(&self, password: &str, config: &DeviseConfig) -> bool {
+            crate::crypto::encryptor::compare(password, &self.encrypted_password, config)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ProxySessionStore {
+        data: std::sync::Arc<std::sync::RwLock<HashMap<String, serde_json::Value>>>,
+        renewed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore for ProxySessionStore {
+        async fn get_value(&self, key: &str) -> Option<serde_json::Value> {
+            self.data.read().unwrap().get(key).cloned()
+        }
+
+        async fn insert_value(&self, key: &str, value: serde_json::Value) {
+            self.data.write().unwrap().insert(key.to_string(), value);
+        }
+
+        async fn remove(&self, key: &str) {
+            self.data.write().unwrap().remove(key);
+        }
+
+        async fn remove_prefix(&self, prefix: &str) {
+            let mut data = self.data.write().unwrap();
+            let doomed: Vec<String> = data
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect();
+            for key in doomed {
+                data.remove(&key);
+            }
+        }
+
+        async fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+            self.data
+                .read()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect()
+        }
+
+        async fn renew(&self) -> Result<(), DeviseError> {
+            self.renewed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn reset(&self) -> Result<(), DeviseError> {
+            self.data.write().unwrap().clear();
+            Ok(())
+        }
+    }
+
+    fn test_config() -> DeviseConfig {
+        DeviseConfig {
+            stretches: 4,
+            ..DeviseConfig::default()
+        }
+    }
+
+    fn test_proxy(renewed: &Arc<AtomicBool>) -> (AuthProxy, Arc<ProxySessionStore>) {
+        let store = Arc::new(ProxySessionStore {
+            data: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            renewed: renewed.clone(),
+        });
+        let mut registry = ScopeRegistry::new();
+        registry.register(Mapping {
+            name: "user".to_string(),
+            class_name: "User".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![crate::scope::Module::DatabaseAuthenticatable],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: SignOutVia::Delete,
+            failure_app: None,
+        });
+        let proxy = AuthProxy::new(
+            store.clone(),
+            Arc::new(registry),
+            Arc::new(HookRegistry::new()),
+            Arc::new(test_config()),
+        );
+        (proxy, store)
+    }
+
+    async fn seeded_bridge(
+        config: &DeviseConfig,
+    ) -> AdapterBridge<MemoryAdapter<ProxyUser>, ProxyUser> {
+        let adapter = MemoryAdapter::<ProxyUser>::new();
+        adapter
+            .create(ProxyUser {
+                id: 1,
+                email: "test@example.com".to_string(),
+                encrypted_password: crate::crypto::encryptor::digest("secret123", config),
+            })
+            .await
+            .unwrap();
+        AdapterBridge::new(adapter)
+    }
+
+    fn sign_in_request() -> AuthRequest {
+        let mut request = AuthRequest::new(HttpMethod::Post, "/users/sign_in");
+        request
+            .params
+            .insert("user_email".to_string(), "test@example.com".to_string());
+        request
+            .params
+            .insert("user_password".to_string(), "secret123".to_string());
+        request.flags.allow_params_authentication = true;
+        request
+    }
+
+    #[tokio::test]
+    async fn test_params_strategy_happy_path() {
+        let renewed = Arc::new(AtomicBool::new(false));
+        let (mut proxy, store) = test_proxy(&renewed);
+        let config = test_config();
+        proxy.register_finder("user", Arc::new(seeded_bridge(&config).await));
+
+        let request = sign_in_request();
+        proxy
+            .authenticate_strict("user", &request)
+            .await
+            .expect("params auth succeeds");
+
+        let session_key = session::keys::scope_session_key("user");
+        let payload = store.get_value(&session_key).await.expect("session stored");
+        let pair = payload.as_array().expect("pair payload");
+        assert_eq!(pair.len(), 2);
+        assert!(renewed.load(Ordering::SeqCst), "renew called");
+        assert!(proxy.authenticated("user"));
+        assert!(proxy.user::<ProxyUser>("user").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_sign_in_out() {
+        let renewed = Arc::new(AtomicBool::new(false));
+        let (mut proxy, _) = test_proxy(&renewed);
+        let user: Box<dyn AnyDeviseModel> = Box::new(ProxyUser {
+            id: 1,
+            email: "test@example.com".to_string(),
+            encrypted_password: String::new(),
+        });
+        assert!(proxy.sign_in("user", user, false).await);
+        assert!(proxy.authenticated("user"));
+        assert!(proxy.sign_out("user").await);
+        assert!(!proxy.authenticated("user"));
+        assert!(!proxy.sign_out("user").await);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_sign_in_noop() {
+        let renewed = Arc::new(AtomicBool::new(false));
+        let (mut proxy, store) = test_proxy(&renewed);
+        let make = || {
+            Box::new(ProxyUser {
+                id: 1,
+                email: "test@example.com".to_string(),
+                encrypted_password: String::new(),
+            }) as Box<dyn AnyDeviseModel>
+        };
+        assert!(proxy.sign_in("user", make(), false).await);
+        let session_key = session::keys::scope_session_key("user");
+        let first = store.get_value(&session_key).await;
+        assert!(proxy.sign_in("user", make(), false).await);
+        let second = store.get_value(&session_key).await;
+        assert_eq!(first, second);
+        assert!(proxy.authenticated("user"));
+    }
+
+    #[tokio::test]
+    async fn test_proxy_bypass_sign_in() {
+        let renewed = Arc::new(AtomicBool::new(false));
+        let (mut proxy, _) = test_proxy(&renewed);
+        proxy
+            .bypass_sign_in(
+                "user",
+                Box::new(ProxyUser {
+                    id: 7,
+                    email: "bypass@example.com".to_string(),
+                    encrypted_password: String::new(),
+                }),
+            )
+            .await;
+        assert!(proxy.authenticated("user"));
+        // Bypass skips callbacks: renew is only invoked by set_user.
+        assert!(!renewed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_proxy_sign_out_all_scopes() {
+        let renewed = Arc::new(AtomicBool::new(false));
+        let (mut proxy, _) = test_proxy(&renewed);
+        proxy
+            .sign_in(
+                "user",
+                Box::new(ProxyUser {
+                    id: 1,
+                    email: "test@example.com".to_string(),
+                    encrypted_password: String::new(),
+                }),
+                false,
+            )
+            .await;
+        assert!(proxy.sign_out_all_scopes(false).await);
+        assert!(!proxy.authenticated("user"));
+        assert!(!proxy.locked());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_lock_blocks_auth() {
+        let renewed = Arc::new(AtomicBool::new(false));
+        let (mut proxy, _) = test_proxy(&renewed);
+        proxy.lock();
+        assert!(proxy.locked());
+        let request = sign_in_request();
+        assert!(proxy.authenticate("user", &request).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_strategy_chain() {
+        let renewed = Arc::new(AtomicBool::new(false));
+        let (mut proxy, _) = test_proxy(&renewed);
+        let config = test_config();
+        proxy.register_finder("user", Arc::new(seeded_bridge(&config).await));
+        let mut bad = sign_in_request();
+        bad.params
+            .insert("user_password".to_string(), "wrong".to_string());
+        assert!(proxy.authenticate("user", &bad).await.is_none());
+    }
+}

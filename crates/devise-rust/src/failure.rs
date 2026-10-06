@@ -73,6 +73,12 @@ pub enum Failure {
         /// I18n message key
         message: &'static str,
     },
+
+    /// Record not found (used by `ParanoidStrategy`)
+    NotFound,
+
+    /// Internal error
+    Internal(String),
 }
 
 impl Failure {
@@ -181,8 +187,26 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
         None
     }
 
+    /// Session pair for this model: `(key, salt)`.
+    ///
+    /// Mirrors Devise's `serialize_into_session(record)` so `AuthProxy` can
+    /// persist sessions without depending on the `Authenticatable` trait
+    /// (which is not object-safe).
+    fn session_pair(&self) -> (DeviseKey, String) {
+        (
+            self.to_key(),
+            self.authenticatable_salt().unwrap_or_default(),
+        )
+    }
+
     /// Downcast to concrete type
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+impl From<crate::error::DeviseError> for Failure {
+    fn from(error: crate::error::DeviseError) -> Self {
+        Failure::Internal(format!("{error}"))
+    }
 }
 
 impl std::fmt::Debug for dyn AnyDeviseModel {
