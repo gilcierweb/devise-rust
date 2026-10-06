@@ -15,10 +15,12 @@
 //! - `time` - `Clock` trait for time abstraction
 //! - `error` - `DeviseError`, `ValidationErrors`, `ResourceWithErrors`, `BlankRecord`
 //! - `failure` - `Failure` enum, `AuthOutcome`, `AnyDeviseModel` trait
+//! - `helpers` - per-scope auth helpers, path helpers, groups, `devise_helpers!`
 //! - `hooks` - `HookRegistry`, `HookFilter`, `Event`, bridge traits
 //! - `model` - `Authenticatable` trait, `PasswordVerifiable`, `ModelFinder` bridge
 //! - `proxy` - `AuthProxy` session and strategy execution
 //! - `request` - `AuthRequest`, `RequestFlags`, `HttpMethod`
+//! - `routes` - scope route tables and guard descriptors for bridges
 //! - `scope` - `Module`, `Mapping`, `ScopeRegistry`, `RouteSpec`
 //! - `session` - `SessionStore` trait, serializer, key naming
 //! - `strategy` - `Strategy` chain: params, HTTP Basic, rememberable, paranoid
@@ -34,12 +36,14 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod failure;
+pub mod helpers;
 pub mod hooks;
 pub mod i18n;
 pub mod model;
 pub mod parameter;
 pub mod proxy;
 pub mod request;
+pub mod routes;
 pub mod scope;
 pub mod session;
 pub mod strategy;
