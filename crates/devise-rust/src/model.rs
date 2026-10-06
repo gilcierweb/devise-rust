@@ -2157,6 +2157,170 @@ mod tests {
         ));
     }
 
+    /// Shared setup for the split `send_reset_password_instructions` tests
+    /// (clippy pedantic keeps each test under the 100-line limit).
+    async fn instructions_setup() -> (
+        DeviseConfig,
+        MemoryAdapter<TestUser>,
+        crate::mailer::TestMailer,
+        crate::time::FixedClock,
+    ) {
+        let config = test_config();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        adapter
+            .create(TestUser::testing("secret123", &config))
+            .await
+            .unwrap();
+        let fixed = chrono::DateTime::parse_from_rfc3339("2026-10-06T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        (
+            config,
+            adapter,
+            crate::mailer::TestMailer::default(),
+            crate::time::FixedClock::new(fixed),
+        )
+    }
+
+    #[tokio::test]
+    async fn send_reset_password_instructions() {
+        use crate::time::Clock as _;
+
+        let (config, adapter, mailer, clock) = instructions_setup().await;
+        let fixed = clock.now();
+
+        // Class entry: finds by reset_password_keys, sends instructions.
+        let mut attributes = serde_json::Map::new();
+        attributes.insert(
+            "email".to_string(),
+            JsonValue::String("test@example.com".to_string()),
+        );
+        let outcome = TestUser::send_reset_password_instructions_for(
+            &attributes,
+            &adapter,
+            &mailer,
+            &config,
+            &clock,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_valid());
+
+        // digest+timestamp persisted; raw token returned by the instance path.
+        let stored = adapter.get(&DeviseKey::from_i64(1)).await.unwrap().unwrap();
+        let digest = Recoverable::reset_password_token(&stored)
+            .unwrap()
+            .to_string();
+        assert_eq!(digest.len(), 64, "HMAC-SHA256 hex digest");
+        assert_eq!(
+            Recoverable::reset_password_sent_at(&stored).unwrap(),
+            fixed,
+            "reset_password_sent_at uses the injected clock"
+        );
+
+        // Unknown email: find-or-initialize errors :not_found (no send, no panic).
+        let mut attributes = serde_json::Map::new();
+        attributes.insert(
+            "email".to_string(),
+            JsonValue::String("ghost@example.com".to_string()),
+        );
+        let outcome = TestUser::send_reset_password_instructions_for(
+            &attributes,
+            &adapter,
+            &mailer,
+            &config,
+            &clock,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_valid());
+        assert_eq!(
+            outcome.errors.get("email").map(Vec::as_slice),
+            Some(&[":not_found".to_string()][..])
+        );
+        assert_eq!(mailer.sent_mails().len(), 1, "no email for unknown record");
+    }
+
+    #[tokio::test]
+    async fn send_reset_password_instructions_regenerates_and_clears() {
+        use std::collections::HashMap;
+
+        let (config, adapter, mailer, clock) = instructions_setup().await;
+        let mut attributes = serde_json::Map::new();
+        attributes.insert(
+            "email".to_string(),
+            JsonValue::String("test@example.com".to_string()),
+        );
+
+        TestUser::send_reset_password_instructions_for(
+            &attributes,
+            &adapter,
+            &mailer,
+            &config,
+            &clock,
+        )
+        .await
+        .unwrap();
+        let first = adapter.get(&DeviseKey::from_i64(1)).await.unwrap().unwrap();
+        let first_digest = Recoverable::reset_password_token(&first)
+            .unwrap()
+            .to_string();
+
+        // Second send for the same user REGENERATES the token (digest changes).
+        TestUser::send_reset_password_instructions_for(
+            &attributes,
+            &adapter,
+            &mailer,
+            &config,
+            &clock,
+        )
+        .await
+        .unwrap();
+        let stored2 = adapter.get(&DeviseKey::from_i64(1)).await.unwrap().unwrap();
+        assert_ne!(
+            first_digest,
+            Recoverable::reset_password_token(&stored2).unwrap()
+        );
+        assert_eq!(mailer.sent_mails().len(), 2);
+
+        // RCV-04: password change or auth-key change clears the token fields.
+        let changes = crate::adapter::ChangeSet::new(
+            HashMap::from([(
+                "encrypted_password".to_string(),
+                Value::String("old".to_string()),
+            )]),
+            HashMap::from([(
+                "encrypted_password".to_string(),
+                Value::String("new".to_string()),
+            )]),
+        );
+        assert!(Recoverable::pending_reset_token_clear(
+            &stored2, &changes, &config
+        ));
+        let email_change = crate::adapter::ChangeSet::new(
+            HashMap::from([("email".to_string(), Value::String("a@x.com".to_string()))]),
+            HashMap::from([("email".to_string(), Value::String("b@x.com".to_string()))]),
+        );
+        assert!(Recoverable::pending_reset_token_clear(
+            &stored2,
+            &email_change,
+            &config
+        ));
+        let unrelated = crate::adapter::ChangeSet::new(
+            HashMap::from([("other".to_string(), Value::String("a".to_string()))]),
+            HashMap::from([("other".to_string(), Value::String("b".to_string()))]),
+        );
+        assert!(!Recoverable::pending_reset_token_clear(
+            &stored2, &unrelated, &config
+        ));
+
+        // Clearing nils both columns.
+        let mut cleared = stored2.clone();
+        Recoverable::clear_reset_password_token(&mut cleared);
+        assert_eq!(Recoverable::reset_password_token(&cleared), None);
+        assert_eq!(Recoverable::reset_password_sent_at(&cleared), None);
+    }
+
     #[test]
     fn test_normalize_auth_conditions() {
         let config = DeviseConfig {
