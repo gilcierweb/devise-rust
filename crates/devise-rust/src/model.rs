@@ -180,8 +180,11 @@ pub trait DatabaseAuthenticatable: Authenticatable {
 
     /// `update_with_password(params)` (DBAU-03): requires the current password,
     /// strips blank password fields (so an untouched password is never reset),
-    /// applies the remaining attributes. Returns the `:current_password :invalid`
-    /// error after applying attrs (Devise re-renders the form with the edits).
+    /// applies the remaining attributes.
+    ///
+    /// # Errors
+    /// Returns `:current_password :invalid` after applying attrs (Devise
+    /// re-renders the form with the edits).
     fn update_with_password(
         &mut self,
         params: &mut serde_json::Map<String, JsonValue>,
@@ -249,7 +252,7 @@ pub trait DatabaseAuthenticatable: Authenticatable {
     fn after_database_authentication(&self) {}
 
     /// Email-change notification recipient (DBAU-08): the ORIGINAL email from
-    /// the ChangeSet's previous value. `None` when the notification is
+    /// the `ChangeSet`'s previous value. `None` when the notification is
     /// disabled, skipped, or no email change occurred.
     fn email_notification_recipient(
         &self,
@@ -791,8 +794,6 @@ mod tests {
 
     #[tokio::test]
     async fn database_authenticatable_methods() {
-        use std::collections::HashMap;
-
         let config = DeviseConfig {
             stretches: 4,
             send_email_changed_notification: true,
@@ -903,6 +904,19 @@ mod tests {
 
         // after_database_authentication hook exists and defaults to no-op (DBAU-07).
         DatabaseAuthenticatable::after_database_authentication(&user);
+    }
+
+    #[test]
+    fn database_authenticatable_notifications() {
+        use std::collections::HashMap;
+
+        let config = DeviseConfig {
+            stretches: 4,
+            send_email_changed_notification: true,
+            send_password_change_notification: true,
+            ..DeviseConfig::default()
+        };
+        let user = TestUser::testing("secret123", &config);
 
         // Notification decisions (DBAU-08/09): email change notifies the
         // ORIGINAL address; password change notifies the current one.
