@@ -16,6 +16,7 @@
 //! - `error` - `DeviseError`, `ValidationErrors`, `ResourceWithErrors`, `BlankRecord`
 //! - `failure` - `Failure` enum, `AuthOutcome`, `AnyDeviseModel` trait
 //! - `hooks` - `HookRegistry`, `HookFilter`, `Event`, bridge traits
+//! - `model` - `Authenticatable` trait, `PasswordVerifiable`, `ModelFinder` bridge
 //! - `request` - `AuthRequest`, `RequestFlags`, `HttpMethod`
 //! - `session` - `SessionStore` trait, serializer, key naming
 //! - `scope` - `Module`, `Mapping`, `ScopeRegistry`, `RouteSpec`
@@ -33,6 +34,7 @@ pub mod error;
 pub mod failure;
 pub mod hooks;
 pub mod i18n;
+pub mod model;
 pub mod parameter;
 pub mod request;
 pub mod scope;

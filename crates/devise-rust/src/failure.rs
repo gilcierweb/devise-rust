@@ -8,7 +8,7 @@ use crate::adapter::DeviseKey;
 use serde::{Deserialize, Serialize};
 
 /// Type alias for authentication rules closure
-type AuthRules = dyn Fn(&dyn AnyDeviseModel) -> bool + Send + Sync;
+pub type AuthRules = dyn Fn(&dyn AnyDeviseModel) -> bool + Send + Sync;
 
 /// Failure decision variants - mirrors Devise's `throw :warden` message types
 /// and the Failure App's response classification.
@@ -152,7 +152,12 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
     fn to_key(&self) -> DeviseKey;
 
     /// Get the model's authenticatable salt (bcrypt hash prefix)
-    fn authenticatable_salt(&self) -> Option<String>;
+    ///
+    /// Base default is `None`; `DatabaseAuthenticatable` models override it
+    /// with the `encrypted_password[0,29]` prefix.
+    fn authenticatable_salt(&self) -> Option<String> {
+        None
+    }
 
     /// Check if the model is valid for authentication (can be overridden by modules)
     fn valid_for_authentication(&self, _rules: Option<&AuthRules>) -> bool {
@@ -168,6 +173,12 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
     fn is_same(&self, other: &dyn AnyDeviseModel) -> bool {
         self.to_key() == other.to_key()
             && self.authenticatable_salt() == other.authenticatable_salt()
+    }
+
+    /// Downcast to the password-checking facet, if this model stores a
+    /// password hash (`DatabaseAuthenticatable` models override this).
+    fn as_password_verifiable(&self) -> Option<&dyn crate::model::PasswordVerifiable> {
+        None
     }
 
     /// Downcast to concrete type
