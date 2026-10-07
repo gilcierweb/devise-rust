@@ -42,7 +42,8 @@ pub const CONFIRMATION_TOKEN_COLUMN: &str = "confirmation_token";
 ///
 /// == Options
 ///
-/// * `reconfirmable` - when true the `unconfirmed_email` column is required too
+/// * `reconfirmable` - when true the `unconfirmed_email` column joins the
+///   required set (Devise checks `klass.reconfirmable` the same way)
 ///
 /// == Examples
 ///
@@ -1412,5 +1413,321 @@ mod tests {
         .unwrap();
         assert!(outcome.is_valid());
         assert_eq!(mailer.sent_mails().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn confirmable_confirm_within_none_never_expires() {
+        let config = test_config();
+        assert_eq!(config.confirm_within, None);
+        let mut clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mut user = TestUser::fresh(1, "ancient@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        let raw = user
+            .ensure_confirmation_token(&adapter, &config, &clock)
+            .await
+            .unwrap();
+
+        clock.advance(chrono::TimeDelta::days(5 * 365));
+        assert!(!user.confirmation_period_expired(&config, &clock));
+        let outcome = TestUser::confirm_by_token(Some(&raw), &adapter, &config, &clock, &valid)
+            .await
+            .unwrap();
+        assert!(outcome.is_valid());
+        assert!(outcome.record.confirmed());
+    }
+
+    #[tokio::test]
+    async fn confirmable_confirm_within_window_edges() {
+        let mut config = test_config();
+        config.confirm_within = Some(chrono::TimeDelta::days(3));
+        let adapter = MemoryAdapter::<TestUser>::new();
+
+        let mut early_clock = FixedClock::now();
+        let mut fresh = TestUser::fresh(1, "early@example.com");
+        adapter.create(fresh.clone()).await.unwrap();
+        let raw = fresh
+            .ensure_confirmation_token(&adapter, &config, &early_clock)
+            .await
+            .unwrap();
+        early_clock.advance(chrono::TimeDelta::days(2));
+        assert!(!fresh.confirmation_period_expired(&config, &early_clock));
+        let outcome =
+            TestUser::confirm_by_token(Some(&raw), &adapter, &config, &early_clock, &valid)
+                .await
+                .unwrap();
+        assert!(outcome.is_valid());
+
+        let mut late_clock = FixedClock::now();
+        let mut stale = TestUser::fresh(2, "stale@example.com");
+        adapter.create(stale.clone()).await.unwrap();
+        let stale_raw = stale
+            .ensure_confirmation_token(&adapter, &config, &late_clock)
+            .await
+            .unwrap();
+        late_clock.advance(chrono::TimeDelta::days(4));
+        assert!(stale.confirmation_period_expired(&config, &late_clock));
+        let outcome =
+            TestUser::confirm_by_token(Some(&stale_raw), &adapter, &config, &late_clock, &valid)
+                .await
+                .unwrap();
+        assert!(!outcome.is_valid());
+        assert_eq!(
+            outcome.errors.get("email"),
+            Some(&vec![":confirmation_period_expired".to_string()])
+        );
+        assert_eq!(humanize_period(config.confirm_within.unwrap()), "3 days");
+    }
+
+    #[tokio::test]
+    async fn confirmable_allow_window_three_way_table() {
+        let clock = FixedClock::now();
+        let zero_config = test_config();
+        assert!(zero_config.allow_unconfirmed_access_for.is_zero());
+
+        let mut pending = TestUser::fresh(1, "pending@example.com");
+        pending.set_confirmation_sent_at(Some(clock.now()));
+        assert!(!pending.confirmation_period_valid(&zero_config, &clock));
+        assert!(!pending.confirmation_gate_active(true, &zero_config, &clock));
+        assert_eq!(pending.confirmation_inactive_message(), Some("unconfirmed"));
+
+        let mut windowed = test_config();
+        windowed.allow_unconfirmed_access_for = chrono::TimeDelta::days(5);
+        let mut inside = TestUser::fresh(2, "inside@example.com");
+        inside.set_confirmation_sent_at(Some(clock.now() - chrono::TimeDelta::days(4)));
+        assert!(inside.confirmation_period_valid(&windowed, &clock));
+        assert!(inside.confirmation_gate_active(true, &windowed, &clock));
+
+        let mut outside = TestUser::fresh(3, "outside@example.com");
+        outside.set_confirmation_sent_at(Some(clock.now() - chrono::TimeDelta::days(6)));
+        assert!(!outside.confirmation_period_valid(&windowed, &clock));
+        assert!(!outside.confirmation_gate_active(true, &windowed, &clock));
+
+        assert!(confirmation_period_valid_with_allow(
+            Some(clock.now() - chrono::TimeDelta::days(400)),
+            None,
+            &clock
+        ));
+
+        let mut done = TestUser::fresh(4, "done@example.com");
+        done.set_confirmed_at(Some(clock.now()));
+        assert!(done.confirmation_gate_active(true, &zero_config, &clock));
+        assert_eq!(done.confirmation_inactive_message(), None);
+        assert!(!done.confirmation_required());
+    }
+
+    #[tokio::test]
+    async fn confirmable_blank_rows_never_confirm() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+
+        let mut empty_token = TestUser::fresh(1, "empty@example.com");
+        empty_token.set_confirmation_token(Some(String::new()));
+        adapter.create(empty_token.clone()).await.unwrap();
+        let mut nil_token = TestUser::fresh(2, "nil@example.com");
+        nil_token.set_confirmation_token(None);
+        adapter.create(nil_token.clone()).await.unwrap();
+
+        for blank in [None, Some("")] {
+            let outcome = TestUser::confirm_by_token(blank, &adapter, &config, &clock, &valid)
+                .await
+                .unwrap();
+            assert!(!outcome.is_valid());
+            assert_eq!(
+                outcome.errors.get("confirmation_token"),
+                Some(&vec![":blank".to_string()])
+            );
+        }
+
+        let stored_empty = adapter
+            .get(&crate::adapter::DeviseKey::from_i64(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored_empty.confirmed());
+        let stored_nil = adapter
+            .get(&crate::adapter::DeviseKey::from_i64(2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored_nil.confirmed());
+    }
+
+    #[tokio::test]
+    async fn confirmable_digest_legacy_row_confirms_through_raw_lookup() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+
+        let legacy_raw = "legacyrawtoken123456";
+        assert_eq!(legacy_raw.len(), 20);
+        let mut legacy = TestUser::fresh(1, "legacy@example.com");
+        legacy.set_confirmation_token(Some(legacy_raw.to_string()));
+        legacy.set_confirmation_sent_at(Some(clock.now()));
+        adapter.create(legacy.clone()).await.unwrap();
+
+        let outcome =
+            TestUser::confirm_by_token(Some(legacy_raw), &adapter, &config, &clock, &valid)
+                .await
+                .unwrap();
+        assert!(outcome.is_valid());
+        assert!(outcome.record.confirmed());
+    }
+
+    #[tokio::test]
+    async fn confirmable_double_confirm_errors_without_refiring_hook() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mut user = TestUser::fresh(1, "twice@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        user.ensure_confirmation_token(&adapter, &config, &clock)
+            .await
+            .unwrap();
+
+        let first = user
+            .confirm(&adapter, &config, &clock, false, &valid)
+            .await
+            .unwrap();
+        assert!(first.is_ok());
+        assert_eq!(user.after_confirmation_count.load(Ordering::SeqCst), 1);
+
+        let second = user
+            .confirm(&adapter, &config, &clock, false, &valid)
+            .await
+            .unwrap();
+        let Err(errors) = second else {
+            panic!("double confirm must error");
+        };
+        assert_eq!(
+            errors.get("email"),
+            Some(&vec![":already_confirmed".to_string()])
+        );
+        assert_eq!(user.after_confirmation_count.load(Ordering::SeqCst), 1);
+
+        let raw = user.raw_confirmation_token().unwrap().to_string();
+        let replay = TestUser::confirm_by_token(Some(&raw), &adapter, &config, &clock, &valid)
+            .await
+            .unwrap();
+        assert!(!replay.is_valid());
+        assert_eq!(
+            replay.errors.get("email"),
+            Some(&vec![":already_confirmed".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmable_reconfirmation_always_validates() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = crate::mailer::TestMailer::default();
+        let invalid = |_user: &TestUser| {
+            let mut errors = ValidationErrors::new();
+            errors.add("email", ":invalid");
+            errors
+        };
+
+        let mut lax = TestUser::fresh(1, "lenient@example.com");
+        adapter.create(lax.clone()).await.unwrap();
+        lax.ensure_confirmation_token(&adapter, &config, &clock)
+            .await
+            .unwrap();
+        let lax_outcome = lax
+            .confirm(&adapter, &config, &clock, false, &invalid)
+            .await
+            .unwrap();
+        assert!(lax_outcome.is_ok());
+
+        let mut strict = TestUser::fresh(2, "strict@example.com");
+        adapter.create(strict.clone()).await.unwrap();
+        strict
+            .ensure_confirmation_token(&adapter, &config, &clock)
+            .await
+            .unwrap();
+        let strict_outcome = strict
+            .confirm(&adapter, &config, &clock, true, &invalid)
+            .await
+            .unwrap();
+        let Err(strict_errors) = strict_outcome else {
+            panic!("ensure_valid must run the validation closure");
+        };
+        assert_eq!(
+            strict_errors.get("email"),
+            Some(&vec![":invalid".to_string()])
+        );
+
+        let mut moving = confirmed_user(&adapter, &config, &clock, 3, "mover@example.com").await;
+        moving
+            .change_email_with_reconfirmation(
+                "mover-new@example.com",
+                &adapter,
+                &mailer,
+                &config,
+                &clock,
+            )
+            .await
+            .unwrap();
+        let forced = moving
+            .confirm(&adapter, &config, &clock, false, &invalid)
+            .await
+            .unwrap();
+        assert!(forced.is_err());
+    }
+
+    #[test]
+    fn confirmable_module_order_pins_chain_position() {
+        use crate::scope::Module;
+
+        assert!(Module::Confirmable < Module::Lockable);
+        let chain = Module::all();
+        let position = |module| chain.iter().position(|item| item == &module).unwrap();
+        assert!(position(Module::Confirmable) < position(Module::Lockable));
+        assert!(position(Module::Lockable) < position(Module::Timeoutable));
+        assert!(position(Module::Timeoutable) < position(Module::Trackable));
+    }
+
+    #[test]
+    fn confirmable_required_fields_match_devise() {
+        assert_eq!(
+            required_fields(false),
+            vec!["confirmation_token", "confirmed_at", "confirmation_sent_at"]
+        );
+        assert_eq!(
+            required_fields(true),
+            vec![
+                "confirmation_token",
+                "confirmed_at",
+                "confirmation_sent_at",
+                "unconfirmed_email"
+            ]
+        );
+    }
+
+    #[test]
+    fn confirmable_unsafe_attributes_cover_confirmation_columns() {
+        for field in [
+            "confirmation_token",
+            "confirmed_at",
+            "confirmation_sent_at",
+            "unconfirmed_email",
+        ] {
+            assert!(
+                crate::error::UNSAFE_ATTRIBUTES_FOR_SERIALIZATION.contains(&field),
+                "{field} must stay in the unsafe serialization list"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmable_humanize_period_renders_devise_windows() {
+        assert_eq!(humanize_period(chrono::TimeDelta::weeks(2)), "2 weeks");
+        assert_eq!(humanize_period(chrono::TimeDelta::days(1)), "1 day");
+        assert_eq!(humanize_period(chrono::TimeDelta::hours(6)), "6 hours");
+        assert_eq!(
+            humanize_period(chrono::TimeDelta::minutes(30)),
+            "30 minutes"
+        );
     }
 }
