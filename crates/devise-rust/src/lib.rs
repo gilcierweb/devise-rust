@@ -18,6 +18,7 @@
 //! - `helpers` - per-scope auth helpers, path helpers, groups, `devise_helpers!`
 //! - `hooks` - `HookRegistry`, `HookFilter`, `Event`, bridge traits
 //! - `model` - `Authenticatable` base, `DatabaseAuthenticatable` (password handling + notifications decisions), `Validatable`, `Registerable`, `PasswordVerifiable`, `ModelFinder` bridge
+//! - `confirmable` - `Confirmable` email confirmation (chain position 6, before `Lockable`): digest-only tokens, reconfirmable postponement, resend reuse, paranoid uniformity
 //! - `mailer` - `Mailer` trait (5 actions), `MailerContext`, `TestMailer`, Tera templates
 //! - `proxy` - `AuthProxy` session and strategy execution
 //! - `request` - `AuthRequest`, `RequestFlags`, `HttpMethod`
@@ -34,6 +35,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod adapter;
 pub mod config;
+pub mod confirmable;
 pub mod crypto;
 pub mod error;
 pub mod failure;
