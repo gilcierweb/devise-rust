@@ -19,6 +19,7 @@
 //! - `hooks` - `HookRegistry`, `HookFilter`, `Event`, bridge traits
 //! - `model` - `Authenticatable` base, `DatabaseAuthenticatable` (password handling + notifications decisions), `Validatable`, `Registerable`, `PasswordVerifiable`, `ModelFinder` bridge
 //! - `confirmable` - `Confirmable` email confirmation (chain position 6, before `Lockable`): digest-only tokens, reconfirmable postponement, resend reuse, paranoid uniformity
+//! - `lockable` - `Lockable` attempt counting (chain position 7, after `Confirmable`): counter-to-lock, time/email/both strategies, digest-only unlock tokens, paranoid suppression
 //! - `mailer` - `Mailer` trait (5 actions), `MailerContext`, `TestMailer`, Tera templates
 //! - `proxy` - `AuthProxy` session and strategy execution
 //! - `request` - `AuthRequest`, `RequestFlags`, `HttpMethod`
@@ -42,6 +43,7 @@ pub mod failure;
 pub mod helpers;
 pub mod hooks;
 pub mod i18n;
+pub mod lockable;
 pub mod mailer;
 pub mod model;
 pub mod parameter;
