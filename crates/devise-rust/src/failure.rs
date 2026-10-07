@@ -228,6 +228,18 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
         false
     }
 
+    /// Devise `update_tracked_fields` in-memory hook entrypoint (TRK-01).
+    ///
+    /// Default no-op returning `false`; trackable models override it to
+    /// apply the current-into-last shift to the memoized record. The typed
+    /// [`Trackable`](crate::trackable::Trackable) trait owns adapter
+    /// persistence through `update_tracked_fields_bang` (with the #4673
+    /// new-record probe); this seam exists because that trait is not
+    /// object-safe and hook bodies only see `dyn AnyDeviseModel`.
+    fn apply_tracked_fields_hook(&mut self, _now: DateTime<Utc>, _peer_ip: &str) -> bool {
+        false
+    }
+
     /// Remember value for cookie validation: the `remember_token` column
     /// when the model carries one, else `authenticatable_salt`.
     ///

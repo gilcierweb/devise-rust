@@ -28,6 +28,9 @@
 //! - `scope` - `Module`, `Mapping`, `ScopeRegistry`, `RouteSpec`
 //! - `session` - `SessionStore` trait, serializer, key naming
 //! - `strategy` - `Strategy` chain: params, HTTP Basic, rememberable, paranoid
+//! - `time` - `Clock` trait for time abstraction
+//! - `timeoutable` - `Timeoutable` inactivity timeout (chain position 8, after `Lockable`): `<=` boundary, epoch tick, remember exemption
+//! - `trackable` - `Trackable` sign-in auditing (chain position 9, last): field shift, socket-peer IP, new-record guard
 
 #![warn(clippy::all, clippy::pedantic, unsafe_code)]
 
@@ -56,6 +59,8 @@ pub mod scope;
 pub mod session;
 pub mod strategy;
 pub mod time;
+pub mod timeoutable;
+pub mod trackable;
 
 #[cfg(feature = "test-utils")]
 pub mod test_utils;

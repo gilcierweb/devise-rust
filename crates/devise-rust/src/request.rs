@@ -106,6 +106,14 @@ pub struct AuthRequest {
     pub query: HashMap<String, String>,
     /// Behavioral flags
     pub flags: RequestFlags,
+    /// Socket peer address (`request.remote_ip` equivalent, e.g. `"127.0.0.1"`).
+    ///
+    /// Bridges MUST fill this from the socket peer only. `X-Forwarded-For`
+    /// and every other proxy header are attacker-controlled and are NEVER
+    /// trusted in v1 (D-20): core reads no header for IP purposes, so a
+    /// forged header can never reach `update_tracked_fields`. Proxy-aware
+    /// IP resolution is a future opt-in, not this phase.
+    pub peer_addr: Option<String>,
 }
 
 impl AuthRequest {
@@ -120,7 +128,25 @@ impl AuthRequest {
             cookies: HashMap::new(),
             query: HashMap::new(),
             flags: RequestFlags::default(),
+            peer_addr: None,
         }
+    }
+
+    /// Attach the socket peer address (bridge-supplied, never a proxy header).
+    ///
+    /// == Examples
+    ///
+    /// ```
+    /// use devise_rust::request::{AuthRequest, HttpMethod};
+    ///
+    /// let request = AuthRequest::new(HttpMethod::Get, "/users/sign_in")
+    ///     .peer_addr("127.0.0.1".to_string());
+    /// assert_eq!(request.peer_addr.as_deref(), Some("127.0.0.1"));
+    /// ```
+    #[must_use]
+    pub fn peer_addr(mut self, addr: String) -> Self {
+        self.peer_addr = Some(addr);
+        self
     }
 
     /// Check if request is a navigational format (HTML/Turbo Stream)
@@ -244,6 +270,26 @@ pub fn build_auth_request(
     query: HashMap<String, String>,
     flags: RequestFlags,
 ) -> AuthRequest {
+    build_auth_request_with_peer(method, path, headers, params, cookies, query, flags, None)
+}
+
+/// Build `AuthRequest` from raw parts plus the socket peer address.
+///
+/// `peer_addr` is the framework-supplied socket peer (`request.remote_ip`
+/// equivalent). Bridges pass `Some` here and MUST never substitute an
+/// `X-Forwarded-For` or other proxy header value (D-20).
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+#[must_use]
+pub fn build_auth_request_with_peer(
+    method: HttpMethod,
+    path: String,
+    headers: HashMap<String, String>,
+    params: HashMap<String, String>,
+    cookies: HashMap<String, String>,
+    query: HashMap<String, String>,
+    flags: RequestFlags,
+    peer_addr: Option<String>,
+) -> AuthRequest {
     AuthRequest {
         method,
         path,
@@ -252,6 +298,7 @@ pub fn build_auth_request(
         cookies,
         query,
         flags,
+        peer_addr,
     }
 }
 
