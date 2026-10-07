@@ -26,7 +26,7 @@
 use crate::adapter::{Conditions, OrmAdapter, Value};
 use crate::config::DeviseConfig;
 use crate::error::{DeviseError, ResourceWithErrors, ValidationErrors};
-use crate::mailer::HasEmail;
+use crate::mailer::{HasEmail, Mailer, MailerContext};
 use crate::model::Authenticatable;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -249,6 +249,56 @@ pub trait Confirmable: Authenticatable + HasEmail {
         }
     }
 
+    /// Generate a fresh raw-plus-digest pair, persist the digest plus
+    /// `sent_at` via `update_columns`, and return the raw bearer.
+    ///
+    /// Uniqueness loops through
+    /// [`column_value_unused`](crate::adapter::OrmAdapter::column_value_unused).
+    ///
+    /// # Errors
+    ///
+    /// `DeviseError::Adapter` when the uniqueness probe or persistence fails.
+    async fn store_fresh_confirmation_token<A>(
+        &mut self,
+        adapter: &A,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> Result<String, DeviseError>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+    {
+        let (raw, enc) = loop {
+            let (raw, enc) = crate::crypto::token_generator::generate(
+                &config.secret_key,
+                CONFIRMATION_TOKEN_COLUMN,
+            );
+            if adapter
+                .column_value_unused(CONFIRMATION_TOKEN_COLUMN, &Value::String(enc.clone()))
+                .await
+                .map_err(DeviseError::Adapter)?
+            {
+                break (raw, enc);
+            }
+        };
+        let now = clock.now();
+        self.set_confirmation_token(Some(enc.clone()));
+        self.set_confirmation_sent_at(Some(now));
+        self.set_raw_confirmation_token(Some(raw.clone()));
+        let fields = HashMap::from([
+            ("confirmation_token".to_string(), Value::String(enc)),
+            (
+                "confirmation_sent_at".to_string(),
+                Value::String(now.to_rfc3339()),
+            ),
+        ]);
+        adapter
+            .update_columns(&self.to_key(), &fields)
+            .await
+            .map_err(DeviseError::Adapter)?;
+        Ok(raw)
+    }
+
     /// Ensure a confirmation token exists, reusing the live one (D-07).
     ///
     /// When a stored token exists and is not expired, the stored digest is
@@ -279,35 +329,8 @@ pub trait Confirmable: Authenticatable + HasEmail {
                 return Ok(stored);
             }
         }
-        let (raw, enc) = loop {
-            let (raw, enc) = crate::crypto::token_generator::generate(
-                &config.secret_key,
-                CONFIRMATION_TOKEN_COLUMN,
-            );
-            if adapter
-                .column_value_unused(CONFIRMATION_TOKEN_COLUMN, &Value::String(enc.clone()))
-                .await
-                .map_err(DeviseError::Adapter)?
-            {
-                break (raw, enc);
-            }
-        };
-        let now = clock.now();
-        self.set_confirmation_token(Some(enc.clone()));
-        self.set_confirmation_sent_at(Some(now));
-        self.set_raw_confirmation_token(Some(raw.clone()));
-        let fields = HashMap::from([
-            ("confirmation_token".to_string(), Value::String(enc)),
-            (
-                "confirmation_sent_at".to_string(),
-                Value::String(now.to_rfc3339()),
-            ),
-        ]);
-        adapter
-            .update_columns(&self.to_key(), &fields)
+        self.store_fresh_confirmation_token(adapter, config, clock)
             .await
-            .map_err(DeviseError::Adapter)?;
-        Ok(raw)
     }
 
     /// `confirm` (CNF-02): set `confirmed_at`, move a pending reconfirmation
@@ -447,6 +470,338 @@ pub trait Confirmable: Authenticatable + HasEmail {
             Err(errors) => Ok(ResourceWithErrors::new(record, errors)),
         }
     }
+
+    /// `skip_confirmation!` (CNF-05): mark confirmed in memory without saving.
+    /// No token is generated and no notification decision is made; the caller
+    /// persists when it saves the record.
+    fn skip_confirmation(&mut self, clock: &dyn crate::time::Clock) {
+        self.set_confirmed_at(Some(clock.now()));
+    }
+
+    /// Whether the create-time confirmation notification goes out (CNF-01):
+    /// confirmation required, not suppressed, and an address exists.
+    fn should_send_confirmation_notification(&self) -> bool {
+        self.confirmation_required()
+            && !self.confirmation_notification_skipped()
+            && !self.email().is_empty()
+    }
+
+    /// Send confirmation instructions for this record (CNF-01 worker).
+    ///
+    /// Ensures a token (reusing the live one per D-07), then mails
+    /// `confirmation_instructions` carrying the bearer to the pending
+    /// `unconfirmed_email` when reconfirming, else to `email` (D-05).
+    /// Returns the bearer token.
+    ///
+    /// # Errors
+    ///
+    /// `DeviseError::Adapter` on token persistence failure,
+    /// `DeviseError::Mailer` when the notification cannot render.
+    async fn send_confirmation_instructions<A, L>(
+        &mut self,
+        adapter: &A,
+        mailer: &L,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> Result<String, DeviseError>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+        L: Mailer<Self>,
+    {
+        let raw = self
+            .ensure_confirmation_token(adapter, config, clock)
+            .await?;
+        let recipient = if self.pending_reconfirmation(config) {
+            self.unconfirmed_email().unwrap_or_default().to_string()
+        } else {
+            self.email().to_string()
+        };
+        let context = MailerContext {
+            email: recipient,
+            token: Some(raw.clone()),
+            url: None,
+            resource: self.serializable_hash(),
+        };
+        mailer.confirmation_instructions(self, Some(&raw), &context)?;
+        Ok(raw)
+    }
+
+    /// `resend_confirmation_instructions` (CNF-05, CNF-06): guarded resend.
+    /// Already-confirmed records (with no pending reconfirmation) fail with an
+    /// `:already_confirmed`-style error instead of pretending to send (D-06).
+    ///
+    /// # Errors
+    ///
+    /// Outer `DeviseError` on token/mailer failure. Inner
+    /// `Err(ValidationErrors)` for the already-confirmed notice.
+    async fn resend_confirmation_instructions<A, L>(
+        &mut self,
+        adapter: &A,
+        mailer: &L,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> Result<Result<String, ValidationErrors>, DeviseError>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+        L: Mailer<Self>,
+    {
+        if self.confirmed() && !self.pending_reconfirmation(config) {
+            let mut errors = ValidationErrors::new();
+            errors.add("email", ":already_confirmed");
+            return Ok(Err(errors));
+        }
+        Ok(Ok(self
+            .send_confirmation_instructions(adapter, mailer, config, clock)
+            .await?))
+    }
+
+    /// Create-time notification decision (CNF-01): send only when
+    /// [`should_send_confirmation_notification`](Self::should_send_confirmation_notification).
+    /// Returns the bearer when sent, `None` when suppressed.
+    ///
+    /// # Errors
+    ///
+    /// `DeviseError::Adapter` on token persistence failure,
+    /// `DeviseError::Mailer` when the notification cannot render.
+    async fn send_on_create_confirmation_instructions<A, L>(
+        &mut self,
+        adapter: &A,
+        mailer: &L,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> Result<Option<String>, DeviseError>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+        L: Mailer<Self>,
+    {
+        if !self.should_send_confirmation_notification() {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.send_confirmation_instructions(adapter, mailer, config, clock)
+                .await?,
+        ))
+    }
+
+    /// Request an email change on a reconfirmable record (CNF-07, D-03, D-05).
+    ///
+    /// Moves the new address into `unconfirmed_email`, keeps `email` at the
+    /// original, clears the token, and stores a fresh raw-plus-digest pair.
+    /// The postponement persists through `update_columns` with an explicit
+    /// field map, so the write lands even when the submitted value equals the
+    /// stored `unconfirmed_email` (the #5783 race fix; this path is never gated
+    /// on change detection). A submission equal to the current `email` is a
+    /// no-op (the explicit-API equivalent of Devise's
+    /// `devise_will_save_change_to_email?` guard).
+    ///
+    /// Notifications follow D-05: `email_changed` goes to the ORIGINAL address
+    /// when `send_email_changed_notification` is set, and
+    /// `confirmation_instructions` carrying the raw token goes to the NEW
+    /// address. With `reconfirmable` off, a consumed `skip_reconfirmation`,
+    /// or a blank address, the address applies directly with no token or mail.
+    /// Returns the raw token when postponed, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// `DeviseError::Adapter` on persistence failure, `DeviseError::Mailer`
+    /// when a notification cannot render.
+    async fn change_email_with_reconfirmation<A, L>(
+        &mut self,
+        new_email: &str,
+        adapter: &A,
+        mailer: &L,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> Result<Option<String>, DeviseError>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+        L: Mailer<Self>,
+    {
+        if new_email.is_empty() || new_email == self.email() {
+            return Ok(None);
+        }
+        if !config.reconfirmable || self.consume_reconfirmation_bypass() {
+            self.set_email_address(new_email.to_string());
+            let fields =
+                HashMap::from([("email".to_string(), Value::String(new_email.to_string()))]);
+            adapter
+                .update_columns(&self.to_key(), &fields)
+                .await
+                .map_err(DeviseError::Adapter)?;
+            return Ok(None);
+        }
+        let original = self.email().to_string();
+        self.set_confirmation_token(None);
+        self.set_unconfirmed_email(Some(new_email.to_string()));
+        let raw = self
+            .store_fresh_confirmation_token(adapter, config, clock)
+            .await?;
+        let fields = HashMap::from([
+            (
+                "unconfirmed_email".to_string(),
+                Value::String(new_email.to_string()),
+            ),
+            ("email".to_string(), Value::String(original.clone())),
+            (
+                "confirmation_token".to_string(),
+                Value::String(self.confirmation_token().unwrap_or_default().to_string()),
+            ),
+            (
+                "confirmation_sent_at".to_string(),
+                Value::String(
+                    self.confirmation_sent_at()
+                        .map(|sent| sent.to_rfc3339())
+                        .unwrap_or_default(),
+                ),
+            ),
+        ]);
+        adapter
+            .update_columns(&self.to_key(), &fields)
+            .await
+            .map_err(DeviseError::Adapter)?;
+        if config.send_email_changed_notification {
+            let context = MailerContext {
+                email: original,
+                token: None,
+                url: None,
+                resource: self.serializable_hash(),
+            };
+            mailer.email_changed(self, None, &context)?;
+        }
+        let context = MailerContext {
+            email: new_email.to_string(),
+            token: Some(raw.clone()),
+            url: None,
+            resource: self.serializable_hash(),
+        };
+        mailer.confirmation_instructions(self, Some(&raw), &context)?;
+        Ok(Some(raw))
+    }
+
+    /// Class `send_confirmation_instructions` (CNF-08, D-08).
+    ///
+    /// With `reconfirmable` on, an `unconfirmed_email` match wins first (so a
+    /// pending address resolves to its record); otherwise the lookup falls
+    /// back to `find_or_initialize_with_errors` over `confirmation_keys`.
+    /// Unknown addresses fail with `:not_found`, except in paranoid mode,
+    /// which returns uniform success with nothing sent. Persisted matches are
+    /// resent (already-confirmed accounts surface the `:already_confirmed`
+    /// notice through the returned errors).
+    ///
+    /// # Errors
+    ///
+    /// `DeviseError::Adapter` on lookup or persistence failure,
+    /// `DeviseError::Mailer` when the notification cannot render.
+    async fn send_confirmation_instructions_for<A, L>(
+        attributes: &serde_json::Map<String, serde_json::Value>,
+        adapter: &A,
+        mailer: &L,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> Result<ResourceWithErrors<Self>, DeviseError>
+    where
+        Self: Sized + Default,
+        A: OrmAdapter<Self> + Send + Sync,
+        L: Mailer<Self>,
+    {
+        if config.reconfirmable {
+            let unconfirmed =
+                Self::find_by_unconfirmed_email_with_errors(attributes, adapter, config).await;
+            if unconfirmed.is_valid() {
+                let mut record = unconfirmed.record;
+                return match record
+                    .resend_confirmation_instructions(adapter, mailer, config, clock)
+                    .await?
+                {
+                    Ok(_) => Ok(ResourceWithErrors::new(record, ValidationErrors::new())),
+                    Err(errors) => Ok(ResourceWithErrors::new(record, errors)),
+                };
+            }
+        }
+        let keys: Vec<&str> = config
+            .confirmation_keys
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut conditions = Conditions::new();
+        for key in &keys {
+            if let Some(value) = attributes.get(*key).and_then(|value| value.as_str()) {
+                conditions.insert((*key).to_string(), Value::String(value.to_string()));
+            }
+        }
+        let mut resource = if conditions.iter().next().is_none() {
+            let mut errors = ValidationErrors::new();
+            for key in &keys {
+                errors.add(key, ":not_found");
+            }
+            ResourceWithErrors::new(Self::default(), errors)
+        } else {
+            Self::find_or_initialize_with_errors(&keys, &conditions, ":not_found", adapter, config)
+                .await
+        };
+        if !resource.is_valid() {
+            if config.paranoid {
+                return Ok(ResourceWithErrors::new(
+                    Self::default(),
+                    ValidationErrors::new(),
+                ));
+            }
+            return Ok(resource);
+        }
+        match resource
+            .record
+            .resend_confirmation_instructions(adapter, mailer, config, clock)
+            .await?
+        {
+            Ok(_) => Ok(resource),
+            Err(errors) => Ok(ResourceWithErrors::new(resource.record, errors)),
+        }
+    }
+
+    /// Find by the pending address for reconfirmable instruction requests
+    /// (CNF-08): `confirmation_keys` remapped from `email` to
+    /// `unconfirmed_email`, miss yields `:not_found` on a blank record.
+    async fn find_by_unconfirmed_email_with_errors<A>(
+        attributes: &serde_json::Map<String, serde_json::Value>,
+        adapter: &A,
+        config: &DeviseConfig,
+    ) -> ResourceWithErrors<Self>
+    where
+        Self: Sized + Default,
+        A: OrmAdapter<Self> + Send + Sync,
+    {
+        let remapped_keys: Vec<String> = config
+            .confirmation_keys
+            .iter()
+            .map(|key| {
+                if key == "email" {
+                    "unconfirmed_email".to_string()
+                } else {
+                    key.clone()
+                }
+            })
+            .collect();
+        let key_refs: Vec<&str> = remapped_keys.iter().map(String::as_str).collect();
+        let mut conditions = Conditions::new();
+        for (key, remapped) in config.confirmation_keys.iter().zip(remapped_keys.iter()) {
+            if let Some(value) = attributes.get(key).and_then(|value| value.as_str()) {
+                conditions.insert(remapped.clone(), Value::String(value.to_string()));
+            }
+        }
+        if conditions.iter().next().is_none() {
+            let mut errors = ValidationErrors::new();
+            for key in &key_refs {
+                errors.add(key, ":not_found");
+            }
+            return ResourceWithErrors::new(Self::default(), errors);
+        }
+        Self::find_or_initialize_with_errors(&key_refs, &conditions, ":not_found", adapter, config)
+            .await
+    }
 }
 
 /// `confirmation_period_valid?` with an explicit allow window (CNF-03).
@@ -489,7 +844,7 @@ mod tests {
     use crate::adapter::memory::MemoryAdapter;
     use crate::config::DeviseConfig;
     use crate::failure::AnyDeviseModel;
-    use crate::time::FixedClock;
+    use crate::time::{Clock, FixedClock};
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -741,5 +1096,321 @@ mod tests {
             );
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    async fn confirmed_user(
+        adapter: &MemoryAdapter<TestUser>,
+        config: &DeviseConfig,
+        clock: &FixedClock,
+        id: i64,
+        email: &str,
+    ) -> TestUser {
+        let mut user = TestUser::fresh(id, email);
+        adapter.create(user.clone()).await.unwrap();
+        user.ensure_confirmation_token(adapter, config, clock)
+            .await
+            .unwrap();
+        let outcome = TestUser::confirm_by_token(
+            user.raw_confirmation_token(),
+            adapter,
+            config,
+            clock,
+            &valid,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_valid());
+        outcome.record
+    }
+
+    #[tokio::test]
+    async fn confirmable_reconfirmation_postpones_with_d05_routing() {
+        let mut config = test_config();
+        config.send_email_changed_notification = true;
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = crate::mailer::TestMailer::default();
+        let mut user = confirmed_user(&adapter, &config, &clock, 1, "original@example.com").await;
+        let old_digest = user.confirmation_token().unwrap().to_string();
+
+        let raw = user
+            .change_email_with_reconfirmation("new@example.com", &adapter, &mailer, &config, &clock)
+            .await
+            .unwrap()
+            .expect("postponement returns the raw token");
+        assert_eq!(raw.len(), 20);
+
+        assert_eq!(user.email(), "original@example.com");
+        assert_eq!(user.unconfirmed_email(), Some("new@example.com"));
+        let rotated = user.confirmation_token().unwrap().to_string();
+        assert_eq!(rotated.len(), 64);
+        assert_ne!(rotated, old_digest);
+        assert!(user.confirmed());
+
+        let sent = mailer.sent_mails();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].to, "original@example.com");
+        assert_eq!(sent[0].subject, "Email Changed");
+        assert_eq!(sent[1].to, "new@example.com");
+        assert_eq!(sent[1].subject, "Confirmation instructions");
+        assert_eq!(sent[1].template_vars.token.as_deref(), Some(raw.as_str()));
+
+        let outcome = TestUser::confirm_by_token(Some(&raw), &adapter, &config, &clock, &valid)
+            .await
+            .unwrap();
+        assert!(outcome.is_valid());
+        assert_eq!(outcome.record.email(), "new@example.com");
+        assert_eq!(outcome.record.unconfirmed_email(), None);
+    }
+
+    #[tokio::test]
+    async fn confirmable_5783_double_submit_keeps_victim_unconfirmed() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = crate::mailer::TestMailer::default();
+        let mut user = confirmed_user(&adapter, &config, &clock, 1, "owner@example.com").await;
+
+        let first = user
+            .change_email_with_reconfirmation(
+                "victim@example.com",
+                &adapter,
+                &mailer,
+                &config,
+                &clock,
+            )
+            .await
+            .unwrap()
+            .expect("first submit postpones");
+        assert_ne!(user.email(), "victim@example.com");
+
+        let second = user
+            .change_email_with_reconfirmation(
+                "victim@example.com",
+                &adapter,
+                &mailer,
+                &config,
+                &clock,
+            )
+            .await
+            .unwrap()
+            .expect("unchanged resubmit still force-writes");
+        assert_ne!(user.email(), "victim@example.com");
+        assert_eq!(user.unconfirmed_email(), Some("victim@example.com"));
+        assert_ne!(first, second);
+
+        let mut pending_conditions = Conditions::new();
+        pending_conditions.insert(
+            "unconfirmed_email",
+            Value::String("victim@example.com".to_string()),
+        );
+        let stored = adapter.find_first(&pending_conditions).await.unwrap();
+        assert!(stored.is_some());
+    }
+
+    #[tokio::test]
+    async fn confirmable_resend_reuses_live_token_without_sent_at_bump() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = crate::mailer::TestMailer::default();
+        let mut user = TestUser::fresh(1, "resend@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        user.ensure_confirmation_token(&adapter, &config, &clock)
+            .await
+            .unwrap();
+        let digest = user.confirmation_token().unwrap().to_string();
+        let sent_at = user.confirmation_sent_at();
+
+        let outcome = user
+            .resend_confirmation_instructions(&adapter, &mailer, &config, &clock)
+            .await
+            .unwrap();
+        assert!(outcome.is_ok());
+        assert_eq!(user.confirmation_token(), Some(digest.as_str()));
+        assert_eq!(user.confirmation_sent_at(), sent_at);
+        assert_eq!(mailer.sent_mails().len(), 1);
+
+        let bearer = outcome.unwrap();
+        let confirm = TestUser::confirm_by_token(Some(&bearer), &adapter, &config, &clock, &valid)
+            .await
+            .unwrap();
+        assert!(confirm.is_valid());
+    }
+
+    #[tokio::test]
+    async fn confirmable_resend_rotates_expired_token_and_sent_at() {
+        let mut config = test_config();
+        config.confirm_within = Some(chrono::TimeDelta::days(3));
+        let mut clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = crate::mailer::TestMailer::default();
+        let mut user = TestUser::fresh(1, "expired@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        user.ensure_confirmation_token(&adapter, &config, &clock)
+            .await
+            .unwrap();
+        let old_digest = user.confirmation_token().unwrap().to_string();
+        let old_sent_at = user.confirmation_sent_at();
+
+        clock.advance(chrono::TimeDelta::days(4));
+        let outcome = user
+            .resend_confirmation_instructions(&adapter, &mailer, &config, &clock)
+            .await
+            .unwrap();
+        assert!(outcome.is_ok());
+        assert_ne!(user.confirmation_token().unwrap(), old_digest.as_str());
+        assert_ne!(user.confirmation_sent_at(), old_sent_at);
+        assert_eq!(user.confirmation_sent_at(), Some(clock.now()));
+    }
+
+    #[tokio::test]
+    async fn confirmable_resend_on_confirmed_errors_already_confirmed() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = crate::mailer::TestMailer::default();
+        let mut user = confirmed_user(&adapter, &config, &clock, 1, "done@example.com").await;
+
+        let outcome = user
+            .resend_confirmation_instructions(&adapter, &mailer, &config, &clock)
+            .await
+            .unwrap();
+        let Err(errors) = outcome else {
+            panic!("resend on a confirmed account must error");
+        };
+        assert_eq!(
+            errors.get("email"),
+            Some(&vec![":already_confirmed".to_string()])
+        );
+        assert!(mailer.sent_mails().is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirmable_skip_flags_suppress_without_confirming() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = crate::mailer::TestMailer::default();
+
+        let mut skipped = TestUser::fresh(1, "skipped@example.com");
+        skipped.skip_confirmation(&clock);
+        assert!(skipped.confirmed());
+        assert_eq!(skipped.confirmation_token(), None);
+
+        let mut silenced = TestUser::fresh(2, "silenced@example.com");
+        silenced.skip_confirmation_notification();
+        let sent = silenced
+            .send_on_create_confirmation_instructions(&adapter, &mailer, &config, &clock)
+            .await
+            .unwrap();
+        assert_eq!(sent, None);
+        assert!(!silenced.confirmed());
+        assert_eq!(silenced.confirmation_token(), None);
+        assert!(mailer.sent_mails().is_empty());
+
+        let mut plain = TestUser::fresh(1, "plain@example.com");
+        adapter.create(plain.clone()).await.unwrap();
+        let sent = plain
+            .send_on_create_confirmation_instructions(&adapter, &mailer, &config, &clock)
+            .await
+            .unwrap()
+            .expect("create-time send returns the bearer");
+        assert_eq!(sent.len(), 20);
+        assert_eq!(mailer.sent_mails().len(), 1);
+        assert_eq!(mailer.sent_mails()[0].to, "plain@example.com");
+
+        let mut blank = TestUser::fresh(4, "");
+        let sent = blank
+            .send_on_create_confirmation_instructions(&adapter, &mailer, &config, &clock)
+            .await
+            .unwrap();
+        assert_eq!(sent, None);
+    }
+
+    #[tokio::test]
+    async fn confirmable_skip_reconfirmation_applies_email_directly() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = crate::mailer::TestMailer::default();
+        let mut user = confirmed_user(&adapter, &config, &clock, 1, "before@example.com").await;
+        user.skip_reconfirmation();
+
+        let outcome = user
+            .change_email_with_reconfirmation(
+                "after@example.com",
+                &adapter,
+                &mailer,
+                &config,
+                &clock,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, None);
+        assert_eq!(user.email(), "after@example.com");
+        assert_eq!(user.unconfirmed_email(), None);
+        assert!(mailer.sent_mails().is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirmable_class_send_finds_unconfirmed_first_and_paranoid_stays_silent() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = crate::mailer::TestMailer::default();
+        let mut user = confirmed_user(&adapter, &config, &clock, 1, "holder@example.com").await;
+        user.change_email_with_reconfirmation(
+            "pending@example.com",
+            &adapter,
+            &mailer,
+            &config,
+            &clock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mailer.sent_mails().len(), 1);
+
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "email".to_string(),
+            serde_json::Value::String("pending@example.com".to_string()),
+        );
+        let outcome = TestUser::send_confirmation_instructions_for(
+            &params, &adapter, &mailer, &config, &clock,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_valid());
+        assert_eq!(outcome.record.id, 1);
+        assert_eq!(mailer.sent_mails().len(), 2);
+        assert_eq!(mailer.sent_mails()[1].to, "pending@example.com");
+
+        let mut unknown = serde_json::Map::new();
+        unknown.insert(
+            "email".to_string(),
+            serde_json::Value::String("ghost@example.com".to_string()),
+        );
+        let outcome = TestUser::send_confirmation_instructions_for(
+            &unknown, &adapter, &mailer, &config, &clock,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_valid());
+        assert_eq!(
+            outcome.errors.get("email"),
+            Some(&vec![":not_found".to_string()])
+        );
+        assert_eq!(mailer.sent_mails().len(), 2);
+
+        let mut paranoid = test_config();
+        paranoid.paranoid = true;
+        let outcome = TestUser::send_confirmation_instructions_for(
+            &unknown, &adapter, &mailer, &paranoid, &clock,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_valid());
+        assert_eq!(mailer.sent_mails().len(), 2);
     }
 }
