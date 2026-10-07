@@ -909,4 +909,476 @@ mod tests {
         assert!(!header.contains("; Secure"));
         assert!(header.contains("; HttpOnly"));
     }
+
+    /// Salt-column-less model: value resolves from `authenticatable_salt`,
+    /// never from a token column it does not carry.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    struct SaltUser {
+        id: i64,
+        email: String,
+        encrypted_password: String,
+        remember_created_at: Option<DateTime<Utc>>,
+        #[serde(skip)]
+        remember_flag: Option<bool>,
+    }
+
+    impl SaltUser {
+        fn fresh(id: i64, email: &str) -> Self {
+            Self {
+                id,
+                email: email.to_string(),
+                encrypted_password: "$2a$12$01234567890123456789012345678901234567890123456789012"
+                    .to_string(),
+                ..Self::default()
+            }
+        }
+
+        fn barren(id: i64) -> Self {
+            Self {
+                id,
+                email: "barren@example.com".to_string(),
+                encrypted_password: String::new(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl AnyDeviseModel for SaltUser {
+        fn to_key(&self) -> DeviseKey {
+            DeviseKey::from_i64(self.id)
+        }
+
+        fn authenticatable_salt(&self) -> Option<String> {
+            self.encrypted_password.get(..29).map(str::to_string)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Authenticatable for SaltUser {
+        fn serializable_hash(&self) -> serde_json::Value {
+            serde_json::json!({ "id": self.id, "email": self.email })
+        }
+    }
+
+    #[async_trait]
+    impl Rememberable for SaltUser {
+        fn remember_created_at(&self) -> Option<DateTime<Utc>> {
+            self.remember_created_at
+        }
+
+        fn set_remember_created_at(&mut self, at: Option<DateTime<Utc>>) {
+            self.remember_created_at = at;
+        }
+
+        fn remember_token(&self) -> Option<&str> {
+            None
+        }
+
+        fn set_remember_token(&mut self, _token: Option<String>) {}
+
+        fn persisted(&self) -> bool {
+            self.id != 0
+        }
+
+        fn remember_me_flag(&self) -> Option<bool> {
+            self.remember_flag
+        }
+
+        fn set_remember_me_flag(&mut self, flag: bool) {
+            self.remember_flag = Some(flag);
+        }
+    }
+
+    /// Adapter wrapper counting writes, proving guarded paths stay silent.
+    struct CountingAdapter<'a> {
+        inner: &'a MemoryAdapter<TestUser>,
+        writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::adapter::OrmAdapter<TestUser> for CountingAdapter<'_> {
+        type New = TestUser;
+
+        async fn get(&self, id: &DeviseKey) -> Result<Option<TestUser>, crate::adapter::OrmError> {
+            self.inner.get(id).await
+        }
+
+        async fn find_first(
+            &self,
+            conditions: &crate::adapter::Conditions,
+        ) -> Result<Option<TestUser>, crate::adapter::OrmError> {
+            self.inner.find_first(conditions).await
+        }
+
+        async fn create(&self, model: TestUser) -> Result<TestUser, crate::adapter::OrmError> {
+            self.inner.create(model).await
+        }
+
+        async fn update(
+            &self,
+            key: &DeviseKey,
+            changes: &crate::adapter::ChangeSet,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            self.inner.update(key, changes).await
+        }
+
+        async fn update_columns(
+            &self,
+            key: &DeviseKey,
+            fields: &HashMap<String, Value>,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.update_columns(key, fields).await
+        }
+
+        async fn delete(&self, id: &DeviseKey) -> Result<(), crate::adapter::OrmError> {
+            self.inner.delete(id).await
+        }
+    }
+
+    fn write_count(counter: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Seed a persisted user remembered at the clock instant, returning the
+    /// record plus its cookie triple minted two seconds later.
+    async fn remembered_cookie(
+        adapter: &MemoryAdapter<TestUser>,
+        clock: &mut FixedClock,
+        id: i64,
+    ) -> (TestUser, String, String, String) {
+        let mut user = TestUser::fresh(id, "matrix@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        user.remember_me(adapter, &*clock).await.unwrap();
+        clock.advance(TimeDelta::seconds(2));
+        let (key, value, generated) = user.serialize_into_cookie(&*clock).unwrap();
+        (user, key, value, generated)
+    }
+
+    #[tokio::test]
+    async fn rememberable_nil_case_invalid_datetime() {
+        let config = test_config();
+        let mut clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let (user, key, value, _) = remembered_cookie(&adapter, &mut clock, 1).await;
+
+        assert!(
+            TestUser::serialize_from_cookie(&key, &value, "not-a-time", &adapter, &config, &clock)
+                .await
+                .is_none()
+        );
+        assert!(!user.remember_me_valid(&value, "1700000000.5", &config, &clock));
+        assert!(!user.remember_me_valid(&value, "", &config, &clock));
+    }
+
+    #[tokio::test]
+    async fn rememberable_nil_case_unknown_resource() {
+        let config = test_config();
+        let mut clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let (_, _, value, generated) = remembered_cookie(&adapter, &mut clock, 1).await;
+
+        assert!(
+            TestUser::serialize_from_cookie("999", &value, &generated, &adapter, &config, &clock)
+                .await
+                .is_none()
+        );
+        assert!(
+            TestUser::serialize_from_cookie("nope", &value, &generated, &adapter, &config, &clock)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rememberable_nil_case_missing_timestamp() {
+        let config = test_config();
+        let clock = fixed_clock();
+
+        assert!(decode_cookie_value("[\"1\",\"tok\"]").is_none());
+        assert!(decode_cookie_value("[]").is_none());
+        assert!(decode_cookie_value("not json").is_none());
+        assert!(decode_cookie_value("[\"1\",7,8]").is_none());
+        assert!(!remember_cookie_valid(
+            "tok",
+            "tok",
+            None,
+            Some(clock.now()),
+            &config,
+            &clock
+        ));
+    }
+
+    #[tokio::test]
+    async fn rememberable_nil_case_timestamp_at_or_before_creation() {
+        let config = test_config();
+        let mut clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let (user, key, value, _) = remembered_cookie(&adapter, &mut clock, 1).await;
+        let created = user.remember_created_at().expect("created is set");
+
+        let earlier = (created - TimeDelta::seconds(60)).timestamp().to_string();
+        assert!(
+            TestUser::serialize_from_cookie(&key, &value, &earlier, &adapter, &config, &clock)
+                .await
+                .is_none()
+        );
+        assert!(!user.remember_me_valid(&value, &earlier, &config, &clock));
+    }
+
+    #[tokio::test]
+    async fn rememberable_equal_timestamps_are_invalid() {
+        let config = test_config();
+        let mut clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let (user, key, value, _) = remembered_cookie(&adapter, &mut clock, 1).await;
+        let created = user.remember_created_at().expect("created is set");
+        let same = created.timestamp().to_string();
+
+        assert!(!user.remember_me_valid(&value, &same, &config, &clock));
+        assert!(
+            TestUser::serialize_from_cookie(&key, &value, &same, &adapter, &config, &clock)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rememberable_nil_case_older_than_remember_for() {
+        let config = test_config();
+        let mut clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let (user, key, value, _) = remembered_cookie(&adapter, &mut clock, 1).await;
+
+        clock.advance(TimeDelta::weeks(3));
+        let stale_generated = (fixed_clock().now() + TimeDelta::seconds(10))
+            .timestamp()
+            .to_string();
+        assert!(
+            TestUser::serialize_from_cookie(
+                &key,
+                &value,
+                &stale_generated,
+                &adapter,
+                &config,
+                &clock
+            )
+            .await
+            .is_none()
+        );
+        assert!(!user.remember_me_valid(&value, &stale_generated, &config, &clock));
+    }
+
+    #[tokio::test]
+    async fn rememberable_nil_case_wrong_token() {
+        let config = test_config();
+        let mut clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let (user, key, _, generated) = remembered_cookie(&adapter, &mut clock, 1).await;
+
+        assert!(
+            TestUser::serialize_from_cookie(&key, "wrong", &generated, &adapter, &config, &clock)
+                .await
+                .is_none()
+        );
+        assert!(!user.remember_me_valid("wrong", &generated, &config, &clock));
+    }
+
+    #[tokio::test]
+    async fn rememberable_missing_created_at_is_invalid() {
+        let config = test_config();
+        let clock = fixed_clock();
+        let user = SaltUser::fresh(1, "salt@example.com");
+        let value = user.rememberable_value().expect("salt resolves");
+        let generated = clock.now().timestamp().to_string();
+
+        assert!(!user.remember_me_valid(&value, &generated, &config, &clock));
+    }
+
+    #[tokio::test]
+    async fn rememberable_forget_clears_per_expire_all() {
+        let clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+
+        let mut forgetting = TestUser::fresh(1, "forget@example.com");
+        adapter.create(forgetting.clone()).await.unwrap();
+        forgetting.remember_me(&adapter, &clock).await.unwrap();
+        assert!(forgetting.remember_token().is_some());
+        assert!(forgetting.remember_created_at().is_some());
+
+        forgetting
+            .forget_me(&adapter, &test_config())
+            .await
+            .unwrap();
+        assert!(forgetting.remember_token().is_none());
+        assert!(forgetting.remember_created_at().is_none());
+        let stored = adapter.get(&forgetting.to_key()).await.unwrap().unwrap();
+        assert!(stored.remember_token.is_none());
+        assert!(stored.remember_created_at.is_none());
+
+        let mut keeping = TestUser::fresh(2, "keep@example.com");
+        adapter.create(keeping.clone()).await.unwrap();
+        keeping.remember_me(&adapter, &clock).await.unwrap();
+        let mut partial = test_config();
+        partial.expire_all_remember_me_on_sign_out = false;
+        keeping.forget_me(&adapter, &partial).await.unwrap();
+        assert!(keeping.remember_token().is_none());
+        assert!(keeping.remember_created_at().is_some());
+        let stored = adapter.get(&keeping.to_key()).await.unwrap().unwrap();
+        assert!(stored.remember_token.is_none());
+        assert!(stored.remember_created_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn rememberable_forget_unpersisted_touches_no_adapter() {
+        let config = test_config();
+        let inner = MemoryAdapter::<TestUser>::new();
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = CountingAdapter {
+            inner: &inner,
+            writes: writes.clone(),
+        };
+
+        let mut ghost = TestUser::fresh(0, "ghost@example.com");
+        ghost.forget_me(&adapter, &config).await.unwrap();
+        assert_eq!(write_count(&writes), 0);
+    }
+
+    #[tokio::test]
+    async fn rememberable_remember_reuse_keeps_token_without_write() {
+        let clock = fixed_clock();
+        let inner = MemoryAdapter::<TestUser>::new();
+        let mut user = TestUser::fresh(1, "reuse@example.com");
+        inner.create(user.clone()).await.unwrap();
+        user.remember_me(&inner, &clock).await.unwrap();
+        let token = user.remember_token().map(str::to_string);
+        let created = user.remember_created_at();
+
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = CountingAdapter {
+            inner: &inner,
+            writes: writes.clone(),
+        };
+        user.remember_me(&adapter, &clock).await.unwrap();
+        assert_eq!(write_count(&writes), 0);
+        assert_eq!(user.remember_token().map(str::to_string), token);
+        assert_eq!(user.remember_created_at(), created);
+    }
+
+    #[tokio::test]
+    async fn rememberable_fixed_expiry_never_slides() {
+        let config = test_config();
+        let mut clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let (user, key, value, generated) = remembered_cookie(&adapter, &mut clock, 1).await;
+        let created = user.remember_created_at().expect("created is set");
+
+        // Reuse a week later: the same value validates, and the stored
+        // creation instant never moves, so the window stays fixed.
+        clock.advance(TimeDelta::weeks(1));
+        let (fresh_key, fresh_value, fresh_generated) = user.serialize_into_cookie(&clock).unwrap();
+        assert_eq!(fresh_key, key);
+        assert_eq!(fresh_value, value);
+        let fresh_epoch: i64 = fresh_generated.parse().expect("epoch timestamp");
+        let old_epoch: i64 = generated.parse().expect("epoch timestamp");
+        assert!(fresh_epoch > old_epoch);
+        assert!(user.remember_me_valid(&fresh_value, &fresh_generated, &config, &clock));
+
+        let stored = adapter.get(&user.to_key()).await.unwrap().unwrap();
+        assert_eq!(stored.remember_created_at, Some(created));
+
+        let expires_at = user.remember_expires_at(&config, &fixed_clock());
+        assert_eq!(expires_at, fixed_clock().now() + config.remember_for);
+    }
+
+    #[tokio::test]
+    async fn rememberable_password_rotation_kills_older_cookies() {
+        let config = test_config();
+        let mut clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let (user, key, value, generated) = remembered_cookie(&adapter, &mut clock, 1).await;
+        assert!(user.remember_me_valid(&value, &generated, &config, &clock));
+
+        clock.advance(TimeDelta::seconds(3600));
+        let rotated_at = clock.now();
+        adapter
+            .update_columns(
+                &user.to_key(),
+                &HashMap::from([(
+                    REMEMBER_CREATED_AT_COLUMN.to_string(),
+                    Value::String(rotated_at.to_rfc3339()),
+                )]),
+            )
+            .await
+            .unwrap();
+
+        // Reload: the in-memory copy still carries the pre-rotation instant.
+        let rotated = adapter.get(&user.to_key()).await.unwrap().unwrap();
+        assert_eq!(rotated.remember_created_at, Some(rotated_at));
+        assert!(!rotated.remember_me_valid(&value, &generated, &config, &clock));
+        assert!(
+            TestUser::serialize_from_cookie(&key, &value, &generated, &adapter, &config, &clock)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rememberable_value_resolution() {
+        let clock = fixed_clock();
+
+        let mut token_user = TestUser::fresh(1, "token@example.com");
+        token_user.set_remember_token(Some("raw-token".to_string()));
+        assert_eq!(token_user.rememberable_value().unwrap(), "raw-token");
+
+        let salt_user = SaltUser::fresh(2, "salt@example.com");
+        let salt = salt_user.authenticatable_salt().expect("salt is set");
+        assert_eq!(salt_user.rememberable_value().unwrap(), salt);
+
+        let empty_token_user = TestUser::fresh(3, "empty@example.com");
+        assert_eq!(
+            empty_token_user.rememberable_value().unwrap(),
+            String::new()
+        );
+
+        let barren = SaltUser::barren(4);
+        assert_eq!(barren.rememberable_value(), Err(MissingRememberableValue));
+        assert!(barren.serialize_into_cookie(&clock).is_err());
+    }
+
+    #[tokio::test]
+    async fn rememberable_remember_unpersisted_errors_without_panic() {
+        let clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mut ghost = TestUser::fresh(0, "ghost@example.com");
+
+        let result = ghost.remember_me(&adapter, &clock).await;
+        assert!(matches!(
+            result,
+            Err(DeviseError::Adapter(crate::adapter::OrmError::NotFound))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rememberable_forget_salt_model_clears_created_only() {
+        let config = test_config();
+        let clock = fixed_clock();
+        let adapter = MemoryAdapter::<SaltUser>::new();
+        let mut user = SaltUser::fresh(1, "salt@example.com");
+        adapter.create(user.clone()).await.unwrap();
+
+        user.remember_me(&adapter, &clock).await.unwrap();
+        assert!(user.remember_created_at().is_some());
+        assert!(user.remember_token().is_none());
+
+        user.forget_me(&adapter, &config).await.unwrap();
+        assert!(user.remember_created_at().is_none());
+        let stored = adapter.get(&user.to_key()).await.unwrap().unwrap();
+        assert!(stored.remember_created_at.is_none());
+    }
 }
