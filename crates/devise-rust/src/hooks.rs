@@ -5,7 +5,9 @@
 //! filtering semantics. Phase 3 delivers the registry and stub hooks; Phase 5
 //! fills in module-specific hook bodies.
 
+use crate::config::DeviseConfig;
 use crate::failure::Failure;
+use crate::rememberable::RememberCookieOp;
 use crate::request::AuthRequest;
 use async_trait::async_trait;
 use std::fmt::Debug;
@@ -147,6 +149,20 @@ pub trait HookProxy: Send + Sync {
     fn session_store(&self) -> &dyn crate::session::SessionStore;
     /// Get the scope registry
     fn scope_registry(&self) -> &crate::scope::ScopeRegistry;
+    /// Get the Devise config (rememberable cookie attributes and expiry).
+    ///
+    /// Proxies serving Rememberable mappings must override this; the
+    /// default panics, matching the other test-only accessors.
+    fn devise_config(&self) -> &DeviseConfig {
+        unimplemented!("hook proxies serving rememberable mappings must expose the config")
+    }
+    /// Queue a remember-cookie intent for the bridge outbox.
+    ///
+    /// `AuthProxy` records it for draining after authentication; the default
+    /// drops the op, which suits test-only proxies that never trigger
+    /// rememberable bodies. Proxies serving Rememberable mappings must
+    /// override this.
+    fn push_remember_cookie_op(&mut self, _op: RememberCookieOp) {}
     /// Get mutable access to user map (for `sign_out`, lock, etc.)
     fn user_mut(&mut self, scope: &str) -> Option<&mut Option<Box<dyn AnyDeviseModel>>>;
     /// Lock the proxy (blocks further auth this request)
@@ -291,12 +307,7 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
     if mapping.modules.contains(&Module::Rememberable) {
         registry.add_hook(
             HookFilter::new().only(vec![Event::Authentication]),
-            Box::new(|_ctx| {
-                Box::pin(async move {
-                    // TODO Phase 5: if remember_me_flag { record.remember_me!(); RememberableBridge::set_cookie(...) }
-                    Ok(())
-                })
-            }),
+            rememberable_set_hook(),
             false,
         );
     }
@@ -305,12 +316,7 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
     if mapping.modules.contains(&Module::Rememberable) {
         registry.add_hook(
             HookFilter::new().only(vec![Event::Logout]),
-            Box::new(|_ctx| {
-                Box::pin(async move {
-                    // TODO Phase 5: record.forget_me!(); RememberableBridge::clear_cookie(...)
-                    Ok(())
-                })
-            }),
+            forgetable_hook(),
             false,
         );
     }
@@ -368,6 +374,83 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
             false,
         );
     }
+}
+
+/// Rememberable-set hook body (hook 4): queue the `Set` cookie intent when
+/// the virtual `remember_me` flag is set and the record offers a value.
+///
+/// Devise `hooks/rememberable.rb` runs `after_set_user` except fetch. The
+/// params strategy stamps the flag from the sign-in params (Devise
+/// `Authenticatable#remember_me`); `ctx.request` is a fallback source when
+/// hooks run outside that flow. Durable persistence (`remember_me` through
+/// the adapter) runs in the bridge sign-in before `set_user`, since hooks
+/// own no adapter; the hook owns the cookie intent.
+fn rememberable_set_hook() -> Box<HookFn> {
+    Box::new(|ctx| {
+        Box::pin(async move {
+            let flag = ctx
+                .record
+                .is_some_and(|record| record.remember_me_flag_opt() == Some(true))
+                || ctx.request.is_some_and(|request| {
+                    crate::rememberable::remember_flag_set(request, ctx.scope)
+                });
+            if !flag {
+                return Ok(());
+            }
+            let Some(record) = ctx.record else {
+                return Ok(());
+            };
+            let Some(value) = record.rememberable_value_opt() else {
+                return Ok(());
+            };
+            if value.is_empty() {
+                // Column present but never minted (or a valueless model):
+                // encoding an empty token would only produce a cookie the
+                // check rejects, so stay silent.
+                return Ok(());
+            }
+            let key = record.to_key().to_string();
+            let (op_key, attrs, jar) = {
+                let config = ctx.proxy.devise_config();
+                let clock = crate::time::SystemClock;
+                let triple = crate::rememberable::build_cookie_triple(&key, &value, &clock);
+                let jar = crate::rememberable::encode_cookie_value(&triple.0, &triple.1, &triple.2);
+                let attrs = crate::rememberable::RememberableCookieAttrs::for_scope(
+                    ctx.scope, config, &clock,
+                );
+                let op_key = attrs.key.clone();
+                (op_key, attrs, jar)
+            };
+            ctx.proxy.push_remember_cookie_op(RememberCookieOp::Set {
+                scope: ctx.scope.to_string(),
+                key: op_key,
+                value: jar,
+                attrs,
+            });
+            Ok(())
+        })
+    })
+}
+
+/// Forgetable hook body (hook 5): queue the `Clear` cookie intent on logout.
+///
+/// Devise `hooks/forgetable.rb` runs `before_logout`, forgetting the user and
+/// clearing the cookie. The typed `forget_me` (adapter persistence) runs in
+/// the bridge sign-out before `sign_out`, since hooks own no adapter and the
+/// memo is already detached here; the hook owns the cookie delete alone.
+fn forgetable_hook() -> Box<HookFn> {
+    Box::new(|ctx| {
+        Box::pin(async move {
+            let scope = ctx.scope.to_string();
+            let key = {
+                let config = ctx.proxy.devise_config();
+                crate::rememberable::remember_cookie_key(&scope, config)
+            };
+            ctx.proxy
+                .push_remember_cookie_op(RememberCookieOp::Clear { scope, key });
+            Ok(())
+        })
+    })
 }
 
 /// Bridge trait for session renewal (SESS-05)

@@ -15,6 +15,7 @@ use crate::error::DeviseError;
 use crate::failure::{AnyDeviseModel, AuthOutcome, Failure};
 use crate::hooks::{Event, HookContext, HookRegistry};
 use crate::model::ModelFinder;
+use crate::rememberable::RememberCookieOp;
 use crate::request::AuthRequest;
 use crate::scope::ScopeRegistry;
 use crate::session::{self, SessionStore};
@@ -68,6 +69,7 @@ pub struct AuthProxy {
     hooks: Arc<HookRegistry>,
     finders: HashMap<String, Arc<dyn ModelFinder>>,
     config: Arc<DeviseConfig>,
+    remember_cookie_ops: Vec<RememberCookieOp>,
 }
 
 impl AuthProxy {
@@ -91,6 +93,7 @@ impl AuthProxy {
             hooks,
             finders: HashMap::new(),
             config,
+            remember_cookie_ops: Vec::new(),
         }
     }
 
@@ -121,6 +124,23 @@ impl AuthProxy {
     #[must_use]
     pub fn config(&self) -> &DeviseConfig {
         &self.config
+    }
+
+    /// Pending remember-cookie intents (Devise jar writes, core side).
+    ///
+    /// Strategies and hooks push [`RememberCookieOp`]s here; framework
+    /// bridges drain them after authentication and execute `Set` through
+    /// `RememberableBridge::set_cookie` plus `Clear` through
+    /// `RememberableBridge::clear_cookie`.
+    #[must_use]
+    pub fn remember_cookie_ops(&self) -> &[RememberCookieOp] {
+        &self.remember_cookie_ops
+    }
+
+    /// Drain the pending remember-cookie intents for the bridge.
+    #[must_use]
+    pub fn take_remember_cookie_ops(&mut self) -> Vec<RememberCookieOp> {
+        std::mem::take(&mut self.remember_cookie_ops)
     }
 
     /// Whether the proxy is locked for this request.
@@ -410,7 +430,7 @@ impl AuthProxy {
             .cloned()
             .ok_or_else(|| Failure::Config(format!("no finder for scope '{scope}'")))?;
         let config = self.config.clone();
-        let strategies = crate::strategy::strategies_for(&mapping, config.paranoid);
+        let strategies = crate::strategy::strategies_for(&mapping, &config);
 
         for strategy in &strategies {
             let strategy_id = strategy.id();
@@ -438,6 +458,41 @@ impl AuthProxy {
                         .insert(strategy_id.to_string());
                     return Ok((user, strategy.store()));
                 }
+                Ok(AuthOutcome::SuccessWithCookieRefresh {
+                    user,
+                    cookie_key,
+                    cookie_value,
+                    expires,
+                }) => {
+                    self.performed
+                        .entry(scope.to_string())
+                        .or_default()
+                        .insert(strategy_id.to_string());
+                    // Extend re-issue (D-14): queue the refreshed cookie with
+                    // the hardened attributes, then proceed as success.
+                    let mut attrs = crate::rememberable::RememberableCookieAttrs::for_scope(
+                        scope,
+                        &config,
+                        &crate::time::SystemClock,
+                    );
+                    attrs.expires = expires;
+                    self.remember_cookie_ops.push(RememberCookieOp::Set {
+                        scope: scope.to_string(),
+                        key: cookie_key,
+                        value: cookie_value,
+                        attrs,
+                    });
+                    return Ok((user, strategy.store()));
+                }
+                Ok(AuthOutcome::ClearCookieAndPass { cookie_key }) => {
+                    // Stale cookie (RMB-04): queue the delete for the bridge
+                    // (its `RememberableBridge::clear_cookie` equivalent) and
+                    // continue the chain with pass-through semantics.
+                    self.remember_cookie_ops.push(RememberCookieOp::Clear {
+                        scope: scope.to_string(),
+                        key: cookie_key,
+                    });
+                }
                 Ok(AuthOutcome::Pass) => {}
                 Err(failure) => {
                     self.performed
@@ -461,6 +516,14 @@ impl crate::hooks::HookProxy for AuthProxy {
         &self.registry
     }
 
+    fn devise_config(&self) -> &DeviseConfig {
+        &self.config
+    }
+
+    fn push_remember_cookie_op(&mut self, op: RememberCookieOp) {
+        self.remember_cookie_ops.push(op);
+    }
+
     fn user_mut(&mut self, scope: &str) -> Option<&mut Option<Box<dyn AnyDeviseModel>>> {
         self.users.get_mut(scope)
     }
@@ -477,6 +540,7 @@ mod tests {
     use crate::adapter::memory::MemoryAdapter;
     use crate::config::DeviseConfig;
     use crate::hooks::HookRegistry;
+    use crate::hooks::RememberableBridge;
     use crate::model::{AdapterBridge, PasswordVerifiable};
     use crate::request::HttpMethod;
     use crate::scope::{Mapping, PathNames, SignOutVia};
@@ -751,5 +815,234 @@ mod tests {
         bad.params
             .insert("user_password".to_string(), "wrong".to_string());
         assert!(proxy.authenticate("user", &bad).await.is_none());
+    }
+
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct RememberProxyUser {
+        id: i64,
+        email: String,
+        encrypted_password: String,
+        remember_token: Option<String>,
+        remember_created_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(skip)]
+        remember_flag: Option<bool>,
+    }
+
+    impl AnyDeviseModel for RememberProxyUser {
+        fn to_key(&self) -> DeviseKey {
+            DeviseKey::from_i64(self.id)
+        }
+
+        fn authenticatable_salt(&self) -> Option<String> {
+            self.encrypted_password.get(..29).map(str::to_string)
+        }
+
+        fn rememberable_value_opt(&self) -> Option<String> {
+            Some(self.remember_token.clone().unwrap_or_default())
+        }
+
+        fn remember_created_at_opt(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+            self.remember_created_at
+        }
+
+        fn remember_me_flag_opt(&self) -> Option<bool> {
+            self.remember_flag
+        }
+
+        fn set_remember_me_flag(&mut self, flag: bool) {
+            self.remember_flag = Some(flag);
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Test bridge proving the proxy outbox drains into real bridge calls.
+    struct RecordingBridge;
+
+    #[async_trait::async_trait]
+    impl crate::hooks::RememberableBridge for RecordingBridge {
+        async fn set_cookie(
+            store: &dyn SessionStore,
+            scope: &str,
+            value: &str,
+            expires: chrono::DateTime<chrono::Utc>,
+        ) -> Result<(), DeviseError> {
+            store
+                .insert_value(
+                    &format!("remember_cookie_set:{scope}"),
+                    serde_json::json!([value, expires.to_rfc3339()]),
+                )
+                .await;
+            Ok(())
+        }
+
+        async fn clear_cookie(store: &dyn SessionStore, scope: &str) -> Result<(), DeviseError> {
+            store
+                .insert_value(
+                    &format!("remember_cookie_cleared:{scope}"),
+                    serde_json::Value::Bool(true),
+                )
+                .await;
+            Ok(())
+        }
+    }
+
+    fn remember_test_proxy(
+        renewed: &Arc<AtomicBool>,
+        config: DeviseConfig,
+    ) -> (AuthProxy, Arc<ProxySessionStore>) {
+        let store = Arc::new(ProxySessionStore {
+            data: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            renewed: renewed.clone(),
+        });
+        let mut registry = ScopeRegistry::new();
+        registry.register(Mapping {
+            name: "user".to_string(),
+            class_name: "User".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![
+                crate::scope::Module::DatabaseAuthenticatable,
+                crate::scope::Module::Rememberable,
+            ],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: SignOutVia::Delete,
+            failure_app: None,
+        });
+        let proxy = AuthProxy::new(
+            store.clone(),
+            Arc::new(registry),
+            Arc::new(HookRegistry::new()),
+            Arc::new(config),
+        );
+        (proxy, store)
+    }
+
+    async fn seeded_remember_proxy_bridge()
+    -> AdapterBridge<MemoryAdapter<RememberProxyUser>, RememberProxyUser> {
+        // Live instants (SystemClock drives the chain-built strategy): the
+        // creation hour and the cookie minute both sit inside the window
+        // with strict ordering between them.
+        let now = chrono::Utc::now();
+        let adapter = MemoryAdapter::<RememberProxyUser>::new();
+        adapter
+            .create(RememberProxyUser {
+                id: 1,
+                email: "remember@example.com".to_string(),
+                encrypted_password: String::new(),
+                remember_token: Some("cookie-token".to_string()),
+                remember_created_at: Some(now - chrono::TimeDelta::hours(1)),
+                remember_flag: None,
+            })
+            .await
+            .unwrap();
+        AdapterBridge::new(adapter)
+    }
+
+    fn remember_cookie_request(jar: &str) -> AuthRequest {
+        let mut request = AuthRequest::new(HttpMethod::Get, "/");
+        request
+            .cookies
+            .insert("remember_user_token".to_string(), jar.to_string());
+        request
+    }
+
+    fn live_cookie_jar() -> String {
+        let generated = (chrono::Utc::now() - chrono::TimeDelta::seconds(60)).timestamp();
+        crate::rememberable::encode_cookie_value("1", "cookie-token", &generated.to_string())
+    }
+
+    #[tokio::test]
+    async fn test_proxy_rememberable_stale_cookie_clears_and_passes() {
+        let renewed = Arc::new(AtomicBool::new(false));
+        let (mut proxy, store) = remember_test_proxy(&renewed, test_config());
+        proxy.register_finder("user", Arc::new(seeded_remember_proxy_bridge().await));
+
+        // Stale jar: the chain passes through (no params follow), so auth
+        // yields nothing, but the delete signal is queued, never a failure.
+        let request = remember_cookie_request("garbage");
+        assert!(proxy.authenticate("user", &request).await.is_none());
+        let ops = proxy.take_remember_cookie_ops();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0],
+            crate::rememberable::RememberCookieOp::Clear { scope, key }
+            if scope == "user" && key == "remember_user_token"
+        ));
+
+        // The drained signal reaches the bridge contract.
+        for op in &ops {
+            if let crate::rememberable::RememberCookieOp::Clear { scope, .. } = op {
+                RecordingBridge::clear_cookie(store.as_ref(), scope)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            store.get_value("remember_cookie_cleared:user").await,
+            Some(serde_json::Value::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_rememberable_success_sets_session_without_ops() {
+        let renewed = Arc::new(AtomicBool::new(false));
+        let (mut proxy, store) = remember_test_proxy(&renewed, test_config());
+        proxy.register_finder("user", Arc::new(seeded_remember_proxy_bridge().await));
+
+        let request = remember_cookie_request(&live_cookie_jar());
+        let user = proxy
+            .authenticate("user", &request)
+            .await
+            .expect("remember hit authenticates");
+        assert_eq!(user.to_key(), DeviseKey::from_i64(1));
+        assert!(proxy.take_remember_cookie_ops().is_empty());
+        let session_key = session::keys::scope_session_key("user");
+        assert!(store.get_value(&session_key).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_rememberable_extend_queues_hardened_set_op() {
+        let renewed = Arc::new(AtomicBool::new(false));
+        let config = DeviseConfig {
+            extend_remember_period: true,
+            ..test_config()
+        };
+        let (mut proxy, store) = remember_test_proxy(&renewed, config);
+        proxy.register_finder("user", Arc::new(seeded_remember_proxy_bridge().await));
+
+        let request = remember_cookie_request(&live_cookie_jar());
+        assert!(proxy.authenticate("user", &request).await.is_some());
+        let ops = proxy.take_remember_cookie_ops();
+        assert_eq!(ops.len(), 1);
+        let crate::rememberable::RememberCookieOp::Set {
+            scope,
+            key,
+            value,
+            attrs,
+        } = &ops[0]
+        else {
+            panic!("extend re-issue queues a Set op, got {:?}", ops[0]);
+        };
+        assert_eq!(scope, "user");
+        assert_eq!(key, "remember_user_token");
+        assert!(crate::rememberable::decode_cookie_value(value).is_some());
+        assert!(attrs.httponly && attrs.secure);
+        assert_eq!(attrs.same_site, crate::rememberable::SameSite::Lax);
+
+        RecordingBridge::set_cookie(store.as_ref(), scope, value, attrs.expires)
+            .await
+            .unwrap();
+        assert!(store.get_value("remember_cookie_set:user").await.is_some());
     }
 }

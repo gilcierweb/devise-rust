@@ -6,6 +6,7 @@
 
 use crate::adapter::DeviseKey;
 use crate::request::AuthRequest;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Type alias for authentication rules closure
@@ -148,6 +149,27 @@ impl Failure {
 pub enum AuthOutcome {
     /// Authentication succeeded with a user record
     Success(Box<dyn AnyDeviseModel>),
+    /// Rememberable hit with `extend_remember_period`: success plus a
+    /// re-issued cookie triple for the bridge to set (the Devise
+    /// `remember_me` re-issue). The proxy converts this into a remember
+    /// `Set` op carrying the hardened attributes, then proceeds as success.
+    SuccessWithCookieRefresh {
+        /// Authenticated record.
+        user: Box<dyn AnyDeviseModel>,
+        /// Cookie name (key-override aware).
+        cookie_key: String,
+        /// Jar string (encoded triple with a fresh timestamp).
+        cookie_value: String,
+        /// Cookie expiry (`remember_for` after the refresh instant).
+        expires: DateTime<Utc>,
+    },
+    /// Stale remember cookie: the bridge must delete `cookie_key`, then the
+    /// chain continues with pass-through semantics (Devise `cookies.delete`
+    /// plus `pass`, never `Failure`).
+    ClearCookieAndPass {
+        /// Cookie name to delete.
+        cookie_key: String,
+    },
     /// Strategy passed (not applicable) - continue to next strategy
     Pass,
 }
@@ -205,6 +227,45 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
     fn reset_failed_attempts_hook(&mut self) -> bool {
         false
     }
+
+    /// Remember value for cookie validation: the `remember_token` column
+    /// when the model carries one, else `authenticatable_salt`.
+    ///
+    /// Default `None` (model does not support rememberable). Typed
+    /// [`Rememberable`](crate::rememberable::Rememberable) impls delegate
+    /// here so the erased strategy chain can validate without naming the
+    /// concrete model (the typed trait is not object-safe).
+    fn rememberable_value_opt(&self) -> Option<String> {
+        None
+    }
+
+    /// `remember_created_at` instant, when the model tracks it.
+    ///
+    /// Default `None`; typed rememberable impls delegate here. The strategy
+    /// reads this through the seam for the strict greater-than check.
+    fn remember_created_at_opt(&self) -> Option<DateTime<Utc>> {
+        None
+    }
+
+    /// Virtual `remember_me` sign-in flag (Devise `attr_accessor`).
+    ///
+    /// Strategies stamp this from the sign-in params; the rememberable-set
+    /// hook reads it. Default `None` (unset).
+    fn remember_me_flag_opt(&self) -> Option<bool> {
+        None
+    }
+
+    /// Assign the virtual `remember_me` flag (memory only, no persistence).
+    ///
+    /// Default no-op; rememberable models store the flag.
+    fn set_remember_me_flag(&mut self, _flag: bool) {}
+
+    /// Extension hook run after a successful remember-hit (Devise
+    /// `after_remembered`).
+    ///
+    /// Default no-op; override for custom logic that runs only after the
+    /// user is remembered.
+    fn after_remembered_hook(&self) {}
 
     /// Session pair for this model: `(key, salt)`.
     ///

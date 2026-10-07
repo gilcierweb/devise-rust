@@ -6,7 +6,7 @@
 //! request shape and `authenticate` for the decision. `AuthProxy`
 //! (`proxy.rs`) runs them in Devise order: rememberable, params, HTTP Basic.
 
-use crate::adapter::{Conditions, Value};
+use crate::adapter::{Conditions, DeviseKey, Value};
 use crate::config::DeviseConfig;
 use crate::failure::{AuthOutcome, Failure};
 use crate::model::ModelFinder;
@@ -14,6 +14,8 @@ use crate::request::AuthRequest;
 use crate::scope::Mapping;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
 
 /// Authentication strategy contract.
 #[async_trait]
@@ -94,10 +96,14 @@ fn extract_param(request: &AuthRequest, scope: &str, key: &str) -> Option<String
 /// Build the strategy chain in Devise execution order.
 ///
 /// Rememberable (no-input) runs first when the mapping enables it, then
-/// params, then HTTP Basic. Each entry is paranoid-wrapped when `paranoid`
-/// is set. `AuthProxy` consumes this so the order is defined once.
+/// params, then HTTP Basic. This order is the resolved RMB-04 verdict: the
+/// stale S-07 after-params sentence in the Phase 3 context is superseded, so
+/// this order stays untouched and pinned by test. Each entry is
+/// paranoid-wrapped when `config.paranoid` is set. The rememberable cookie
+/// key resolves from `config` (key override aware). `AuthProxy` consumes
+/// this so the order is defined once.
 #[must_use]
-pub fn strategies_for(mapping: &Mapping, paranoid: bool) -> Vec<Box<dyn Strategy>> {
+pub fn strategies_for(mapping: &Mapping, config: &DeviseConfig) -> Vec<Box<dyn Strategy>> {
     fn boxed<S: Strategy + 'static>(strategy: S, paranoid: bool) -> Box<dyn Strategy> {
         if paranoid {
             Box::new(ParanoidStrategy::new(strategy))
@@ -108,10 +114,16 @@ pub fn strategies_for(mapping: &Mapping, paranoid: bool) -> Vec<Box<dyn Strategy
 
     let mut chain: Vec<Box<dyn Strategy>> = Vec::with_capacity(3);
     if mapping.has_module(crate::scope::Module::Rememberable) {
-        chain.push(boxed(RememberableStrategy::default(), paranoid));
+        chain.push(boxed(
+            RememberableStrategy {
+                cookie_key: crate::rememberable::remember_cookie_key(&mapping.name, config),
+                ..RememberableStrategy::default()
+            },
+            config.paranoid,
+        ));
     }
-    chain.push(boxed(ParamsStrategy::default(), paranoid));
-    chain.push(boxed(HttpBasicStrategy::default(), paranoid));
+    chain.push(boxed(ParamsStrategy::default(), config.paranoid));
+    chain.push(boxed(HttpBasicStrategy::default(), config.paranoid));
     chain
 }
 
@@ -185,7 +197,7 @@ impl Strategy for ParamsStrategy {
         let Some((conditions, password)) = self.credentials(request, &mapping.name) else {
             return Ok(AuthOutcome::Pass);
         };
-        let Some(user) = finder
+        let Some(mut user) = finder
             .find_first_boxed(&conditions)
             .await
             .map_err(|error| Failure::Config(format!("{error}")))?
@@ -201,6 +213,12 @@ impl Strategy for ParamsStrategy {
             // DBAU-07: Devise fires after_database_authentication after a
             // successful password check in the database_authenticatable strategy.
             user.after_database_authentication();
+            // Devise `Authenticatable#remember_me`: stamp the virtual flag
+            // from the sign-in params so the rememberable-set hook can act.
+            user.set_remember_me_flag(crate::rememberable::remember_flag_set(
+                request,
+                &mapping.name,
+            ));
             Ok(AuthOutcome::Success(user))
         } else {
             Err(Failure::InvalidCredentials { message: "invalid" })
@@ -297,19 +315,27 @@ impl Strategy for HttpBasicStrategy {
     }
 }
 
-/// Rememberable strategy shell - remember-me cookie.
+/// Rememberable strategy - remember-me cookie, no-input, runs first.
 ///
-/// Full cookie validation lands in Phase 5; this shell keeps the Devise
-/// strategy order (rememberable first, `no_input`) compiling.
+/// Mirrors `devise/lib/devise/strategies/rememberable.rb`: `valid` on cookie
+/// presence, `authenticate` deserializing the triple and enforcing the
+/// five-condition check. Every miss shape (undecodable cookie, bad key,
+/// unknown record, valueless record, failed check) deletes the cookie and
+/// passes through, never failing. On a hit the strategy optionally re-issues
+/// the cookie when `extend_remember_period` holds, calls
+/// `after_remembered`, and succeeds.
 pub struct RememberableStrategy {
-    /// Cookie name (default `remember_{scope}_token`).
+    /// Cookie name (default `remember_{scope}_token`, override aware).
     pub cookie_key: String,
+    /// Clock for the remember window and refresh timestamps.
+    pub clock: Arc<dyn crate::time::Clock>,
 }
 
 impl Default for RememberableStrategy {
     fn default() -> Self {
         Self {
             cookie_key: "remember_user_token".to_string(),
+            clock: Arc::new(crate::time::SystemClock),
         }
     }
 }
@@ -322,13 +348,79 @@ impl Strategy for RememberableStrategy {
 
     async fn authenticate(
         &self,
-        _request: &AuthRequest,
-        _mapping: &Mapping,
-        _finder: &dyn ModelFinder,
-        _config: &DeviseConfig,
+        request: &AuthRequest,
+        mapping: &Mapping,
+        finder: &dyn ModelFinder,
+        config: &DeviseConfig,
     ) -> Result<AuthOutcome, Failure> {
-        // Phase 5: validate via serialize_from_cookie (RMB-03).
-        Ok(AuthOutcome::Pass)
+        let stale = || AuthOutcome::ClearCookieAndPass {
+            cookie_key: self.cookie_key.clone(),
+        };
+        let Some(cookie) = request.cookies.get(&self.cookie_key) else {
+            return Ok(AuthOutcome::Pass);
+        };
+        let Some((key, token, generated_at)) = crate::rememberable::decode_cookie_value(cookie)
+        else {
+            return Ok(stale());
+        };
+        let Ok(key) = DeviseKey::from_str(&key) else {
+            return Ok(stale());
+        };
+        let record = finder
+            .get_boxed(&key)
+            .await
+            .map_err(|error| Failure::Config(format!("{error}")))?;
+        let Some(record) = record else {
+            return Ok(stale());
+        };
+        let Some(stored) = record.rememberable_value_opt() else {
+            return Ok(stale());
+        };
+        let generated = crate::rememberable::parse_generated_at(&generated_at);
+        if !crate::rememberable::remember_cookie_valid(
+            &stored,
+            &token,
+            generated,
+            record.remember_created_at_opt(),
+            config,
+            self.clock.as_ref(),
+        ) {
+            return Ok(stale());
+        }
+        // Devise `validate(resource)`: the remembered record must still pass
+        // its authentication rules, else fail with its own message.
+        if !record.valid_for_authentication(None) {
+            return Err(Failure::Unauthenticated {
+                message: record.unauthenticated_message(),
+            });
+        }
+        if config.extend_remember_period {
+            let (fresh_key, fresh_value, fresh_generated) =
+                crate::rememberable::build_cookie_triple(
+                    &key.to_string(),
+                    &stored,
+                    self.clock.as_ref(),
+                );
+            let attrs = crate::rememberable::RememberableCookieAttrs::for_scope(
+                &mapping.name,
+                config,
+                self.clock.as_ref(),
+            );
+            let cookie_value = crate::rememberable::encode_cookie_value(
+                &fresh_key,
+                &fresh_value,
+                &fresh_generated,
+            );
+            record.after_remembered_hook();
+            return Ok(AuthOutcome::SuccessWithCookieRefresh {
+                user: record,
+                cookie_key: self.cookie_key.clone(),
+                cookie_value,
+                expires: attrs.expires,
+            });
+        }
+        record.after_remembered_hook();
+        Ok(AuthOutcome::Success(record))
     }
 
     fn no_input(&self) -> bool {
@@ -421,6 +513,8 @@ mod tests {
         id: i64,
         email: String,
         encrypted_password: String,
+        #[serde(skip)]
+        remember_flag: Option<bool>,
     }
 
     impl AnyDeviseModel for StrategyUser {
@@ -434,6 +528,14 @@ mod tests {
 
         fn as_password_verifiable(&self) -> Option<&dyn PasswordVerifiable> {
             Some(self)
+        }
+
+        fn remember_me_flag_opt(&self) -> Option<bool> {
+            self.remember_flag
+        }
+
+        fn set_remember_me_flag(&mut self, flag: bool) {
+            self.remember_flag = Some(flag);
         }
 
         fn as_any(&self) -> &dyn std::any::Any {
@@ -450,6 +552,14 @@ mod tests {
     fn test_config() -> DeviseConfig {
         DeviseConfig {
             stretches: 4,
+            ..DeviseConfig::default()
+        }
+    }
+
+    fn paranoid_config() -> DeviseConfig {
+        DeviseConfig {
+            stretches: 4,
+            paranoid: true,
             ..DeviseConfig::default()
         }
     }
@@ -484,6 +594,7 @@ mod tests {
                 id: 1,
                 email: "test@example.com".to_string(),
                 encrypted_password: crate::crypto::encryptor::digest("secret123", config),
+                remember_flag: None,
             })
             .await
             .unwrap();
@@ -499,7 +610,8 @@ mod tests {
 
     #[test]
     fn test_strategy_chain_order() {
-        let plain = strategies_for(&test_mapping(), false);
+        let config = test_config();
+        let plain = strategies_for(&test_mapping(), &config);
         let plain_ids: Vec<&str> = plain.iter().map(Strategy::id).collect();
         assert_eq!(plain_ids, vec!["params", "http_basic"]);
 
@@ -508,12 +620,15 @@ mod tests {
             crate::scope::Module::DatabaseAuthenticatable,
             crate::scope::Module::Rememberable,
         ];
-        let ordered = strategies_for(&with_remember, false);
+        // RMB-04 verdict pinned: the no-input strategy runs BEFORE params
+        // and HTTP Basic; the stale S-07 after-params sentence is superseded.
+        let ordered = strategies_for(&with_remember, &config);
         let ordered_ids: Vec<&str> = ordered.iter().map(Strategy::id).collect();
         assert_eq!(ordered_ids, vec!["rememberable", "params", "http_basic"]);
+        assert!(ordered.first().is_some_and(Strategy::no_input));
 
         // Paranoid wrapping preserves order and ids.
-        let paranoid = strategies_for(&with_remember, true);
+        let paranoid = strategies_for(&with_remember, &paranoid_config());
         let paranoid_ids: Vec<&str> = paranoid.iter().map(Strategy::id).collect();
         assert_eq!(paranoid_ids, ordered_ids);
     }
@@ -601,6 +716,14 @@ mod tests {
         let finder = seeded_finder(&config).await;
         let strategy = RememberableStrategy::default();
         assert!(strategy.no_input());
+        // Absent cookie: plain pass-through.
+        let bare = AuthRequest::new(crate::request::HttpMethod::Get, "/");
+        assert!(!strategy.valid(&bare, &test_mapping()).await);
+        let result = strategy
+            .authenticate(&bare, &test_mapping(), &finder, &config)
+            .await;
+        assert!(matches!(result, Ok(AuthOutcome::Pass)));
+        // Undecodable cookie: stale-cookie delete signal plus pass, never failure.
         let mut request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
         request
             .cookies
@@ -609,7 +732,288 @@ mod tests {
         let result = strategy
             .authenticate(&request, &test_mapping(), &finder, &config)
             .await;
-        assert!(matches!(result, Ok(AuthOutcome::Pass)));
+        assert!(matches!(
+            result,
+            Ok(AuthOutcome::ClearCookieAndPass { ref cookie_key })
+            if cookie_key == "remember_user_token"
+        ));
+    }
+
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct RememberStrategyUser {
+        id: i64,
+        email: String,
+        remember_token: Option<String>,
+        remember_created_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(skip)]
+        remember_flag: Option<bool>,
+        #[serde(skip)]
+        inactive: bool,
+        #[serde(skip)]
+        remembered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RememberStrategyUser {
+        fn remembered(id: i64, created_at: chrono::DateTime<chrono::Utc>, token: &str) -> Self {
+            Self {
+                id,
+                email: "remember@example.com".to_string(),
+                remember_token: Some(token.to_string()),
+                remember_created_at: Some(created_at),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl AnyDeviseModel for RememberStrategyUser {
+        fn to_key(&self) -> crate::adapter::DeviseKey {
+            crate::adapter::DeviseKey::from_i64(self.id)
+        }
+
+        fn valid_for_authentication(&self, _rules: Option<&crate::failure::AuthRules>) -> bool {
+            !self.inactive
+        }
+
+        fn rememberable_value_opt(&self) -> Option<String> {
+            Some(self.remember_token.clone().unwrap_or_default())
+        }
+
+        fn remember_created_at_opt(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+            self.remember_created_at
+        }
+
+        fn remember_me_flag_opt(&self) -> Option<bool> {
+            self.remember_flag
+        }
+
+        fn set_remember_me_flag(&mut self, flag: bool) {
+            self.remember_flag = Some(flag);
+        }
+
+        fn after_remembered_hook(&self) {
+            self.remembered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn remember_test_clock() -> crate::time::FixedClock {
+        crate::time::FixedClock::new(
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid epoch"),
+        )
+    }
+
+    async fn seeded_remember_finder()
+    -> AdapterBridge<MemoryAdapter<RememberStrategyUser>, RememberStrategyUser> {
+        let adapter = MemoryAdapter::<RememberStrategyUser>::new();
+        adapter
+            .create(RememberStrategyUser::remembered(
+                1,
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid epoch"),
+                "cookie-token",
+            ))
+            .await
+            .unwrap();
+        AdapterBridge::new(adapter)
+    }
+
+    fn remember_strategy_at(instant: chrono::DateTime<chrono::Utc>) -> RememberableStrategy {
+        RememberableStrategy {
+            cookie_key: "remember_user_token".to_string(),
+            clock: Arc::new(crate::time::FixedClock::new(instant)),
+        }
+    }
+
+    fn remember_cookie_for(token: &str, generated_epoch: i64) -> HashMap<String, String> {
+        HashMap::from([(
+            "remember_user_token".to_string(),
+            crate::rememberable::encode_cookie_value("1", token, &generated_epoch.to_string()),
+        )])
+    }
+
+    #[tokio::test]
+    async fn test_strategy_rememberable_round_trip_success() {
+        let config = test_config();
+        let finder = seeded_remember_finder().await;
+        let clock = remember_test_clock();
+        let strategy = remember_strategy_at(crate::time::Clock::now(&clock));
+        let mapping = test_mapping();
+
+        let mut request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
+        // Cookie minted a minute after creation: inside the window and
+        // strictly greater than `remember_created_at`.
+        request.cookies = remember_cookie_for("cookie-token", 1_700_000_060);
+        assert!(strategy.valid(&request, &mapping).await);
+        match strategy
+            .authenticate(&request, &mapping, &finder, &config)
+            .await
+        {
+            Ok(AuthOutcome::Success(user)) => {
+                assert_eq!(user.to_key(), crate::adapter::DeviseKey::from_i64(1));
+                assert!(
+                    user.as_any()
+                        .downcast_ref::<RememberStrategyUser>()
+                        .is_some_and(|record| record
+                            .remembered
+                            .load(std::sync::atomic::Ordering::SeqCst)),
+                    "after_remembered runs on hit"
+                );
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_strategy_rememberable_miss_shapes_delete_and_pass() {
+        let config = test_config();
+        let finder = seeded_remember_finder().await;
+        let clock = remember_test_clock();
+        let strategy = remember_strategy_at(crate::time::Clock::now(&clock));
+        let mapping = test_mapping();
+
+        let miss_cookies = vec![
+            // Undecodable jar string.
+            "garbage".to_string(),
+            // Short array: the Devise "no timestamp" miss.
+            "[\"1\",\"cookie-token\"]".to_string(),
+            // Unparseable key.
+            crate::rememberable::encode_cookie_value("nope", "cookie-token", "1700000060"),
+            // Unknown record.
+            crate::rememberable::encode_cookie_value("999", "cookie-token", "1700000060"),
+            // Unparseable timestamp.
+            crate::rememberable::encode_cookie_value("1", "cookie-token", "not-a-time"),
+            // Expired generation.
+            crate::rememberable::encode_cookie_value("1", "cookie-token", "1000"),
+            // Generation at creation (strict greater-than fails).
+            crate::rememberable::encode_cookie_value("1", "cookie-token", "1700000000"),
+            // Wrong token (constant-time mismatch).
+            crate::rememberable::encode_cookie_value("1", "wrong", "1700000060"),
+        ];
+        for jar in miss_cookies {
+            let mut request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
+            request
+                .cookies
+                .insert("remember_user_token".to_string(), jar);
+            let result = strategy
+                .authenticate(&request, &mapping, &finder, &config)
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Ok(AuthOutcome::ClearCookieAndPass { ref cookie_key })
+                    if cookie_key == "remember_user_token"
+                ),
+                "stale cookie deletes and passes, never fails"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_strategy_rememberable_rejects_inactive_record() {
+        let config = test_config();
+        let adapter = MemoryAdapter::<RememberStrategyUser>::new();
+        let mut locked_out = RememberStrategyUser::remembered(
+            1,
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid epoch"),
+            "cookie-token",
+        );
+        locked_out.inactive = true;
+        adapter.create(locked_out).await.unwrap();
+        let finder = AdapterBridge::new(adapter);
+        let clock = remember_test_clock();
+        let strategy = remember_strategy_at(crate::time::Clock::now(&clock));
+
+        let mut request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
+        request.cookies = remember_cookie_for("cookie-token", 1_700_000_060);
+        let result = strategy
+            .authenticate(&request, &test_mapping(), &finder, &config)
+            .await;
+        assert!(matches!(
+            result,
+            Err(crate::failure::Failure::Unauthenticated { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_strategy_rememberable_extend_reissues_when_enabled() {
+        let mut config = test_config();
+        config.extend_remember_period = true;
+        let finder = seeded_remember_finder().await;
+        let mapping = test_mapping();
+
+        let mut request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
+        request.cookies = remember_cookie_for("cookie-token", 1_700_000_060);
+        let refresh_at = chrono::DateTime::from_timestamp(1_700_010_000, 0).expect("valid epoch");
+        let strategy = remember_strategy_at(refresh_at);
+        match strategy
+            .authenticate(&request, &mapping, &finder, &config)
+            .await
+        {
+            Ok(AuthOutcome::SuccessWithCookieRefresh {
+                user,
+                cookie_key,
+                cookie_value,
+                expires,
+            }) => {
+                assert_eq!(user.to_key(), crate::adapter::DeviseKey::from_i64(1));
+                assert_eq!(cookie_key, "remember_user_token");
+                let decoded = crate::rememberable::decode_cookie_value(&cookie_value)
+                    .expect("refresh carries a triple");
+                assert_eq!(decoded.0, "1");
+                assert_eq!(decoded.1, "cookie-token");
+                let refreshed: i64 = decoded.2.parse().expect("epoch timestamp");
+                assert_eq!(refreshed, refresh_at.timestamp());
+                assert_eq!(expires, refresh_at + config.remember_for);
+            }
+            other => panic!("expected refresh, got {other:?}"),
+        }
+
+        // Fixed expiry (D-14): reuse never re-issues.
+        let fixed_config = test_config();
+        let fixed = remember_strategy_at(refresh_at);
+        let mut fixed_request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
+        fixed_request.cookies = remember_cookie_for("cookie-token", 1_700_000_060);
+        let result = fixed
+            .authenticate(&fixed_request, &mapping, &finder, &fixed_config)
+            .await;
+        assert!(matches!(result, Ok(AuthOutcome::Success(_))));
+    }
+
+    #[tokio::test]
+    async fn test_params_strategy_stamps_remember_flag() {
+        let config = test_config();
+        let finder = seeded_finder(&config).await;
+        let strategy = ParamsStrategy::default();
+        let mapping = test_mapping();
+
+        let flagged = params_request(&[
+            ("email", "test@example.com"),
+            ("password", "secret123"),
+            ("remember_me", "1"),
+        ]);
+        match strategy
+            .authenticate(&flagged, &mapping, &finder, &config)
+            .await
+        {
+            Ok(AuthOutcome::Success(user)) => {
+                assert_eq!(user.remember_me_flag_opt(), Some(true));
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+
+        let plain = params_request(&[("email", "test@example.com"), ("password", "secret123")]);
+        match strategy
+            .authenticate(&plain, &mapping, &finder, &config)
+            .await
+        {
+            Ok(AuthOutcome::Success(user)) => {
+                assert_eq!(user.remember_me_flag_opt(), Some(false));
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
     }
 
     #[test]

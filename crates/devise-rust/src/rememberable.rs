@@ -477,12 +477,6 @@ pub trait Rememberable: Authenticatable {
     /// Whether the record is persisted (Devise `persisted?`). Unpersisted
     /// records never write remember state.
     fn persisted(&self) -> bool;
-    /// Virtual `remember_me` flag from the sign-in form (`None` when unset).
-    fn remember_me_flag(&self) -> Option<bool> {
-        None
-    }
-    /// Assign the virtual `remember_me` flag (no persistence).
-    fn set_remember_me_flag(&mut self, _flag: bool) {}
 
     /// `rememberable_value`: the token column when the model carries one
     /// (even when empty, mirroring Devise returning the column as-is), else
@@ -646,7 +640,7 @@ pub trait Rememberable: Authenticatable {
         if fields.is_empty() {
             return Ok(());
         }
-        let flag = self.remember_me_flag();
+        let flag = self.remember_me_flag_opt();
         let updated = adapter
             .update_columns(&self.to_key(), &fields)
             .await
@@ -684,7 +678,7 @@ pub trait Rememberable: Authenticatable {
         if fields.is_empty() {
             return Ok(());
         }
-        let flag = self.remember_me_flag();
+        let flag = self.remember_me_flag_opt();
         let updated = adapter
             .update_columns(&self.to_key(), &fields)
             .await
@@ -784,6 +778,25 @@ mod tests {
             self.encrypted_password.get(..29).map(str::to_string)
         }
 
+        fn rememberable_value_opt(&self) -> Option<String> {
+            if self.has_remember_token_column() {
+                return Some(self.remember_token.clone().unwrap_or_default());
+            }
+            self.authenticatable_salt().filter(|salt| !salt.is_empty())
+        }
+
+        fn remember_created_at_opt(&self) -> Option<DateTime<Utc>> {
+            self.remember_created_at
+        }
+
+        fn remember_me_flag_opt(&self) -> Option<bool> {
+            self.remember_flag
+        }
+
+        fn set_remember_me_flag(&mut self, flag: bool) {
+            self.remember_flag = Some(flag);
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
@@ -820,14 +833,6 @@ mod tests {
 
         fn persisted(&self) -> bool {
             self.id != 0
-        }
-
-        fn remember_me_flag(&self) -> Option<bool> {
-            self.remember_flag
-        }
-
-        fn set_remember_me_flag(&mut self, flag: bool) {
-            self.remember_flag = Some(flag);
         }
     }
 
@@ -952,6 +957,22 @@ mod tests {
             self.encrypted_password.get(..29).map(str::to_string)
         }
 
+        fn rememberable_value_opt(&self) -> Option<String> {
+            self.authenticatable_salt().filter(|salt| !salt.is_empty())
+        }
+
+        fn remember_created_at_opt(&self) -> Option<DateTime<Utc>> {
+            self.remember_created_at
+        }
+
+        fn remember_me_flag_opt(&self) -> Option<bool> {
+            self.remember_flag
+        }
+
+        fn set_remember_me_flag(&mut self, flag: bool) {
+            self.remember_flag = Some(flag);
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
@@ -982,14 +1003,6 @@ mod tests {
 
         fn persisted(&self) -> bool {
             self.id != 0
-        }
-
-        fn remember_me_flag(&self) -> Option<bool> {
-            self.remember_flag
-        }
-
-        fn set_remember_me_flag(&mut self, flag: bool) {
-            self.remember_flag = Some(flag);
         }
     }
 
@@ -1380,5 +1393,176 @@ mod tests {
         assert!(user.remember_created_at().is_none());
         let stored = adapter.get(&user.to_key()).await.unwrap().unwrap();
         assert!(stored.remember_created_at.is_none());
+    }
+
+    /// Minimal session store for hook dispatch tests.
+    #[derive(Debug, Default)]
+    struct HookTestStore {
+        data: std::sync::Arc<std::sync::RwLock<HashMap<String, serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl crate::session::SessionStore for HookTestStore {
+        async fn get_value(&self, key: &str) -> Option<serde_json::Value> {
+            self.data.read().unwrap().get(key).cloned()
+        }
+
+        async fn insert_value(&self, key: &str, value: serde_json::Value) {
+            self.data.write().unwrap().insert(key.to_string(), value);
+        }
+
+        async fn remove(&self, key: &str) {
+            self.data.write().unwrap().remove(key);
+        }
+
+        async fn remove_prefix(&self, prefix: &str) {
+            let mut data = self.data.write().unwrap();
+            let doomed: Vec<String> = data
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect();
+            for key in doomed {
+                data.remove(&key);
+            }
+        }
+
+        async fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+            self.data
+                .read()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect()
+        }
+
+        async fn renew(&self) -> Result<(), crate::error::DeviseError> {
+            Ok(())
+        }
+
+        async fn reset(&self) -> Result<(), crate::error::DeviseError> {
+            self.data.write().unwrap().clear();
+            Ok(())
+        }
+    }
+
+    fn hook_test_proxy(
+        config: DeviseConfig,
+    ) -> (crate::proxy::AuthProxy, std::sync::Arc<HookTestStore>) {
+        let store = std::sync::Arc::new(HookTestStore::default());
+        let mut registry = crate::scope::ScopeRegistry::new();
+        registry.register(crate::scope::Mapping {
+            name: "user".to_string(),
+            class_name: "User".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: crate::scope::PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![
+                crate::scope::Module::DatabaseAuthenticatable,
+                crate::scope::Module::Rememberable,
+            ],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: crate::scope::SignOutVia::Delete,
+            failure_app: None,
+        });
+        let mut hooks = crate::hooks::HookRegistry::new();
+        crate::hooks::register_devise_hooks(
+            &mut hooks,
+            registry.get("user").expect("mapping is registered"),
+        );
+        let proxy = crate::proxy::AuthProxy::new(
+            store.clone(),
+            std::sync::Arc::new(registry),
+            std::sync::Arc::new(hooks),
+            std::sync::Arc::new(config),
+        );
+        (proxy, store)
+    }
+
+    #[tokio::test]
+    async fn rememberable_set_hook_emits_hardened_cookie() {
+        let (mut proxy, _) = hook_test_proxy(test_config());
+        let mut user = TestUser::fresh(1, "hook@example.com");
+        user.set_remember_token(Some("hook-token".to_string()));
+        user.set_remember_created_at(Some(fixed_clock().now()));
+        user.set_remember_me_flag(true);
+        assert!(proxy.sign_in("user", Box::new(user), false).await);
+
+        let ops = proxy.take_remember_cookie_ops();
+        assert_eq!(ops.len(), 1);
+        let RememberCookieOp::Set {
+            scope,
+            key,
+            value,
+            attrs,
+        } = &ops[0]
+        else {
+            panic!("set hook queues a Set op, got {:?}", ops[0]);
+        };
+        assert_eq!(scope, "user");
+        assert_eq!(key, "remember_user_token");
+        let triple = decode_cookie_value(value).expect("jar carries the triple");
+        assert_eq!(triple.0, "1");
+        assert_eq!(triple.1, "hook-token");
+        assert!(attrs.httponly && attrs.secure);
+        assert_eq!(attrs.same_site, SameSite::Lax);
+        let header = attrs.to_set_cookie_header(value);
+        assert!(header.contains("; HttpOnly"));
+        assert!(header.contains("; Secure"));
+        assert!(header.contains("; SameSite=Lax"));
+    }
+
+    #[tokio::test]
+    async fn rememberable_set_hook_skips_without_flag_or_value() {
+        let (mut proxy, _) = hook_test_proxy(test_config());
+
+        // Flag unset: session-only sign-in leaves no cookie intent.
+        let mut plain = TestUser::fresh(1, "plain@example.com");
+        plain.set_remember_token(Some("hook-token".to_string()));
+        plain.set_remember_created_at(Some(fixed_clock().now()));
+        assert!(proxy.sign_in("user", Box::new(plain), false).await);
+        assert!(proxy.take_remember_cookie_ops().is_empty());
+        assert!(proxy.sign_out("user").await);
+        // The sign-out above queues its own delete; drain before continuing.
+        let leftovers = proxy.take_remember_cookie_ops();
+        assert_eq!(leftovers.len(), 1);
+
+        // Flag set but no value minted yet: fail closed, no junk cookie.
+        let mut empty = TestUser::fresh(1, "empty@example.com");
+        empty.set_remember_me_flag(true);
+        assert!(proxy.sign_in("user", Box::new(empty), false).await);
+        assert!(proxy.take_remember_cookie_ops().is_empty());
+        assert!(proxy.sign_out("user").await);
+        let ops = proxy.take_remember_cookie_ops();
+        assert_eq!(ops.len(), 1);
+        assert!(
+            ops.iter()
+                .all(|op| matches!(op, RememberCookieOp::Clear { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn rememberable_logout_hook_clears_cookie() {
+        let (mut proxy, _) = hook_test_proxy(test_config());
+        let user = TestUser::fresh(1, "bye@example.com");
+        assert!(proxy.sign_in("user", Box::new(user), false).await);
+        assert!(proxy.take_remember_cookie_ops().is_empty());
+
+        assert!(proxy.sign_out("user").await);
+        let ops = proxy.take_remember_cookie_ops();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0],
+            RememberCookieOp::Clear { scope, key }
+            if scope == "user" && key == "remember_user_token"
+        ));
     }
 }
