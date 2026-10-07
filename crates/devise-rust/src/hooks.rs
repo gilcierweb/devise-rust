@@ -318,10 +318,36 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
     // 6. Lockable Reset - runs on Authentication for scopes with Lockable module
     if mapping.modules.contains(&Module::Lockable) {
         registry.add_hook(
-            HookFilter::new().only(vec![Event::Authentication]),
-            Box::new(|_ctx| {
+            HookFilter::new()
+                .only(vec![Event::Authentication])
+                .except(vec![Event::Fetch]),
+            Box::new(|ctx| {
                 Box::pin(async move {
-                    // TODO Phase 5: record.reset_failed_attempts!()
+                    // LCK-06 / D-11: the warden `after_set_user except: :fetch`
+                    // equivalent. `Event::Fetch` exists, so the `except`
+                    // exclusion is explicit here: `only(Authentication)`
+                    // already rejects fetch events at the filter, and
+                    // `AuthProxy::set_user` never dispatches hooks on the
+                    // fetch path at all (it returns before hook dispatch for
+                    // `SetUserEvent::Fetch`). The `ctx.event == Fetch` return
+                    // below records that second guarantee at the body level.
+                    //
+                    // The hook zeroes the memoized record's counter through
+                    // the object-safe `AnyDeviseModel::reset_failed_attempts_hook`
+                    // seam (the typed `Lockable` trait is not object-safe, so
+                    // the body cannot name it). Durable callers persist
+                    // through the typed `Lockable::reset_failed_attempts`
+                    // with their adapter; the hook keeps the in-request copy
+                    // consistent.
+                    if ctx.event == Event::Fetch {
+                        return Ok(());
+                    }
+                    let scope = ctx.scope.to_string();
+                    if let Some(slot) = ctx.proxy.user_mut(&scope) {
+                        if let Some(record) = slot.as_mut() {
+                            record.reset_failed_attempts_hook();
+                        }
+                    }
                     Ok(())
                 })
             }),

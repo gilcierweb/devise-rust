@@ -109,6 +109,25 @@ pub fn unlock_strategy_enabled_for(strategy: &str, config: &DeviseConfig) -> boo
         || (config.unlock_strategy == "both" && BOTH_STRATEGIES.contains(&strategy))
 }
 
+/// Outcome of one evaluated authentication attempt through
+/// [`Lockable::apply_failed_attempt`].
+///
+/// The three variants are the patch-plus-outcome contract of Devise's
+/// `valid_for_authentication?`: success, counted failure, or lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockAttemptOutcome {
+    /// The base check passed and the record is unlocked: proceed to sign in.
+    /// No lock state was written (an expired lock released first still
+    /// counts as a write, but the outcome is success).
+    Authenticated,
+    /// A failure was recorded: the counter incremented while counting is
+    /// enabled, and the record is still unlocked.
+    FailedIncremented,
+    /// The record is locked (already locked, or just locked at the
+    /// threshold): reject the attempt as locked.
+    Locked,
+}
+
 /// `Lockable` module - attempt counting and lock state over the three Devise
 /// columns (`failed_attempts`, `locked_at`, `unlock_token`).
 ///
@@ -639,6 +658,76 @@ pub trait Lockable: Authenticatable + HasEmail {
         }
         Authenticatable::unauthenticated_message(self)
     }
+
+    /// `valid_for_authentication?` side-effect chain (LCK-01): evaluate one
+    /// password attempt (`base_valid` is the password result) with Devise's
+    /// exact side effects, persisting every mutation through
+    /// `update_columns`.
+    ///
+    /// Order (mirrors `lockable.rb`):
+    /// 1. Unpersisted records or the `none` lock strategy: no side effects,
+    ///    pass the base result through.
+    /// 2. Release an expired time-lock first, no matter the password result.
+    /// 3. Base valid plus unlocked: success, nothing further to write (the
+    ///    sign-in reset hook owns counter clearing on this path).
+    /// 4. Otherwise increment the counter (even on already-locked records),
+    ///    locking with instructions when the threshold is reached.
+    ///
+    /// Diesel backends must keep the increment a single-statement
+    /// `UPDATE ... SET failed_attempts = failed_attempts + 1` (see
+    /// [`increment_failed_attempts`](Self::increment_failed_attempts)); the
+    /// trailing Devise `save(validate: false)` is intentionally not ported
+    /// because every mutation above already persisted.
+    ///
+    /// == Examples
+    ///
+    /// ```ignore
+    /// match user.apply_failed_attempt(false, &adapter, &mailer, &config, &clock).await? {
+    ///     LockAttemptOutcome::Locked => { /* reject as locked */ }
+    ///     LockAttemptOutcome::FailedIncremented => { /* reject as invalid */ }
+    ///     LockAttemptOutcome::Authenticated => { /* sign in */ }
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// `DeviseError::Adapter` on persistence failure, `DeviseError::Mailer`
+    /// when auto-lock instructions cannot render.
+    async fn apply_failed_attempt<A, L>(
+        &mut self,
+        base_valid: bool,
+        adapter: &A,
+        mailer: &L,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> Result<LockAttemptOutcome, DeviseError>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+        L: Mailer<Self>,
+    {
+        if !self.lock_counting_enabled(config) {
+            return Ok(if base_valid {
+                LockAttemptOutcome::Authenticated
+            } else {
+                LockAttemptOutcome::FailedIncremented
+            });
+        }
+        if self.lock_expired(config, clock) {
+            self.unlock_access(adapter).await?;
+        }
+        if base_valid && !self.access_locked(config, clock) {
+            return Ok(LockAttemptOutcome::Authenticated);
+        }
+        self.increment_failed_attempts(adapter).await?;
+        if self.attempts_exceeded(config) {
+            if !self.access_locked(config, clock) {
+                self.lock_access(adapter, mailer, config, clock).await?;
+            }
+            return Ok(LockAttemptOutcome::Locked);
+        }
+        Ok(LockAttemptOutcome::FailedIncremented)
+    }
 }
 
 #[cfg(test)]
@@ -676,6 +765,14 @@ mod tests {
     impl AnyDeviseModel for TestUser {
         fn to_key(&self) -> crate::adapter::DeviseKey {
             crate::adapter::DeviseKey::from_i64(self.id)
+        }
+
+        fn reset_failed_attempts_hook(&mut self) -> bool {
+            if self.failed_attempts == 0 {
+                return false;
+            }
+            self.failed_attempts = 0;
+            true
         }
 
         fn as_any(&self) -> &dyn std::any::Any {
@@ -1206,5 +1303,323 @@ mod tests {
             Some(&vec![":not_locked".to_string()])
         );
         assert!(mailer.sent_mails().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lockable_chain_locks_at_threshold_and_counts_when_locked() {
+        let config = DeviseConfig {
+            maximum_attempts: 2,
+            ..test_config()
+        };
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = TestMailer::default();
+        let mut user = TestUser::fresh(1, "chain@example.com");
+        adapter.create(user.clone()).await.unwrap();
+
+        let first = user
+            .apply_failed_attempt(false, &adapter, &mailer, &config, &clock)
+            .await
+            .unwrap();
+        assert_eq!(first, LockAttemptOutcome::FailedIncremented);
+        assert_eq!(user.failed_attempts(), 1);
+        assert!(!user.access_locked(&config, &clock));
+
+        let second = user
+            .apply_failed_attempt(false, &adapter, &mailer, &config, &clock)
+            .await
+            .unwrap();
+        assert_eq!(second, LockAttemptOutcome::Locked);
+        assert_eq!(user.failed_attempts(), 2);
+        assert!(user.access_locked(&config, &clock));
+        assert_eq!(mailer.sent_mails().len(), 1);
+
+        let third = user
+            .apply_failed_attempt(true, &adapter, &mailer, &config, &clock)
+            .await
+            .unwrap();
+        assert_eq!(third, LockAttemptOutcome::Locked);
+        assert_eq!(user.failed_attempts(), 3);
+
+        let stored = adapter.get(&user.to_key()).await.unwrap().unwrap();
+        assert_eq!(stored.failed_attempts, 3);
+        assert!(stored.locked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn lockable_chain_skips_unpersisted_and_none_strategy() {
+        let clock = FixedClock::now();
+        let inner = MemoryAdapter::<TestUser>::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = CountingAdapter {
+            inner: &inner,
+            calls: Arc::clone(&calls),
+        };
+        let mailer = TestMailer::default();
+
+        let mut ghost = TestUser::fresh(0, "ghost@example.com");
+        let ghost_outcome = ghost
+            .apply_failed_attempt(false, &adapter, &mailer, &test_config(), &clock)
+            .await
+            .unwrap();
+        assert_eq!(ghost_outcome, LockAttemptOutcome::FailedIncremented);
+        assert_eq!(ghost.failed_attempts(), 0);
+
+        let none_config = DeviseConfig {
+            lock_strategy: "none".to_string(),
+            maximum_attempts: 2,
+            ..test_config()
+        };
+        let mut plain = TestUser::fresh(1, "plain@example.com");
+        adapter.create(plain.clone()).await.unwrap();
+        let calls_after_seed = calls.load(Ordering::SeqCst);
+        let none_outcome = plain
+            .apply_failed_attempt(false, &adapter, &mailer, &none_config, &clock)
+            .await
+            .unwrap();
+        assert_eq!(none_outcome, LockAttemptOutcome::FailedIncremented);
+        assert_eq!(plain.failed_attempts(), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), calls_after_seed);
+    }
+
+    #[tokio::test]
+    async fn lockable_chain_releases_expired_lock() {
+        let config = DeviseConfig {
+            unlock_in: chrono::TimeDelta::minutes(1),
+            ..test_config()
+        };
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = TestMailer::default();
+
+        let mut stale_failure = TestUser::fresh(1, "stale-fail@example.com");
+        adapter.create(stale_failure.clone()).await.unwrap();
+        let fields = HashMap::from([
+            ("failed_attempts".to_string(), Value::Integer(2)),
+            (
+                "locked_at".to_string(),
+                Value::String((clock.now() - chrono::TimeDelta::minutes(2)).to_rfc3339()),
+            ),
+        ]);
+        adapter
+            .update_columns(&stale_failure.to_key(), &fields)
+            .await
+            .unwrap();
+        stale_failure = adapter
+            .get(&stale_failure.to_key())
+            .await
+            .unwrap()
+            .expect("seeded lockable record reloads");
+        let failed = stale_failure
+            .apply_failed_attempt(false, &adapter, &mailer, &config, &clock)
+            .await
+            .unwrap();
+        assert_eq!(failed, LockAttemptOutcome::FailedIncremented);
+        assert_eq!(stale_failure.failed_attempts(), 1);
+        assert!(!stale_failure.access_locked(&config, &clock));
+
+        let mut stale_success = TestUser::fresh(2, "stale-ok@example.com");
+        adapter.create(stale_success.clone()).await.unwrap();
+        let stale_fields = HashMap::from([
+            ("failed_attempts".to_string(), Value::Integer(2)),
+            (
+                "locked_at".to_string(),
+                Value::String((clock.now() - chrono::TimeDelta::minutes(2)).to_rfc3339()),
+            ),
+        ]);
+        adapter
+            .update_columns(&stale_success.to_key(), &stale_fields)
+            .await
+            .unwrap();
+        stale_success = adapter
+            .get(&stale_success.to_key())
+            .await
+            .unwrap()
+            .expect("seeded lockable record reloads");
+        let succeeded = stale_success
+            .apply_failed_attempt(true, &adapter, &mailer, &config, &clock)
+            .await
+            .unwrap();
+        assert_eq!(succeeded, LockAttemptOutcome::Authenticated);
+        assert_eq!(stale_success.failed_attempts(), 0);
+        assert!(stale_success.locked_at().is_none());
+    }
+
+    #[tokio::test]
+    async fn lockable_chain_reads_counter_from_store() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = TestMailer::default();
+        let mut user = TestUser::fresh(1, "race@example.com");
+        adapter.create(user.clone()).await.unwrap();
+
+        user.increment_failed_attempts(&adapter).await.unwrap();
+        assert_eq!(user.failed_attempts(), 1);
+
+        adapter
+            .update_columns(
+                &user.to_key(),
+                &HashMap::from([("failed_attempts".to_string(), Value::Integer(5))]),
+            )
+            .await
+            .unwrap();
+        user.increment_failed_attempts(&adapter).await.unwrap();
+        assert_eq!(user.failed_attempts(), 6);
+
+        let outcome = user
+            .apply_failed_attempt(false, &adapter, &mailer, &config, &clock)
+            .await
+            .unwrap();
+        assert_eq!(outcome, LockAttemptOutcome::FailedIncremented);
+        assert_eq!(user.failed_attempts(), 7);
+    }
+
+    #[tokio::test]
+    async fn lockable_reset_failed_attempts_writes_zero() {
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mut user = TestUser::fresh(1, "reset@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        user.increment_failed_attempts(&adapter).await.unwrap();
+        assert_eq!(user.failed_attempts(), 1);
+
+        assert!(user.reset_failed_attempts(&adapter).await.unwrap());
+        assert_eq!(user.failed_attempts(), 0);
+        let stored = adapter.get(&user.to_key()).await.unwrap().unwrap();
+        assert_eq!(stored.failed_attempts, 0);
+
+        assert!(!user.reset_failed_attempts(&adapter).await.unwrap());
+    }
+
+    #[derive(Debug, Default)]
+    struct NoopStore;
+    #[async_trait::async_trait]
+    impl crate::session::SessionStore for NoopStore {
+        async fn get_value(&self, _key: &str) -> Option<serde_json::Value> {
+            None
+        }
+
+        async fn insert_value(&self, _key: &str, _value: serde_json::Value) {}
+
+        async fn remove(&self, _key: &str) {}
+
+        async fn remove_prefix(&self, _prefix: &str) {}
+
+        async fn keys_with_prefix(&self, _prefix: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn renew(&self) -> Result<(), crate::error::DeviseError> {
+            Ok(())
+        }
+
+        async fn reset(&self) -> Result<(), crate::error::DeviseError> {
+            Ok(())
+        }
+    }
+
+    struct LockHookProxy {
+        store: NoopStore,
+        users: HashMap<String, Option<Box<dyn AnyDeviseModel>>>,
+    }
+
+    impl crate::hooks::HookProxy for LockHookProxy {
+        fn session_store(&self) -> &dyn crate::session::SessionStore {
+            &self.store
+        }
+
+        fn scope_registry(&self) -> &crate::scope::ScopeRegistry {
+            unimplemented!("lockable hook tests never touch the scope registry")
+        }
+
+        fn user_mut(&mut self, scope: &str) -> Option<&mut Option<Box<dyn AnyDeviseModel>>> {
+            self.users.get_mut(scope)
+        }
+
+        fn lock(&mut self) {}
+    }
+
+    fn lockable_test_mapping() -> crate::scope::Mapping {
+        crate::scope::Mapping {
+            name: "user".to_string(),
+            class_name: "User".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: crate::scope::PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![
+                crate::scope::Module::DatabaseAuthenticatable,
+                crate::scope::Module::Lockable,
+            ],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: crate::scope::SignOutVia::Delete,
+            failure_app: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn lockable_reset_hook_fires_on_authentication_skips_fetch() {
+        use crate::hooks::{Event, HookContext, HookRegistry, register_devise_hooks};
+
+        let mut registry = HookRegistry::new();
+        register_devise_hooks(&mut registry, &lockable_test_mapping());
+        assert_eq!(registry.len(), 3);
+
+        let mut proxy = LockHookProxy {
+            store: NoopStore,
+            users: HashMap::new(),
+        };
+        let mut signed_in = TestUser::fresh(1, "hook@example.com");
+        signed_in.set_failed_attempts(5);
+        proxy
+            .users
+            .insert("user".to_string(), Some(Box::new(signed_in)));
+
+        {
+            let mut auth_ctx = HookContext {
+                proxy: &mut proxy,
+                scope: "user",
+                event: Event::Authentication,
+                request: None,
+                record: None,
+            };
+            registry.run_hooks(&mut auth_ctx).await.unwrap();
+        }
+        let cleared = proxy.users["user"]
+            .as_ref()
+            .expect("user stays signed in")
+            .as_any()
+            .downcast_ref::<TestUser>()
+            .expect("memoized record is the lockable test user");
+        assert_eq!(cleared.failed_attempts(), 0);
+
+        let mut relocked = TestUser::fresh(1, "hook@example.com");
+        relocked.set_failed_attempts(5);
+        proxy
+            .users
+            .insert("user".to_string(), Some(Box::new(relocked)));
+        {
+            let mut fetch_ctx = HookContext {
+                proxy: &mut proxy,
+                scope: "user",
+                event: Event::Fetch,
+                request: None,
+                record: None,
+            };
+            registry.run_hooks(&mut fetch_ctx).await.unwrap();
+        }
+        let kept = proxy.users["user"]
+            .as_ref()
+            .expect("user stays memoized")
+            .as_any()
+            .downcast_ref::<TestUser>()
+            .expect("memoized record is the lockable test user");
+        assert_eq!(kept.failed_attempts(), 5);
     }
 }

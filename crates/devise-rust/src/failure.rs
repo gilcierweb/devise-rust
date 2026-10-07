@@ -195,6 +195,17 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
     /// where Devise's `database_authenticatable` strategy invokes it).
     fn after_database_authentication(&self) {}
 
+    /// Devise `reset_failed_attempts!` in-memory hook entrypoint (LCK-06).
+    ///
+    /// Default no-op returning `false`; lockable models override it to zero
+    /// the in-memory `failed_attempts` counter so the memoized record
+    /// reflects the sign-in reset. The typed `Lockable` trait owns adapter
+    /// persistence; this seam exists because that trait is not object-safe
+    /// and hook bodies only see `dyn AnyDeviseModel`.
+    fn reset_failed_attempts_hook(&mut self) -> bool {
+        false
+    }
+
     /// Session pair for this model: `(key, salt)`.
     ///
     /// Mirrors Devise's `serialize_into_session(record)` so `AuthProxy` can
