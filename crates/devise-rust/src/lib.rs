@@ -22,6 +22,7 @@
 //! - `lockable` - `Lockable` attempt counting (chain position 7, after `Confirmable`): counter-to-lock, time/email/both strategies, digest-only unlock tokens, paranoid suppression
 //! - `mailer` - `Mailer` trait (5 actions), `MailerContext`, `TestMailer`, Tera templates
 //! - `proxy` - `AuthProxy` session and strategy execution
+//! - `rememberable` - `Rememberable` persistent sessions (chain position 1, after `DatabaseAuthenticatable`): cookie codec, 5-condition check, hardened attributes
 //! - `request` - `AuthRequest`, `RequestFlags`, `HttpMethod`
 //! - `routes` - scope route tables and guard descriptors for bridges
 //! - `scope` - `Module`, `Mapping`, `ScopeRegistry`, `RouteSpec`
@@ -48,6 +49,7 @@ pub mod mailer;
 pub mod model;
 pub mod parameter;
 pub mod proxy;
+pub mod rememberable;
 pub mod request;
 pub mod routes;
 pub mod scope;
