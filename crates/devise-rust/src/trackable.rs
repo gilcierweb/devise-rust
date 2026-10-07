@@ -420,4 +420,165 @@ mod tests {
         );
         assert_eq!(ghost.sign_in_count(), 0);
     }
+
+    #[test]
+    fn trackable_matrix_required_fields() {
+        assert_eq!(
+            required_fields(),
+            vec![
+                "current_sign_in_at",
+                "current_sign_in_ip",
+                "last_sign_in_at",
+                "last_sign_in_ip",
+                "sign_in_count"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn trackable_matrix_shift_sets_without_saving() {
+        let clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mut user = TestUser::fresh(1);
+        adapter.create(user.clone()).await.unwrap();
+
+        user.update_tracked_fields(clock.now(), "127.0.0.1");
+        assert_eq!(user.current_sign_in_ip(), Some("127.0.0.1"));
+        assert_eq!(user.sign_in_count(), 1);
+
+        // The pure shift never wrote: the store still holds the pristine row.
+        let reloaded = adapter
+            .get(&crate::adapter::DeviseKey::from_i64(1))
+            .await
+            .unwrap()
+            .expect("record is stored");
+        assert_eq!(reloaded.current_sign_in_ip(), None);
+        assert_eq!(reloaded.last_sign_in_ip(), None);
+        assert_eq!(reloaded.current_sign_in_at(), None);
+        assert_eq!(reloaded.last_sign_in_at(), None);
+        assert_eq!(reloaded.sign_in_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn trackable_matrix_bang_skips_unpersisted_and_validates_nothing() {
+        let clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+
+        // Unpersisted record (issue #4673 shape): no write, falsy return.
+        let mut fresh = TestUser::fresh(0);
+        assert!(!fresh.persisted());
+        let persisted = fresh
+            .update_tracked_fields_bang(Some("127.0.0.1"), &adapter, &clock)
+            .await
+            .unwrap();
+        assert!(!persisted);
+        assert_eq!(fresh.sign_in_count(), 0);
+
+        // The bang path never validates: a record no validator would accept
+        // still persists through `update_columns`.
+        let seed = TestUser::fresh(1);
+        adapter.create(seed).await.unwrap();
+        let mut stored = adapter
+            .get(&crate::adapter::DeviseKey::from_i64(1))
+            .await
+            .unwrap()
+            .expect("record is stored");
+        let persisted = stored
+            .update_tracked_fields_bang(None, &adapter, &clock)
+            .await
+            .unwrap();
+        assert!(persisted);
+        assert_eq!(stored.sign_in_count(), 1);
+        assert_eq!(stored.current_sign_in_ip(), Some(""));
+    }
+
+    /// Override model proving `extract_ip_from` is an override point.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    struct OverridingUser {
+        inner: TestUser,
+    }
+
+    impl AnyDeviseModel for OverridingUser {
+        fn to_key(&self) -> crate::adapter::DeviseKey {
+            self.inner.to_key()
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Authenticatable for OverridingUser {}
+
+    #[async_trait]
+    impl Trackable for OverridingUser {
+        fn sign_in_count(&self) -> u64 {
+            self.inner.sign_in_count()
+        }
+
+        fn set_sign_in_count(&mut self, count: u64) {
+            self.inner.set_sign_in_count(count);
+        }
+
+        fn current_sign_in_at(&self) -> Option<DateTime<Utc>> {
+            self.inner.current_sign_in_at()
+        }
+
+        fn set_current_sign_in_at(&mut self, at: Option<DateTime<Utc>>) {
+            self.inner.set_current_sign_in_at(at);
+        }
+
+        fn last_sign_in_at(&self) -> Option<DateTime<Utc>> {
+            self.inner.last_sign_in_at()
+        }
+
+        fn set_last_sign_in_at(&mut self, at: Option<DateTime<Utc>>) {
+            self.inner.set_last_sign_in_at(at);
+        }
+
+        fn current_sign_in_ip(&self) -> Option<&str> {
+            self.inner.current_sign_in_ip()
+        }
+
+        fn set_current_sign_in_ip(&mut self, ip: Option<String>) {
+            self.inner.set_current_sign_in_ip(ip);
+        }
+
+        fn last_sign_in_ip(&self) -> Option<&str> {
+            self.inner.last_sign_in_ip()
+        }
+
+        fn set_last_sign_in_ip(&mut self, ip: Option<String>) {
+            self.inner.set_last_sign_in_ip(ip);
+        }
+
+        fn persisted(&self) -> bool {
+            self.inner.persisted()
+        }
+
+        fn extract_ip_from(&self, _peer_addr: Option<&str>) -> Option<String> {
+            Some("127.0.0.2".to_string())
+        }
+    }
+
+    #[test]
+    fn trackable_matrix_extract_ip_overridable() {
+        let clock = fixed_clock();
+        let mut user = OverridingUser {
+            inner: TestUser::fresh(1),
+        };
+        user.update_tracked_fields_from_peer(Some("127.0.0.1"), &clock);
+        assert_eq!(user.current_sign_in_ip(), Some("127.0.0.2"));
+        assert_eq!(user.last_sign_in_ip(), Some("127.0.0.2"));
+
+        let mut plain = TestUser::fresh(1);
+        plain.update_tracked_fields_from_peer(Some("127.0.0.1"), &clock);
+        assert_eq!(plain.current_sign_in_ip(), Some("127.0.0.1"));
+
+        // Missing and empty peers shift with an empty IP, never a header.
+        let mut missing = TestUser::fresh(1);
+        missing.update_tracked_fields_from_peer(None, &clock);
+        assert_eq!(missing.current_sign_in_ip(), Some(""));
+    }
 }

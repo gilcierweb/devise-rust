@@ -379,7 +379,6 @@ mod tests {
     fn epoch_offset(seconds_ago: i64) -> serde_json::Value {
         serde_json::json!(1_700_000_000 - seconds_ago)
     }
-
     #[tokio::test]
     async fn timeout_trackable_tracer_stale_tick_times_out() {
         let config = test_config();
@@ -471,6 +470,213 @@ mod tests {
             check_timeout(stored.as_ref(), &flags, config.timeout_in, &clock),
             TimeoutDecision::Live
         );
+    }
+
+    #[test]
+    fn timeoutable_matrix_config_fallback_and_zero_window() {
+        let clock = fixed_clock();
+        let user = TestUser { id: 1 };
+
+        // Fallback to the config option (Devise `swap Devise, timeout_in:`).
+        let narrow = DeviseConfig {
+            timeout_in: TimeDelta::minutes(1),
+            ..DeviseConfig::default()
+        };
+        assert!(user.timedout(parse_last_request_at(&epoch_offset(120)), &narrow, &clock));
+        assert!(!user.timedout(parse_last_request_at(&epoch_offset(30)), &narrow, &clock));
+
+        let wide = DeviseConfig {
+            timeout_in: TimeDelta::minutes(5),
+            ..DeviseConfig::default()
+        };
+        assert!(!user.timedout(parse_last_request_at(&epoch_offset(120)), &wide, &clock));
+        assert!(user.timedout(parse_last_request_at(&epoch_offset(360)), &wide, &clock));
+
+        // A zero window expires every past tick (Devise `0.ago` is now, and
+        // every stored tick is `<=` now). Devise's nil-window (never expires)
+        // has no `TimeDelta` representation, so it is intentionally not
+        // ported; the per-model `timeout_in` override stays the opt-out seam.
+        let zero = DeviseConfig {
+            timeout_in: TimeDelta::zero(),
+            ..DeviseConfig::default()
+        };
+        assert!(user.timedout(parse_last_request_at(&epoch_offset(1)), &zero, &clock));
+        assert!(!user.timedout(None, &zero, &clock));
+
+        assert!(required_fields().is_empty());
+    }
+
+    /// Record carrying remember state for the exemption matrix.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    struct RememberingUser {
+        id: i64,
+        value: Option<String>,
+        created_at: Option<DateTime<Utc>>,
+    }
+
+    impl AnyDeviseModel for RememberingUser {
+        fn to_key(&self) -> crate::adapter::DeviseKey {
+            crate::adapter::DeviseKey::from_i64(self.id)
+        }
+
+        fn rememberable_value_opt(&self) -> Option<String> {
+            self.value.clone()
+        }
+
+        fn remember_created_at_opt(&self) -> Option<DateTime<Utc>> {
+            self.created_at
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Authenticatable for RememberingUser {}
+
+    fn exemption_request(cookie: Option<String>) -> AuthRequest {
+        let mut request =
+            AuthRequest::new(crate::request::HttpMethod::Get, "/protected".to_string());
+        if let Some(jar) = cookie {
+            request.cookies.insert(
+                crate::rememberable::remember_cookie_key("user", &DeviseConfig::default()),
+                jar,
+            );
+        }
+        request
+    }
+
+    fn exemption_user(config: &DeviseConfig, clock: &FixedClock) -> (RememberingUser, String) {
+        let created = clock.now() - TimeDelta::hours(1);
+        let user = RememberingUser {
+            id: 1,
+            value: Some("cookie-token".to_string()),
+            created_at: Some(created),
+        };
+        // Epoch-second granularity plus strict greater-than: the cookie must
+        // postdate the creation second to validate.
+        let generated = (clock.now() - TimeDelta::minutes(30))
+            .timestamp()
+            .to_string();
+        let jar = crate::rememberable::encode_cookie_value("1", "cookie-token", &generated);
+        let _ = config;
+        (user, jar)
+    }
+
+    #[test]
+    fn timeoutable_matrix_remember_exemption() {
+        let config = test_config();
+        let clock = fixed_clock();
+
+        // Live remember-me session with a stale tick stays exempt.
+        let (user, jar) = exemption_user(&config, &clock);
+        let request = exemption_request(Some(jar));
+        assert!(remember_active_for_timeout(
+            &user, &request, "user", &config, &clock
+        ));
+
+        // Every miss shape loses the exemption (stale flags never trusted).
+        let (user, _) = exemption_user(&config, &clock);
+        assert!(!remember_active_for_timeout(
+            &user,
+            &exemption_request(None),
+            "user",
+            &config,
+            &clock
+        ));
+
+        let stale_generated = (clock.now() - config.remember_for - TimeDelta::hours(1))
+            .timestamp()
+            .to_string();
+        let stale_jar =
+            crate::rememberable::encode_cookie_value("1", "cookie-token", &stale_generated);
+        assert!(!remember_active_for_timeout(
+            &user,
+            &exemption_request(Some(stale_jar)),
+            "user",
+            &config,
+            &clock
+        ));
+
+        let wrong_jar = crate::rememberable::encode_cookie_value(
+            "1",
+            "wrong",
+            &(clock.now() - TimeDelta::minutes(30))
+                .timestamp()
+                .to_string(),
+        );
+        assert!(!remember_active_for_timeout(
+            &user,
+            &exemption_request(Some(wrong_jar)),
+            "user",
+            &config,
+            &clock
+        ));
+
+        let equal_generated = user
+            .created_at
+            .expect("created is set")
+            .timestamp()
+            .to_string();
+        let equal_jar =
+            crate::rememberable::encode_cookie_value("1", "cookie-token", &equal_generated);
+        assert!(!remember_active_for_timeout(
+            &user,
+            &exemption_request(Some(equal_jar)),
+            "user",
+            &config,
+            &clock
+        ));
+
+        let foreign_jar = crate::rememberable::encode_cookie_value(
+            "2",
+            "cookie-token",
+            &(clock.now() - TimeDelta::minutes(30))
+                .timestamp()
+                .to_string(),
+        );
+        assert!(!remember_active_for_timeout(
+            &user,
+            &exemption_request(Some(foreign_jar)),
+            "user",
+            &config,
+            &clock
+        ));
+
+        let valueless = RememberingUser {
+            value: None,
+            ..user.clone()
+        };
+        let (_, jar) = exemption_user(&config, &clock);
+        assert!(!remember_active_for_timeout(
+            &valueless,
+            &exemption_request(Some(jar)),
+            "user",
+            &config,
+            &clock
+        ));
+
+        let dateless = RememberingUser {
+            created_at: None,
+            ..user.clone()
+        };
+        let (_, jar) = exemption_user(&config, &clock);
+        assert!(!remember_active_for_timeout(
+            &dateless,
+            &exemption_request(Some(jar)),
+            "user",
+            &config,
+            &clock
+        ));
+
+        assert!(!remember_active_for_timeout(
+            &user,
+            &exemption_request(Some("not json".to_string())),
+            "user",
+            &config,
+            &clock
+        ));
     }
 
     /// Minimal in-memory session store for the tick round-trip test.

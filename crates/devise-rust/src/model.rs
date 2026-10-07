@@ -1088,6 +1088,57 @@ pub trait Authenticatable: AnyDeviseModel {
     }
 }
 
+// ============================================================================
+// Gate chain: confirmable before lockable (05-04)
+// Mirrors the `super`-chain order in devise/lib/devise/modules.rb
+// ============================================================================
+
+/// Compose the canonical confirmable-before-lockable activity gate.
+///
+/// `confirmable_active` is the [`Confirmable::confirmation_gate_active`](crate::confirmable::Confirmable::confirmation_gate_active)
+/// slice, `lockable_active` the [`Lockable::lock_gate_active`](crate::lockable::Lockable::lock_gate_active)
+/// slice. App `User` types call confirmable-then-lockable through this fn;
+/// the order is fixed here so call sites cannot invert it.
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::model::chain_active_for_authentication;
+///
+/// assert!(chain_active_for_authentication(true, true));
+/// assert!(!chain_active_for_authentication(false, true));
+/// assert!(!chain_active_for_authentication(true, false));
+/// ```
+#[must_use]
+pub fn chain_active_for_authentication(confirmable_active: bool, lockable_active: bool) -> bool {
+    confirmable_active && lockable_active
+}
+
+/// First-failing inactive message for the canonical chain.
+///
+/// The confirmable slice wins over the lockable slice (`unconfirmed` before
+/// `locked`, mirroring Devise's `super`-chain evaluation); `inactive` when
+/// every gate defers.
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::model::chain_inactive_message;
+///
+/// assert_eq!(chain_inactive_message(Some("unconfirmed"), Some("locked")), "unconfirmed");
+/// assert_eq!(chain_inactive_message(None, Some("locked")), "locked");
+/// assert_eq!(chain_inactive_message(None, None), "inactive");
+/// ```
+#[must_use]
+pub fn chain_inactive_message(
+    confirmable_message: Option<&'static str>,
+    lockable_message: Option<&'static str>,
+) -> &'static str {
+    confirmable_message
+        .or(lockable_message)
+        .unwrap_or("inactive")
+}
+
 /// Object-safe read bridge over any typed adapter.
 ///
 /// `OrmAdapter<M>` cannot be turned into a trait object over heterogeneous
@@ -2642,5 +2693,39 @@ mod tests {
         let by_conditions = bridge.find_first_boxed(&conditions).await.unwrap();
         let boxed = by_conditions.expect("found");
         assert!(boxed.as_password_verifiable().is_some());
+    }
+
+    #[test]
+    fn test_gate_chain_confirmable_before_lockable() {
+        use crate::scope::Module;
+
+        // Canonical super-chain order pins the evaluation order: Confirmable
+        // sorts below Lockable, so the confirmable gate runs first. Inverting
+        // the chain would surface "locked" for an unconfirmed-plus-locked
+        // record; this test fails exactly then.
+        assert!(Module::Confirmable < Module::Lockable);
+        assert!(Module::Lockable < Module::Timeoutable);
+        assert!(Module::Timeoutable < Module::Trackable);
+        let mut ordered = vec![Module::Lockable, Module::Confirmable];
+        ordered.sort();
+        assert_eq!(ordered, vec![Module::Confirmable, Module::Lockable]);
+
+        // Composition truth table through the chain fns.
+        assert!(chain_active_for_authentication(true, true));
+        assert!(!chain_active_for_authentication(false, true));
+        assert!(!chain_active_for_authentication(true, false));
+        assert!(!chain_active_for_authentication(false, false));
+
+        // First-failing message wins: unconfirmed before locked.
+        assert_eq!(
+            chain_inactive_message(Some("unconfirmed"), Some("locked")),
+            "unconfirmed"
+        );
+        assert_eq!(
+            chain_inactive_message(Some("unconfirmed"), None),
+            "unconfirmed"
+        );
+        assert_eq!(chain_inactive_message(None, Some("locked")), "locked");
+        assert_eq!(chain_inactive_message(None, None), "inactive");
     }
 }

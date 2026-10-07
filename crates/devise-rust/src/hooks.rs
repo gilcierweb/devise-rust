@@ -9,6 +9,7 @@ use crate::config::DeviseConfig;
 use crate::failure::Failure;
 use crate::rememberable::RememberCookieOp;
 use crate::request::AuthRequest;
+use crate::time::{Clock, SystemClock};
 use async_trait::async_trait;
 use std::fmt::Debug;
 
@@ -144,6 +145,7 @@ struct HookEntry {
 }
 
 /// Proxy trait for hook context - abstracts `AuthProxy` for hook access
+#[async_trait]
 pub trait HookProxy: Send + Sync {
     /// Get the session store
     fn session_store(&self) -> &dyn crate::session::SessionStore;
@@ -167,6 +169,33 @@ pub trait HookProxy: Send + Sync {
     fn user_mut(&mut self, scope: &str) -> Option<&mut Option<Box<dyn AnyDeviseModel>>>;
     /// Lock the proxy (blocks further auth this request)
     fn lock(&mut self);
+    /// Sign out after a timeout (hook plumbing, TMO-02/D-19).
+    ///
+    /// Clears memos plus session keys (and the timeout tick keys) for every
+    /// scope when `sign_out_all` holds, else for `scope` alone. The default
+    /// covers every registered scope; `AuthProxy` overrides to cover every
+    /// memoized scope through its real `sign_out` paths (which also run the
+    /// logout hooks, so the remember cookie is cleared exactly as Devise's
+    /// warden-logout timeout path does).
+    async fn sign_out_for_timeout(&mut self, scope: &str, sign_out_all: bool) {
+        let mut scopes = if sign_out_all {
+            self.scope_registry().scope_names()
+        } else {
+            Vec::new()
+        };
+        if !scopes.iter().any(|name| name == scope) {
+            scopes.push(scope.to_string());
+        }
+        for timed_out in &scopes {
+            if let Some(slot) = self.user_mut(timed_out) {
+                *slot = None;
+            }
+            let session_key = crate::session::keys::scope_session_key(timed_out);
+            self.session_store().remove(&session_key).await;
+            let tick_key = crate::timeoutable::last_request_at_key(timed_out);
+            self.session_store().remove(&tick_key).await;
+        }
+    }
 }
 
 /// Trait for any Devise model - re-exported for hook context
@@ -292,13 +321,10 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
     // 3. Trackable - runs on Authentication for scopes with Trackable module
     if mapping.modules.contains(&Module::Trackable) {
         registry.add_hook(
-            HookFilter::new().only(vec![Event::Authentication]),
-            Box::new(|_ctx| {
-                Box::pin(async move {
-                    // TODO Phase 5: record.update_tracked_fields(ctx.request.unwrap())
-                    Ok(())
-                })
-            }),
+            HookFilter::new()
+                .only(vec![Event::Authentication])
+                .except(vec![Event::Fetch]),
+            trackable_hook(),
             false,
         );
     }
@@ -365,15 +391,125 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
     if mapping.modules.contains(&Module::Timeoutable) {
         registry.add_hook(
             HookFilter::new().only(vec![Event::Request]),
-            Box::new(|_ctx| {
-                Box::pin(async move {
-                    // TODO Phase 5: update last_request_at; if record.timedout?(last) { return Err(Failure::Timeout) }
-                    Ok(())
-                })
-            }),
+            timeoutable_tick_hook(),
             false,
         );
     }
+}
+
+/// Trackable hook body (hook 3): shift the memoized record's sign-in fields.
+///
+/// Devise `hooks/trackable.rb` runs `after_set_user except: :fetch`. The
+/// filter carries that exclusion; the body repeats it defensively (the
+/// lockable-reset precedent). The body honors `skip_trackable` (D-21, shared
+/// with the timeout tick) and applies the in-memory shift through the
+/// object-safe `AnyDeviseModel::apply_tracked_fields_hook` seam, feeding it
+/// the socket peer from `AuthRequest.peer_addr` (D-20: proxy headers are
+/// never consulted).
+///
+/// Durable persistence is NOT here: hooks own no adapter, and the typed
+/// `Trackable::update_tracked_fields_bang` (with the #4673 new-record probe)
+/// is the bridge-called verb. This mirrors the lockable-reset split (hook
+/// memo-consistency versus typed durable path).
+fn trackable_hook() -> Box<HookFn> {
+    Box::new(|ctx| {
+        Box::pin(async move {
+            if ctx.event == Event::Fetch {
+                return Ok(());
+            }
+            let Some(request) = ctx.request else {
+                return Ok(());
+            };
+            if request.flags.skip_trackable {
+                return Ok(());
+            }
+            let peer = request.peer_addr.as_deref().unwrap_or_default();
+            let now = SystemClock.now();
+            let scope = ctx.scope.to_string();
+            if let Some(slot) = ctx.proxy.user_mut(&scope) {
+                if let Some(record) = slot.as_mut() {
+                    record.apply_tracked_fields_hook(now, peer);
+                }
+            }
+            Ok(())
+        })
+    })
+}
+
+/// Timeoutable-tick hook body (hook 7): expiry check plus epoch tick.
+///
+/// Devise `hooks/timeoutable.rb` runs on every request the user is set:
+/// skip entirely under `skip_timeoutable` or `skip_timeout` (D-17); read the
+/// session `last_request_at` Integer epoch; when the tick is stale AND no
+/// live remember-me session exempts it (D-18, revalidated from the current
+/// cookie triple, never a stale flag), sign out (all scopes when
+/// `sign_out_all_scopes`, D-19) and fail `:timeout`; otherwise tick the
+/// epoch unless `skip_trackable`.
+///
+/// Anonymous requests (no memoized record) are a no-op: there is no session
+/// to time out, and ticking would mint session keys for strangers.
+///
+/// The sign-out runs through [`HookProxy::sign_out_for_timeout`]: `AuthProxy`
+/// routes through its real `sign_out` paths, so logout hooks fire and the
+/// remember cookie is cleared exactly as Devise's warden-logout timeout path
+/// does.
+fn timeoutable_tick_hook() -> Box<HookFn> {
+    Box::new(|ctx| {
+        Box::pin(async move {
+            let flags = ctx.request.map(|request| request.flags).unwrap_or_default();
+            if flags.skip_timeoutable || flags.skip_timeout {
+                return Ok(());
+            }
+            if ctx.record.is_none() {
+                return Ok(());
+            }
+            let clock = SystemClock;
+            let scope = ctx.scope.to_string();
+            let stored =
+                crate::timeoutable::read_last_request_at(ctx.proxy.session_store(), &scope).await;
+            let timeout_in = ctx.proxy.devise_config().timeout_in;
+            match crate::timeoutable::check_timeout(stored.as_ref(), &flags, timeout_in, &clock) {
+                crate::timeoutable::TimeoutDecision::Skipped => Ok(()),
+                crate::timeoutable::TimeoutDecision::Live => {
+                    if !flags.skip_trackable {
+                        crate::timeoutable::tick_last_request_at(
+                            ctx.proxy.session_store(),
+                            &scope,
+                            &clock,
+                        )
+                        .await;
+                    }
+                    Ok(())
+                }
+                crate::timeoutable::TimeoutDecision::Expired => {
+                    let exempt = match (ctx.record, ctx.request) {
+                        (Some(record), Some(request)) => {
+                            let config = ctx.proxy.devise_config().clone();
+                            crate::timeoutable::remember_active_for_timeout(
+                                record, request, &scope, &config, &clock,
+                            )
+                        }
+                        _ => false,
+                    };
+                    if exempt {
+                        if !flags.skip_trackable {
+                            crate::timeoutable::tick_last_request_at(
+                                ctx.proxy.session_store(),
+                                &scope,
+                                &clock,
+                            )
+                            .await;
+                        }
+                        return Ok(());
+                    }
+                    let sign_out_all = ctx.proxy.devise_config().sign_out_all_scopes;
+                    ctx.proxy.sign_out_for_timeout(&scope, sign_out_all).await;
+                    ctx.proxy.lock();
+                    Err(Failure::Timeout)
+                }
+            }
+        })
+    })
 }
 
 /// Rememberable-set hook body (hook 4): queue the `Set` cookie intent when
@@ -827,5 +963,310 @@ mod tests {
         assert_eq!(Event::Fetch as u8, 2);
         assert_eq!(Event::Logout as u8, 3);
         assert_eq!(Event::Request as u8, 4);
+    }
+
+    /// Memo-tracked user for the trackable and timeout hook tests.
+    #[derive(Debug, Clone)]
+    struct TrackedHookUser {
+        id: i64,
+        sign_in_count: u64,
+        current_sign_in_ip: Option<String>,
+        last_sign_in_ip: Option<String>,
+        remember_value: Option<String>,
+        remember_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    impl TrackedHookUser {
+        fn signed_in(id: i64) -> Self {
+            Self {
+                id,
+                sign_in_count: 0,
+                current_sign_in_ip: None,
+                last_sign_in_ip: None,
+                remember_value: None,
+                remember_created_at: None,
+            }
+        }
+    }
+
+    impl AnyDeviseModel for TrackedHookUser {
+        fn to_key(&self) -> crate::adapter::DeviseKey {
+            crate::adapter::DeviseKey::from_i64(self.id)
+        }
+
+        fn authenticatable_salt(&self) -> Option<String> {
+            Some("$2a$12$hooktestsalt123456789012".to_string())
+        }
+
+        fn apply_tracked_fields_hook(
+            &mut self,
+            _now: chrono::DateTime<chrono::Utc>,
+            peer_ip: &str,
+        ) -> bool {
+            self.last_sign_in_ip = self.current_sign_in_ip.clone();
+            self.current_sign_in_ip = Some(peer_ip.to_string());
+            self.sign_in_count += 1;
+            true
+        }
+
+        fn rememberable_value_opt(&self) -> Option<String> {
+            self.remember_value.clone()
+        }
+
+        fn remember_created_at_opt(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+            self.remember_created_at
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Build a proxy plus a dispatch registry for the hook bodies under test.
+    fn timeout_trackable_harness(
+        modules: Vec<Module>,
+    ) -> (
+        crate::proxy::AuthProxy,
+        Arc<TrackingStore>,
+        HookRegistry,
+        crate::scope::Mapping,
+    ) {
+        let renewed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (proxy, store) = hook_test_proxy(&renewed, modules.clone());
+        let mapping = Mapping {
+            name: "user".to_string(),
+            class_name: "User".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: PathNames::default(),
+            controllers: HashMap::new(),
+            modules,
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: SignOutVia::Delete,
+            failure_app: None,
+        };
+        let mut registry = HookRegistry::new();
+        register_devise_hooks(&mut registry, &mapping);
+        (proxy, store, registry, mapping)
+    }
+
+    fn hook_request_with_peer(peer: &str) -> AuthRequest {
+        AuthRequest::new(crate::request::HttpMethod::Get, "/protected".to_string())
+            .peer_addr(peer.to_string())
+    }
+
+    #[tokio::test]
+    async fn test_trackable_hook_shifts_memo_and_honors_skip() {
+        let (mut proxy, _store, registry, _mapping) =
+            timeout_trackable_harness(vec![Module::DatabaseAuthenticatable, Module::Trackable]);
+        proxy
+            .sign_in("user", Box::new(TrackedHookUser::signed_in(1)), false)
+            .await;
+        assert!(proxy.authenticated("user"));
+
+        let owned: TrackedHookUser = proxy.user("user").cloned().expect("memoized");
+        assert_eq!(owned.sign_in_count, 0);
+
+        // Authentication with a socket peer shifts the memo.
+        let request = hook_request_with_peer("10.1.2.3");
+        let mut ctx = HookContext {
+            proxy: &mut proxy,
+            scope: "user",
+            event: Event::Authentication,
+            request: Some(&request),
+            record: Some(&owned),
+        };
+        registry.run_hooks(&mut ctx).await.expect("hook passes");
+        let shifted: TrackedHookUser = proxy.user("user").cloned().expect("memoized");
+        assert_eq!(shifted.sign_in_count, 1);
+        assert_eq!(shifted.current_sign_in_ip.as_deref(), Some("10.1.2.3"));
+
+        // skip_trackable freezes the memo.
+        let mut skipping = hook_request_with_peer("10.9.9.9");
+        skipping.flags.skip_trackable = true;
+        let owned: TrackedHookUser = proxy.user("user").cloned().expect("memoized");
+        let mut ctx = HookContext {
+            proxy: &mut proxy,
+            scope: "user",
+            event: Event::Authentication,
+            request: Some(&skipping),
+            record: Some(&owned),
+        };
+        registry.run_hooks(&mut ctx).await.expect("hook passes");
+        let frozen: TrackedHookUser = proxy.user("user").cloned().expect("memoized");
+        assert_eq!(frozen.sign_in_count, 1);
+        assert_eq!(frozen.current_sign_in_ip.as_deref(), Some("10.1.2.3"));
+
+        // Fetch events never shift (Devise except: :fetch).
+        let request = hook_request_with_peer("10.9.9.9");
+        let owned: TrackedHookUser = proxy.user("user").cloned().expect("memoized");
+        let mut ctx = HookContext {
+            proxy: &mut proxy,
+            scope: "user",
+            event: Event::Fetch,
+            request: Some(&request),
+            record: Some(&owned),
+        };
+        registry.run_hooks(&mut ctx).await.expect("hook passes");
+        let unfetched: TrackedHookUser = proxy.user("user").cloned().expect("memoized");
+        assert_eq!(unfetched.sign_in_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_timeoutable_tick_hook_stale_signs_out_all_scopes() {
+        let (mut proxy, store, registry, _mapping) =
+            timeout_trackable_harness(vec![Module::DatabaseAuthenticatable, Module::Timeoutable]);
+        proxy
+            .sign_in("user", Box::new(TrackedHookUser::signed_in(1)), false)
+            .await;
+        proxy
+            .sign_in("admin", Box::new(TrackedHookUser::signed_in(2)), false)
+            .await;
+        assert!(proxy.authenticated("user"));
+        assert!(proxy.authenticated("admin"));
+
+        // Stale tick for the requesting scope (one hour past the window).
+        let stale =
+            chrono::Utc::now() - chrono::TimeDelta::minutes(30) - chrono::TimeDelta::hours(1);
+        store
+            .insert_value(
+                &crate::timeoutable::last_request_at_key("user"),
+                serde_json::Value::Number(serde_json::Number::from(stale.timestamp())),
+            )
+            .await;
+
+        let request = AuthRequest::new(crate::request::HttpMethod::Get, "/protected".to_string());
+        let owned: TrackedHookUser = proxy.user("user").cloned().expect("memoized");
+        let mut ctx = HookContext {
+            proxy: &mut proxy,
+            scope: "user",
+            event: Event::Request,
+            request: Some(&request),
+            record: Some(&owned),
+        };
+        let outcome = registry.run_hooks(&mut ctx).await;
+        assert_eq!(outcome, Err(Failure::Timeout));
+        assert!(!proxy.authenticated("user"));
+        assert!(!proxy.authenticated("admin"));
+        assert!(proxy.locked());
+        let session_key = crate::session::keys::scope_session_key("user");
+        assert!(store.get_value(&session_key).await.is_none());
+        let admin_key = crate::session::keys::scope_session_key("admin");
+        assert!(store.get_value(&admin_key).await.is_none());
+        let tick_key = crate::timeoutable::last_request_at_key("user");
+        assert!(store.get_value(&tick_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_timeoutable_tick_hook_live_ticks_and_exempt_stays() {
+        let (mut proxy, store, registry, _mapping) =
+            timeout_trackable_harness(vec![Module::DatabaseAuthenticatable, Module::Timeoutable]);
+        let mut user = TrackedHookUser::signed_in(1);
+        user.remember_value = Some("cookie-token".to_string());
+        user.remember_created_at = Some(chrono::Utc::now() - chrono::TimeDelta::hours(1));
+        proxy.sign_in("user", Box::new(user), false).await;
+
+        // Live tick: passes and refreshes the epoch.
+        let tick_key = crate::timeoutable::last_request_at_key("user");
+        let fresh = chrono::Utc::now() - chrono::TimeDelta::minutes(5);
+        store
+            .insert_value(
+                &tick_key,
+                serde_json::Value::Number(serde_json::Number::from(fresh.timestamp())),
+            )
+            .await;
+        let request = AuthRequest::new(crate::request::HttpMethod::Get, "/protected".to_string());
+        let owned: TrackedHookUser = proxy.user("user").cloned().expect("memoized");
+        let mut ctx = HookContext {
+            proxy: &mut proxy,
+            scope: "user",
+            event: Event::Request,
+            request: Some(&request),
+            record: Some(&owned),
+        };
+        registry
+            .run_hooks(&mut ctx)
+            .await
+            .expect("live tick passes");
+        assert!(proxy.authenticated("user"));
+        let ticked = store.get_value(&tick_key).await.expect("tick stored");
+        let ticked_epoch = ticked.as_i64().expect("integer epoch");
+        assert!(ticked_epoch >= fresh.timestamp());
+
+        // skip_trackable freezes the tick on the live path.
+        let mut freezing =
+            AuthRequest::new(crate::request::HttpMethod::Get, "/protected".to_string());
+        freezing.flags.skip_trackable = true;
+        let owned: TrackedHookUser = proxy.user("user").cloned().expect("memoized");
+        let mut ctx = HookContext {
+            proxy: &mut proxy,
+            scope: "user",
+            event: Event::Request,
+            request: Some(&freezing),
+            record: Some(&owned),
+        };
+        registry
+            .run_hooks(&mut ctx)
+            .await
+            .expect("live tick passes");
+        let frozen = store.get_value(&tick_key).await.expect("tick stored");
+        assert_eq!(frozen, ticked);
+
+        // Stale tick plus a live remember cookie stays signed in (D-18).
+        let stale = chrono::Utc::now() - chrono::TimeDelta::hours(2);
+        store
+            .insert_value(
+                &tick_key,
+                serde_json::Value::Number(serde_json::Number::from(stale.timestamp())),
+            )
+            .await;
+        let generated = (chrono::Utc::now() - chrono::TimeDelta::minutes(30))
+            .timestamp()
+            .to_string();
+        let jar = crate::rememberable::encode_cookie_value("1", "cookie-token", &generated);
+        let mut exempt =
+            AuthRequest::new(crate::request::HttpMethod::Get, "/protected".to_string());
+        exempt.cookies.insert(
+            crate::rememberable::remember_cookie_key("user", proxy.config()),
+            jar,
+        );
+        let owned: TrackedHookUser = proxy.user("user").cloned().expect("memoized");
+        let mut ctx = HookContext {
+            proxy: &mut proxy,
+            scope: "user",
+            event: Event::Request,
+            request: Some(&exempt),
+            record: Some(&owned),
+        };
+        registry
+            .run_hooks(&mut ctx)
+            .await
+            .expect("exempt session passes");
+        assert!(proxy.authenticated("user"));
+        assert!(!proxy.locked());
+
+        // Skip flags bypass the check entirely, even for a stale tick.
+        let mut skipping =
+            AuthRequest::new(crate::request::HttpMethod::Get, "/protected".to_string());
+        skipping.flags.skip_timeout = true;
+        let owned: TrackedHookUser = proxy.user("user").cloned().expect("memoized");
+        let mut ctx = HookContext {
+            proxy: &mut proxy,
+            scope: "user",
+            event: Event::Request,
+            request: Some(&skipping),
+            record: Some(&owned),
+        };
+        registry
+            .run_hooks(&mut ctx)
+            .await
+            .expect("skipped check passes");
+        assert!(proxy.authenticated("user"));
     }
 }

@@ -507,6 +507,7 @@ impl AuthProxy {
     }
 }
 
+#[async_trait::async_trait]
 impl crate::hooks::HookProxy for AuthProxy {
     fn session_store(&self) -> &dyn SessionStore {
         self.session_store.as_ref()
@@ -530,6 +531,23 @@ impl crate::hooks::HookProxy for AuthProxy {
 
     fn lock(&mut self) {
         self.locked = true;
+    }
+
+    async fn sign_out_for_timeout(&mut self, scope: &str, sign_out_all: bool) {
+        if sign_out_all {
+            let scopes: Vec<String> = self.users.keys().cloned().collect();
+            self.sign_out_all_scopes(true).await;
+            for timed_out in &scopes {
+                self.session_store
+                    .remove(&crate::timeoutable::last_request_at_key(timed_out))
+                    .await;
+            }
+        } else {
+            self.sign_out(scope).await;
+            self.session_store
+                .remove(&crate::timeoutable::last_request_at_key(scope))
+                .await;
+        }
     }
 }
 
