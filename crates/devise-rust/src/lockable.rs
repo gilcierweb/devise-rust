@@ -32,9 +32,9 @@
 //! assert!(user.access_locked(&config, &clock));
 //! ```
 
-use crate::adapter::{OrmAdapter, Value};
+use crate::adapter::{Conditions, OrmAdapter, Value};
 use crate::config::DeviseConfig;
-use crate::error::DeviseError;
+use crate::error::{DeviseError, ResourceWithErrors, ValidationErrors};
 use crate::mailer::{HasEmail, Mailer, MailerContext};
 use crate::model::Authenticatable;
 use async_trait::async_trait;
@@ -434,6 +434,211 @@ pub trait Lockable: Authenticatable + HasEmail {
         self.set_failed_attempts(updated.failed_attempts());
         Ok(true)
     }
+
+    /// `send_unlock_instructions` (LCK-04): generate a raw token via
+    /// [`store_fresh_unlock_token`](Self::store_fresh_unlock_token)
+    /// (digest-only storage), e-mail the RAW token through
+    /// `Mailer::unlock_instructions`, and return the raw token.
+    ///
+    /// # Errors
+    ///
+    /// `DeviseError::Adapter` on persistence failure, `DeviseError::Mailer`
+    /// when the notification cannot render.
+    async fn send_unlock_instructions<A, L>(
+        &mut self,
+        adapter: &A,
+        mailer: &L,
+        config: &DeviseConfig,
+    ) -> Result<String, DeviseError>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+        L: Mailer<Self>,
+    {
+        let raw = self.store_fresh_unlock_token(adapter, config).await?;
+        let context = MailerContext::from_record(self)
+            .with_token(raw.clone())
+            .with_resource(self.serializable_hash());
+        mailer.unlock_instructions(self, Some(&raw), &context)?;
+        Ok(raw)
+    }
+
+    /// `resend_unlock_instructions` (LCK-04): re-mail instructions only while
+    /// locked (Devise `if_access_locked`); returns the fresh raw token, or
+    /// `None` when the record is not locked. The `:not_locked` error belongs
+    /// to the class-level caller, which owns the errors object.
+    ///
+    /// # Errors
+    ///
+    /// `DeviseError::Adapter` on persistence failure, `DeviseError::Mailer`
+    /// when the notification cannot render.
+    async fn resend_unlock_instructions<A, L>(
+        &mut self,
+        adapter: &A,
+        mailer: &L,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> Result<Option<String>, DeviseError>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+        L: Mailer<Self>,
+    {
+        if self.access_locked(config, clock) {
+            Ok(Some(
+                self.send_unlock_instructions(adapter, mailer, config)
+                    .await?,
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// `unlock_access_by_token` (LCK-04): blank tokens fail with `:blank` on
+    /// a fresh record without touching the adapter (T-05-04); otherwise the
+    /// HMAC digest is looked up, a persisted match is unlocked, and the input
+    /// token is restored on the returned record for re-render. Unknown tokens
+    /// fail with `:invalid`. Unlocking never checks `access_locked`: any
+    /// digest match unlocks, even an already-released lock.
+    ///
+    /// # Errors
+    ///
+    /// `DeviseError::Adapter` on lookup or persistence failure.
+    async fn unlock_access_by_token<A>(
+        token: Option<&str>,
+        adapter: &A,
+        config: &DeviseConfig,
+    ) -> Result<ResourceWithErrors<Self>, DeviseError>
+    where
+        Self: Sized + Default,
+        A: OrmAdapter<Self> + Send + Sync,
+    {
+        let raw = token.map(str::trim).filter(|text| !text.is_empty());
+        let Some(raw) = raw else {
+            let mut errors = ValidationErrors::new();
+            errors.add(UNLOCK_TOKEN_COLUMN, ":blank");
+            return Ok(ResourceWithErrors::new(Self::default(), errors));
+        };
+        let digest =
+            crate::crypto::token_generator::digest(&config.secret_key, UNLOCK_TOKEN_COLUMN, raw);
+        let mut conditions = Conditions::new();
+        conditions.insert(UNLOCK_TOKEN_COLUMN, Value::String(digest));
+        let Some(mut record) = adapter
+            .find_first(&conditions)
+            .await
+            .map_err(DeviseError::Adapter)?
+        else {
+            let mut errors = ValidationErrors::new();
+            errors.add(UNLOCK_TOKEN_COLUMN, ":invalid");
+            return Ok(ResourceWithErrors::new(Self::default(), errors));
+        };
+        record.unlock_access(adapter).await?;
+        record.set_raw_unlock_token(Some(raw.to_string()));
+        Ok(ResourceWithErrors::new(record, ValidationErrors::new()))
+    }
+
+    /// Class `send_unlock_instructions(attributes)` (LCK-04): slice the
+    /// attributes to `unlock_keys`, drop blanks, and require every key
+    /// (Devise `find_or_initialize_with_errors`): missing keys fail with
+    /// `:blank` and present keys with `:not_found`, with zero adapter calls.
+    /// A persisted match re-mails only while locked, attaching `:not_locked`
+    /// to the first unlock key otherwise.
+    ///
+    /// # Errors
+    ///
+    /// `DeviseError::Adapter` on lookup or persistence failure,
+    /// `DeviseError::Mailer` when the notification cannot render.
+    async fn send_unlock_instructions_for<A, L>(
+        attributes: &serde_json::Map<String, serde_json::Value>,
+        adapter: &A,
+        mailer: &L,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> Result<ResourceWithErrors<Self>, DeviseError>
+    where
+        Self: Sized + Default,
+        A: OrmAdapter<Self> + Send + Sync,
+        L: Mailer<Self>,
+    {
+        let keys: Vec<&str> = config.unlock_keys.iter().map(String::as_str).collect();
+        let mut present: Vec<(&str, String)> = Vec::new();
+        for key in &keys {
+            if let Some(value) = attributes.get(*key).and_then(|item| item.as_str()) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    present.push((*key, trimmed.to_string()));
+                }
+            }
+        }
+        if present.len() != keys.len() {
+            let mut errors = ValidationErrors::new();
+            for key in &keys {
+                if present.iter().any(|(found, _)| found == key) {
+                    errors.add(key, ":not_found");
+                } else {
+                    errors.add(key, ":blank");
+                }
+            }
+            return Ok(ResourceWithErrors::new(Self::default(), errors));
+        }
+        let mut conditions = Conditions::new();
+        for (key, value) in &present {
+            conditions.insert((*key).to_string(), Value::String(value.clone()));
+        }
+        let filtered = Self::normalize_auth_attributes_static(&conditions, config);
+        let found = adapter
+            .find_first(&filtered)
+            .await
+            .map_err(DeviseError::Adapter)?;
+        let mut resource = if let Some(record) = found {
+            ResourceWithErrors::new(record, ValidationErrors::new())
+        } else {
+            let mut errors = ValidationErrors::new();
+            for key in &keys {
+                errors.add(key, ":not_found");
+            }
+            ResourceWithErrors::new(Self::default(), errors)
+        };
+        if resource.is_valid() {
+            let resent = resource
+                .record
+                .resend_unlock_instructions(adapter, mailer, config, clock)
+                .await?;
+            if resent.is_none() {
+                let first = keys.first().copied().unwrap_or("email");
+                resource.errors.add(first, ":not_locked");
+            }
+        }
+        Ok(resource)
+    }
+
+    /// `unauthenticated_message` lockable branch (LCK-05, D-12): paranoid
+    /// mode returns the uniform base message first, so locked, last-attempt,
+    /// and unknown states stay indistinguishable; then `locked` while locked
+    /// or past the threshold; then `last_attempt` on the next-to-last
+    /// attempt with the warning enabled; else the base message.
+    fn lock_unauthenticated_message(
+        &self,
+        config: &DeviseConfig,
+        clock: &dyn crate::time::Clock,
+    ) -> &'static str {
+        if config.paranoid {
+            return Authenticatable::unauthenticated_message(self);
+        }
+        if self.access_locked(config, clock)
+            || (self.lock_strategy_enabled("failed_attempts", config)
+                && self.attempts_exceeded(config))
+        {
+            return "locked";
+        }
+        if self.lock_strategy_enabled("failed_attempts", config)
+            && self.last_attempt(config)
+            && config.last_attempt_warning
+        {
+            return "last_attempt";
+        }
+        Authenticatable::unauthenticated_message(self)
+    }
 }
 
 #[cfg(test)]
@@ -442,7 +647,7 @@ mod tests {
     use crate::adapter::memory::MemoryAdapter;
     use crate::failure::AnyDeviseModel;
     use crate::mailer::TestMailer;
-    use crate::time::FixedClock;
+    use crate::time::{Clock, FixedClock};
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -661,5 +866,345 @@ mod tests {
         assert!(!user.attempts_exceeded(&config));
         assert!(!user.access_locked(&config, &FixedClock::now()));
         assert_eq!(calls.load(Ordering::SeqCst), calls_after_seed);
+    }
+
+    #[tokio::test]
+    async fn lockable_unlock_strategy_predicates_and_required_fields() {
+        let both = test_config();
+        assert_eq!(both.unlock_strategy, "both");
+        assert!(unlock_strategy_enabled_for("both", &both));
+        assert!(unlock_strategy_enabled_for("time", &both));
+        assert!(unlock_strategy_enabled_for("email", &both));
+        assert!(!unlock_strategy_enabled_for("none", &both));
+        assert!(!unlock_strategy_enabled_for("undefined", &both));
+        assert_eq!(
+            required_fields(&both),
+            vec!["failed_attempts", "locked_at", "unlock_token"]
+        );
+
+        let email_only = DeviseConfig {
+            unlock_strategy: "email".to_string(),
+            ..test_config()
+        };
+        assert!(!unlock_strategy_enabled_for("both", &email_only));
+        assert!(!unlock_strategy_enabled_for("time", &email_only));
+        assert!(unlock_strategy_enabled_for("email", &email_only));
+        assert_eq!(
+            required_fields(&email_only),
+            vec!["failed_attempts", "unlock_token"]
+        );
+
+        let time_only = DeviseConfig {
+            unlock_strategy: "time".to_string(),
+            ..test_config()
+        };
+        assert!(unlock_strategy_enabled_for("time", &time_only));
+        assert!(!unlock_strategy_enabled_for("email", &time_only));
+        assert_eq!(
+            required_fields(&time_only),
+            vec!["failed_attempts", "locked_at"]
+        );
+
+        assert!(lock_strategy_enabled_for("failed_attempts", &both));
+        assert!(!lock_strategy_enabled_for("none", &both));
+    }
+
+    #[tokio::test]
+    async fn lockable_expired_time_lock_releases_live_lock_holds() {
+        let config = test_config();
+        let clock = FixedClock::now();
+
+        let mut stale = TestUser::fresh(1, "stale@example.com");
+        stale.set_locked_at(Some(clock.now() - chrono::TimeDelta::hours(2)));
+        assert!(!stale.access_locked(&config, &clock));
+
+        let mut fresh = TestUser::fresh(2, "fresh@example.com");
+        fresh.set_locked_at(Some(clock.now() - chrono::TimeDelta::minutes(30)));
+        assert!(fresh.access_locked(&config, &clock));
+
+        let email_only = DeviseConfig {
+            unlock_strategy: "email".to_string(),
+            ..test_config()
+        };
+        let mut old_email_lock = TestUser::fresh(3, "old@example.com");
+        old_email_lock.set_locked_at(Some(clock.now() - chrono::TimeDelta::hours(2)));
+        assert!(old_email_lock.access_locked(&email_only, &clock));
+    }
+
+    #[tokio::test]
+    async fn lockable_lock_access_mails_raw_stores_digest() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = TestMailer::default();
+        let mut user = TestUser::fresh(1, "locked@example.com");
+        adapter.create(user.clone()).await.unwrap();
+
+        let sent_raw = user
+            .lock_access(&adapter, &mailer, &config, &clock)
+            .await
+            .unwrap()
+            .expect("email strategy mails on lock");
+        assert_eq!(sent_raw.len(), 20);
+
+        let stored = user.unlock_token().unwrap().to_string();
+        assert_eq!(stored.len(), 64);
+        assert_ne!(stored, sent_raw);
+        assert_eq!(user.raw_unlock_token(), Some(sent_raw.as_str()));
+
+        let mails = mailer.sent_mails();
+        assert_eq!(mails.len(), 1);
+        assert_eq!(mails[0].to, "locked@example.com");
+        assert_eq!(
+            mails[0].template_vars.token.as_deref(),
+            Some(sent_raw.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn lockable_lock_access_opt_out_skips_mail() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = TestMailer::default();
+        let mut user = TestUser::fresh(1, "quiet@example.com");
+        adapter.create(user.clone()).await.unwrap();
+
+        let sent_opt = user
+            .lock_access_with_options(&adapter, &mailer, &config, &clock, false)
+            .await
+            .unwrap();
+        assert!(sent_opt.is_none());
+        assert!(user.locked_at().is_some());
+        assert!(user.unlock_token().is_none());
+        assert!(mailer.sent_mails().is_empty());
+        assert_eq!(user.lock_unauthenticated_message(&config, &clock), "locked");
+    }
+
+    #[tokio::test]
+    async fn lockable_unlock_access_by_token_round_trip() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = TestMailer::default();
+        let mut user = TestUser::fresh(1, "roundtrip@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        user.set_failed_attempts(3);
+        let raw = user
+            .lock_access(&adapter, &mailer, &config, &clock)
+            .await
+            .unwrap()
+            .expect("lock mails the raw token");
+        assert!(user.access_locked(&config, &clock));
+
+        let outcome = TestUser::unlock_access_by_token(Some(&raw), &adapter, &config)
+            .await
+            .unwrap();
+        assert!(outcome.is_valid());
+        assert_eq!(outcome.record.raw_unlock_token(), Some(raw.as_str()));
+        assert!(!outcome.record.access_locked(&config, &clock));
+
+        let stored = adapter.get(&user.to_key()).await.unwrap().unwrap();
+        assert!(stored.locked_at.is_none());
+        assert!(stored.unlock_token.is_none());
+        assert_eq!(stored.failed_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn lockable_unlock_access_by_token_blank_touches_no_adapter() {
+        let config = test_config();
+        let inner = MemoryAdapter::<TestUser>::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = CountingAdapter {
+            inner: &inner,
+            calls: Arc::clone(&calls),
+        };
+
+        for blank in [None, Some(""), Some("   ")] {
+            let outcome = TestUser::unlock_access_by_token(blank, &adapter, &config)
+                .await
+                .unwrap();
+            assert!(!outcome.is_valid());
+            assert_eq!(
+                outcome.errors.get("unlock_token"),
+                Some(&vec![":blank".to_string()])
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn lockable_unlock_access_by_token_invalid() {
+        let config = test_config();
+        let adapter = MemoryAdapter::<TestUser>::new();
+
+        let outcome = TestUser::unlock_access_by_token(Some("invalid_token"), &adapter, &config)
+            .await
+            .unwrap();
+        assert!(!outcome.is_valid());
+        assert!(!outcome.record.persisted());
+        assert_eq!(
+            outcome.errors.get("unlock_token"),
+            Some(&vec![":invalid".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn lockable_last_attempt_matrix() {
+        let config = DeviseConfig {
+            maximum_attempts: 20,
+            last_attempt_warning: true,
+            ..test_config()
+        };
+        let clock = FixedClock::now();
+
+        let mut user = TestUser::fresh(1, "matrix@example.com");
+        user.set_failed_attempts(18);
+        assert_eq!(
+            user.lock_unauthenticated_message(&config, &clock),
+            "invalid"
+        );
+
+        user.set_failed_attempts(19);
+        assert!(user.last_attempt(&config));
+        assert_eq!(
+            user.lock_unauthenticated_message(&config, &clock),
+            "last_attempt"
+        );
+
+        user.set_failed_attempts(20);
+        assert!(user.attempts_exceeded(&config));
+        assert_eq!(user.lock_unauthenticated_message(&config, &clock), "locked");
+
+        let quiet = DeviseConfig {
+            last_attempt_warning: false,
+            ..test_config()
+        };
+        user.set_failed_attempts(19);
+        assert_eq!(user.lock_unauthenticated_message(&quiet, &clock), "invalid");
+    }
+
+    #[tokio::test]
+    async fn lockable_paranoid_suppresses_lock_messages() {
+        let config = DeviseConfig {
+            paranoid: true,
+            maximum_attempts: 20,
+            ..test_config()
+        };
+        let clock = FixedClock::now();
+
+        let mut locked = TestUser::fresh(1, "paranoid@example.com");
+        locked.set_locked_at(Some(clock.now()));
+        locked.set_failed_attempts(21);
+        assert_eq!(
+            locked.lock_unauthenticated_message(&config, &clock),
+            "invalid"
+        );
+
+        let mut last_attempt = TestUser::fresh(2, "edge@example.com");
+        last_attempt.set_failed_attempts(19);
+        assert_eq!(
+            last_attempt.lock_unauthenticated_message(&config, &clock),
+            "invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn lockable_class_send_unlock_instructions() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = TestMailer::default();
+
+        let mut user = TestUser::fresh(1, "class@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        user.lock_access(&adapter, &mailer, &config, &clock)
+            .await
+            .unwrap();
+
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "email".to_string(),
+            serde_json::Value::String("class@example.com".to_string()),
+        );
+        let outcome =
+            TestUser::send_unlock_instructions_for(&params, &adapter, &mailer, &config, &clock)
+                .await
+                .unwrap();
+        assert!(outcome.is_valid());
+        assert_eq!(mailer.sent_mails().len(), 2);
+
+        let mut unknown = serde_json::Map::new();
+        unknown.insert(
+            "email".to_string(),
+            serde_json::Value::String("nobody@example.com".to_string()),
+        );
+        let missing =
+            TestUser::send_unlock_instructions_for(&unknown, &adapter, &mailer, &config, &clock)
+                .await
+                .unwrap();
+        assert!(!missing.is_valid());
+        assert_eq!(
+            missing.errors.get("email"),
+            Some(&vec![":not_found".to_string()])
+        );
+        assert_eq!(mailer.sent_mails().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lockable_class_send_requires_all_unlock_keys() {
+        let config = DeviseConfig {
+            unlock_keys: vec!["email".to_string(), "username".to_string()],
+            ..test_config()
+        };
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = TestMailer::default();
+
+        let user = TestUser::fresh(1, "keys@example.com");
+        adapter.create(user.clone()).await.unwrap();
+
+        let mut partial = serde_json::Map::new();
+        partial.insert(
+            "email".to_string(),
+            serde_json::Value::String("keys@example.com".to_string()),
+        );
+        let outcome =
+            TestUser::send_unlock_instructions_for(&partial, &adapter, &mailer, &config, &clock)
+                .await
+                .unwrap();
+        assert!(!outcome.is_valid());
+        assert_eq!(
+            outcome.errors.get("username"),
+            Some(&vec![":blank".to_string()])
+        );
+        assert!(mailer.sent_mails().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lockable_resend_refuses_unlocked_record() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = TestMailer::default();
+
+        let user = TestUser::fresh(1, "open@example.com");
+        adapter.create(user.clone()).await.unwrap();
+
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "email".to_string(),
+            serde_json::Value::String("open@example.com".to_string()),
+        );
+        let outcome =
+            TestUser::send_unlock_instructions_for(&params, &adapter, &mailer, &config, &clock)
+                .await
+                .unwrap();
+        assert!(!outcome.is_valid());
+        assert_eq!(
+            outcome.errors.get("email"),
+            Some(&vec![":not_locked".to_string()])
+        );
+        assert!(mailer.sent_mails().is_empty());
     }
 }
