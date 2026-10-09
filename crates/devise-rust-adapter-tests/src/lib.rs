@@ -334,6 +334,476 @@ where
         .expect("deleting a missing row is a no-op");
 }
 
+/// Token-digest lookups: `find_first` resolves the row by every curated
+/// digest column (`reset_password_token`, `confirmation_token`,
+/// `unlock_token`) and by the reconfirmable `unconfirmed_email` after a
+/// pending-email write (D-28 digest-lookup list; D-02 finder set).
+///
+/// # Panics
+///
+/// Panics when any contract assertion fails; case fns are the assertion
+/// mechanism (see the crate docs).
+pub async fn token_digest_case<F: ContractFactory>(factory: &F) {
+    let adapter = factory.adapter().await;
+    let now = sample_time();
+    let email = "digest-tracer@example.test";
+    let created = adapter
+        .create(<F::Model as ContractModel>::sample_new(email, now))
+        .await
+        .expect("create stores the row");
+    let key = factory.key_of_created(&created);
+
+    for column in ["reset_password_token", "confirmation_token", "unlock_token"] {
+        let digest = match column {
+            "reset_password_token" => created
+                .contract_reset_password_token()
+                .expect("sample sets a reset digest")
+                .to_owned(),
+            "confirmation_token" => created
+                .contract_confirmation_token()
+                .expect("sample sets a confirmation digest")
+                .to_owned(),
+            _ => created
+                .contract_unlock_token()
+                .expect("sample sets an unlock digest")
+                .to_owned(),
+        };
+        let mut conditions = Conditions::new();
+        conditions.insert(column, digest.as_str());
+        let found = adapter
+            .find_first(&conditions)
+            .await
+            .unwrap_or_else(|e| panic!("{column} digest lookup works: {e}"));
+        assert_eq!(
+            found.as_ref().map(ContractModel::contract_email),
+            Some(email),
+            "{column} digest lookup resolves the row"
+        );
+        assert_eq!(
+            adapter
+                .find_first_strict(&conditions)
+                .await
+                .expect("strict digest lookup hits")
+                .contract_email(),
+            email,
+            "strict hit matches finder hit on {column}"
+        );
+    }
+
+    let pending_email = "digest-pending@example.test";
+    let stamped = adapter
+        .update_columns(
+            &key,
+            &HashMap::from([("unconfirmed_email".to_owned(), Value::from(pending_email))]),
+        )
+        .await
+        .expect("pending email write works");
+    assert_eq!(stamped.contract_unconfirmed_email(), Some(pending_email));
+    let mut by_pending = Conditions::new();
+    by_pending.insert("unconfirmed_email", pending_email);
+    assert_eq!(
+        adapter
+            .find_first(&by_pending)
+            .await
+            .expect("pending email lookup works")
+            .map(|row| row.contract_email().to_owned()),
+        Some(email.to_owned()),
+        "unconfirmed_email lookup resolves the row"
+    );
+
+    let mut missing = Conditions::new();
+    missing.insert("confirmation_token", "enc-confirm-nobody@example.test");
+    assert_eq!(
+        adapter
+            .find_first(&missing)
+            .await
+            .expect("digest miss works"),
+        None
+    );
+}
+
+/// Uniqueness probe and retry loop (D-28): `column_value_unused` flips
+/// false for a stored digest, stays true for fresh values, and a
+/// token-generator-style regeneration loop skips the taken candidate and
+/// terminates on the next free one (the `crypto::token_generator`
+/// `generate_with` shape).
+///
+/// # Panics
+///
+/// Panics when any contract assertion fails; case fns are the assertion
+/// mechanism (see the crate docs).
+pub async fn uniqueness_retry_case<F: ContractFactory>(factory: &F) {
+    let adapter = factory.adapter().await;
+    let now = sample_time();
+
+    let pioneer_email = "retry-r1@example.test";
+    adapter
+        .create(<F::Model as ContractModel>::sample_new(pioneer_email, now))
+        .await
+        .expect("pioneer row stores");
+    let pioneer_digest = format!("enc-reset-{pioneer_email}");
+    assert!(
+        !adapter
+            .column_value_unused(
+                "reset_password_token",
+                &Value::from(pioneer_digest.as_str())
+            )
+            .await
+            .expect("probe works"),
+        "a stored digest reports taken"
+    );
+
+    let mut attempts = 0;
+    let winner_email = loop {
+        attempts += 1;
+        assert!(attempts <= 8, "uniqueness retry loop must terminate");
+        let candidate = format!("retry-r{attempts}@example.test");
+        let candidate_digest = format!("enc-reset-{candidate}");
+        if adapter
+            .column_value_unused(
+                "reset_password_token",
+                &Value::from(candidate_digest.as_str()),
+            )
+            .await
+            .expect("probe works")
+        {
+            break candidate;
+        }
+    };
+    assert_eq!(
+        attempts, 2,
+        "the loop must skip the taken candidate and take the next"
+    );
+
+    adapter
+        .create(<F::Model as ContractModel>::sample_new(&winner_email, now))
+        .await
+        .expect("winner row stores");
+    let winner_digest = format!("enc-reset-{winner_email}");
+    assert!(
+        !adapter
+            .column_value_unused("reset_password_token", &Value::from(winner_digest.as_str()))
+            .await
+            .expect("probe works"),
+        "the freshly created digest flips the probe to taken"
+    );
+}
+
+/// `ChangeSet` tristate (D-28): absent fields are skipped by a diff-scoped
+/// `update`, an explicit `Value::Null` writes `NULL` (devise token
+/// clearing), `update_columns` force-writes a named field even when
+/// unchanged without moving `updated_at` (devise #5783), naming
+/// `updated_at` writes it, and a named `NULL` clears the token column.
+///
+/// # Panics
+///
+/// Panics when any contract assertion fails; case fns are the assertion
+/// mechanism (see the crate docs).
+pub async fn changeset_tristate_case<F: ContractFactory>(factory: &F) {
+    let adapter = factory.adapter().await;
+    let now = sample_time();
+    let email = "tristate-tracer@example.test";
+    let created = adapter
+        .create(<F::Model as ContractModel>::sample_new(email, now))
+        .await
+        .expect("create stores the row");
+    let key = factory.key_of_created(&created);
+    let token_digest = created
+        .contract_reset_password_token()
+        .expect("sample sets a reset token")
+        .to_owned();
+
+    let rename = ChangeSet::new(
+        HashMap::from([
+            ("email".to_owned(), Value::from(email)),
+            (
+                "reset_password_token".to_owned(),
+                Value::from(token_digest.as_str()),
+            ),
+        ]),
+        HashMap::from([
+            (
+                "email".to_owned(),
+                Value::from("tristate-renamed@example.test"),
+            ),
+            (
+                "reset_password_token".to_owned(),
+                Value::from(token_digest.as_str()),
+            ),
+        ]),
+    );
+    let renamed = adapter.update(&key, &rename).await.expect("rename works");
+    assert_eq!(renamed.contract_email(), "tristate-renamed@example.test");
+    assert_eq!(
+        renamed.contract_reset_password_token(),
+        Some(token_digest.as_str()),
+        "an untouched column never enters the diff, so it is preserved"
+    );
+
+    let clearing = ChangeSet::new(
+        HashMap::from([(
+            "reset_password_token".to_owned(),
+            Value::from(token_digest.as_str()),
+        )]),
+        HashMap::from([("reset_password_token".to_owned(), Value::Null)]),
+    );
+    let cleared = adapter
+        .update(&key, &clearing)
+        .await
+        .expect("clearing works");
+    assert_eq!(cleared.contract_reset_password_token(), None);
+    let reread = adapter.get_strict(&key).await.expect("row exists");
+    assert_eq!(
+        reread.contract_reset_password_token(),
+        None,
+        "Value::Null through update SETs NULL (devise clearing)"
+    );
+
+    let before = adapter.get_strict(&key).await.expect("row exists");
+    let forced = adapter
+        .update_columns(
+            &key,
+            &HashMap::from([(
+                "email".to_owned(),
+                Value::from("tristate-renamed@example.test"),
+            )]),
+        )
+        .await
+        .expect("force-write works");
+    assert_eq!(forced.contract_email(), "tristate-renamed@example.test");
+    assert_eq!(
+        forced.contract_updated_at(),
+        before.contract_updated_at(),
+        "update_columns leaves updated_at alone unless named"
+    );
+
+    let stamped = adapter
+        .update_columns(
+            &key,
+            &HashMap::from([("updated_at".to_owned(), Value::from(later_time_iso()))]),
+        )
+        .await
+        .expect("naming updated_at writes it");
+    assert_eq!(stamped.contract_updated_at(), later_time());
+
+    let nulled = adapter
+        .update_columns(
+            &key,
+            &HashMap::from([("unlock_token".to_owned(), Value::Null)]),
+        )
+        .await
+        .expect("named NULL writes NULL");
+    assert_eq!(nulled.contract_unlock_token(), None);
+    let reread = adapter.get_strict(&key).await.expect("row exists");
+    assert_eq!(reread.contract_unlock_token(), None);
+}
+
+/// Atomic counters (D-28, D-11): two sequential `increment_counter` calls
+/// raise the stored counter by exactly 2, the two counter columns
+/// increment independently, an out-of-set column refuses with a
+/// value-free `OrmError::Query` naming the column without touching
+/// storage, and a missing key refuses with `NotFound`.
+///
+/// # Panics
+///
+/// Panics when any contract assertion fails; case fns are the assertion
+/// mechanism (see the crate docs).
+pub async fn counter_case<F: ContractFactory>(factory: &F) {
+    let adapter = factory.adapter().await;
+    let now = sample_time();
+    let created = adapter
+        .create(<F::Model as ContractModel>::sample_new(
+            "counter-tracer@example.test",
+            now,
+        ))
+        .await
+        .expect("create stores the row");
+    let key = factory.key_of_created(&created);
+    assert_eq!(created.contract_failed_attempts(), 0);
+    assert_eq!(created.contract_sign_in_count(), 0);
+
+    let bumped = adapter
+        .increment_counter(&key, "failed_attempts")
+        .await
+        .expect("first failed_attempts increment works");
+    assert_eq!(bumped.contract_failed_attempts(), 1);
+    let locked = adapter
+        .increment_counter(&key, "failed_attempts")
+        .await
+        .expect("second failed_attempts increment works");
+    assert_eq!(
+        locked.contract_failed_attempts(),
+        2,
+        "two increments raise the stored counter by exactly 2"
+    );
+    assert_eq!(
+        locked.contract_sign_in_count(),
+        0,
+        "counter columns increment independently"
+    );
+
+    let tracked = adapter
+        .increment_counter(&key, "sign_in_count")
+        .await
+        .expect("first sign_in_count increment works");
+    assert_eq!(tracked.contract_sign_in_count(), 1);
+    let revisits = adapter
+        .increment_counter(&key, "sign_in_count")
+        .await
+        .expect("second sign_in_count increment works");
+    assert_eq!(
+        revisits.contract_sign_in_count(),
+        2,
+        "two increments raise the stored counter by exactly 2"
+    );
+    assert_eq!(
+        revisits.contract_failed_attempts(),
+        2,
+        "counter columns increment independently"
+    );
+
+    let err = adapter
+        .increment_counter(&key, "locked_at")
+        .await
+        .unwrap_err();
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("locked_at"),
+        "the error must name the column: {rendered}"
+    );
+    assert!(
+        !rendered.contains('@'),
+        "the error must not leak record values: {rendered}"
+    );
+    assert!(
+        matches!(err, OrmError::Query { .. }),
+        "out-of-set column must yield OrmError::Query, got {rendered}"
+    );
+    let untouched = adapter.get_strict(&key).await.expect("row exists");
+    assert_eq!(
+        untouched.contract_failed_attempts(),
+        2,
+        "a rejected increment never reaches the database"
+    );
+
+    let missing = factory.missing_key();
+    assert!(
+        matches!(
+            adapter
+                .increment_counter(&missing, "failed_attempts")
+                .await
+                .unwrap_err(),
+            OrmError::NotFound
+        ),
+        "increment on a missing key must refuse with NotFound"
+    );
+}
+
+/// Salt-invalidation reads (D-28): rewriting `encrypted_password` through
+/// `update_columns` changes what a fresh read returns, so the session salt
+/// (`authenticatable_salt`, the digest prefix) changes and old sessions
+/// invalidate on password rotation.
+///
+/// # Panics
+///
+/// Panics when any contract assertion fails; case fns are the assertion
+/// mechanism (see the crate docs).
+pub async fn salt_invalidation_case<F: ContractFactory>(factory: &F) {
+    let adapter = factory.adapter().await;
+    let now = sample_time();
+    let created = adapter
+        .create(<F::Model as ContractModel>::sample_new(
+            "salt-tracer@example.test",
+            now,
+        ))
+        .await
+        .expect("create stores the row");
+    let key = factory.key_of_created(&created);
+    let old_digest = created.contract_encrypted_password().to_owned();
+
+    let rewritten = adapter
+        .update_columns(
+            &key,
+            &HashMap::from([(
+                "encrypted_password".to_owned(),
+                Value::from("bcrypt-rotated-digest"),
+            )]),
+        )
+        .await
+        .expect("password rewrite works");
+    assert_eq!(
+        rewritten.contract_encrypted_password(),
+        "bcrypt-rotated-digest"
+    );
+    let reread = adapter.get_strict(&key).await.expect("row exists");
+    assert_eq!(
+        reread.contract_encrypted_password(),
+        "bcrypt-rotated-digest",
+        "a fresh read observes the rotated digest"
+    );
+    assert_ne!(
+        reread.contract_encrypted_password(),
+        old_digest.as_str(),
+        "the salt source must change on password rotation"
+    );
+}
+
+/// Change-notification hook point (D-28): the model-layer notifications
+/// (`send_email_changed_notification`, `send_password_change_notification`)
+/// observe exactly the `email` and `encrypted_password` columns, so the
+/// adapter-level contract is that both trigger columns round-trip through
+/// `update_columns` and a fresh read observes them. The notification
+/// dispatch itself lives in the model modules, not the adapter.
+///
+/// # Panics
+///
+/// Panics when any contract assertion fails; case fns are the assertion
+/// mechanism (see the crate docs).
+pub async fn change_notification_case<F: ContractFactory>(factory: &F) {
+    let adapter = factory.adapter().await;
+    let now = sample_time();
+    let created = adapter
+        .create(<F::Model as ContractModel>::sample_new(
+            "notify-tracer@example.test",
+            now,
+        ))
+        .await
+        .expect("create stores the row");
+    let key = factory.key_of_created(&created);
+
+    let renamed = adapter
+        .update_columns(
+            &key,
+            &HashMap::from([("email".to_owned(), Value::from("notify-new@example.test"))]),
+        )
+        .await
+        .expect("email trigger column writes");
+    assert_eq!(renamed.contract_email(), "notify-new@example.test");
+
+    let reworded = adapter
+        .update_columns(
+            &key,
+            &HashMap::from([(
+                "encrypted_password".to_owned(),
+                Value::from("bcrypt-notified-digest"),
+            )]),
+        )
+        .await
+        .expect("password trigger column writes");
+    assert_eq!(
+        reworded.contract_encrypted_password(),
+        "bcrypt-notified-digest"
+    );
+
+    let reread = adapter.get_strict(&key).await.expect("row exists");
+    assert_eq!(reread.contract_email(), "notify-new@example.test");
+    assert_eq!(
+        reread.contract_encrypted_password(),
+        "bcrypt-notified-digest",
+        "a fresh read observes both notification trigger columns"
+    );
+}
+
 /// Runs every shared contract case against one leg's factory.
 ///
 /// # Panics
@@ -342,4 +812,10 @@ where
 /// entry point for backend integration tests (see the crate docs).
 pub async fn run_contract_suite<F: ContractFactory>(factory: &F) {
     crud_roundtrip_case(factory).await;
+    token_digest_case(factory).await;
+    uniqueness_retry_case(factory).await;
+    changeset_tristate_case(factory).await;
+    counter_case(factory).await;
+    salt_invalidation_case(factory).await;
+    change_notification_case(factory).await;
 }

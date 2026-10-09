@@ -1,8 +1,9 @@
 //! SQLite contract suite entry (D-27 retrofit): thin wrappers that run the
 //! shared `devise-rust-adapter-tests` cases against the sqlite rig for
 //! both PK shapes. The per-op step tests this file used to carry live in
-//! the shared crate now (D-24); only sqlite-specific edges stay here - the
-//! driver error mapping canary and the pool smoke test.
+//! the shared crate now (D-24); the fixture bridge (`ContractModel`) lives
+//! in `models.rs`, shared with the pg entry. Only sqlite-specific edges
+//! stay here - the driver error mapping canary and the pool smoke test.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -10,133 +11,12 @@ mod common;
 #[path = "models.rs"]
 mod models;
 
-use chrono::NaiveDateTime;
 use common::{SqliteConn, bootstrap_sqlite_memory, sample_time};
 use devise_rust::adapter::{DeviseKey, OrmAdapter, OrmError};
-use devise_rust_adapter_tests::{ContractFactory, ContractModel, run_contract_suite};
+use devise_rust_adapter_tests::{ContractFactory, run_contract_suite};
 use devise_rust_diesel::DieselOrmAdapter;
 use diesel::sqlite::Sqlite;
 use models::{FixtureUser, NewFixtureUser, UuidUser};
-
-impl ContractModel for FixtureUser {
-    type New = NewFixtureUser;
-
-    fn sample_new(email: &str, now: NaiveDateTime) -> Self::New {
-        NewFixtureUser::sample(email, now)
-    }
-
-    fn contract_email(&self) -> &str {
-        &self.email
-    }
-
-    fn contract_encrypted_password(&self) -> &str {
-        &self.encrypted_password
-    }
-
-    fn contract_reset_password_token(&self) -> Option<&str> {
-        self.reset_password_token.as_deref()
-    }
-
-    fn contract_reset_password_sent_at(&self) -> Option<NaiveDateTime> {
-        self.reset_password_sent_at
-    }
-
-    fn contract_confirmation_token(&self) -> Option<&str> {
-        self.confirmation_token.as_deref()
-    }
-
-    fn contract_confirmation_sent_at(&self) -> Option<NaiveDateTime> {
-        self.confirmation_sent_at
-    }
-
-    fn contract_unconfirmed_email(&self) -> Option<&str> {
-        self.unconfirmed_email.as_deref()
-    }
-
-    fn contract_failed_attempts(&self) -> i64 {
-        i64::from(self.failed_attempts)
-    }
-
-    fn contract_sign_in_count(&self) -> i64 {
-        i64::from(self.sign_in_count)
-    }
-
-    fn contract_unlock_token(&self) -> Option<&str> {
-        self.unlock_token.as_deref()
-    }
-
-    fn contract_locked_at(&self) -> Option<NaiveDateTime> {
-        self.locked_at
-    }
-
-    fn contract_created_at(&self) -> NaiveDateTime {
-        self.created_at
-    }
-
-    fn contract_updated_at(&self) -> NaiveDateTime {
-        self.updated_at
-    }
-}
-
-impl ContractModel for UuidUser {
-    type New = models::NewUuidUser;
-
-    fn sample_new(email: &str, now: NaiveDateTime) -> Self::New {
-        models::NewUuidUser::sample(email, now)
-    }
-
-    fn contract_email(&self) -> &str {
-        &self.email
-    }
-
-    fn contract_encrypted_password(&self) -> &str {
-        &self.encrypted_password
-    }
-
-    fn contract_reset_password_token(&self) -> Option<&str> {
-        self.reset_password_token.as_deref()
-    }
-
-    fn contract_reset_password_sent_at(&self) -> Option<NaiveDateTime> {
-        self.reset_password_sent_at
-    }
-
-    fn contract_confirmation_token(&self) -> Option<&str> {
-        self.confirmation_token.as_deref()
-    }
-
-    fn contract_confirmation_sent_at(&self) -> Option<NaiveDateTime> {
-        self.confirmation_sent_at
-    }
-
-    fn contract_unconfirmed_email(&self) -> Option<&str> {
-        self.unconfirmed_email.as_deref()
-    }
-
-    fn contract_failed_attempts(&self) -> i64 {
-        i64::from(self.failed_attempts)
-    }
-
-    fn contract_sign_in_count(&self) -> i64 {
-        i64::from(self.sign_in_count)
-    }
-
-    fn contract_unlock_token(&self) -> Option<&str> {
-        self.unlock_token.as_deref()
-    }
-
-    fn contract_locked_at(&self) -> Option<NaiveDateTime> {
-        self.locked_at
-    }
-
-    fn contract_created_at(&self) -> NaiveDateTime {
-        self.created_at
-    }
-
-    fn contract_updated_at(&self) -> NaiveDateTime {
-        self.updated_at
-    }
-}
 
 /// Shared-suite leg over the integer-PK `users` table: a fresh `:memory:`
 /// rig per case (pool-of-1, emitted DDL applied).

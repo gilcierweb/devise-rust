@@ -46,13 +46,26 @@ jobs:
         run: cargo test --all
 
   test-postgres:
-    name: Test Postgres (e2e)
+    name: Test Postgres (e2e, ${{ matrix.backend }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # D-32: one backend-by-database matrix job - the single place to
+        # read backend health. The sqlx and sea-orm legs activate when
+        # their crates land (06-03 / Phase 7); until then the presence
+        # guard skips the leg without masking diesel health.
+        backend: [diesel, sqlx, sea-orm]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run Postgres e2e tests
-        run: cargo test -p devise-rust-diesel --features e2e-pg
+      - name: Run ${{ matrix.backend }} Postgres e2e tests
+        run: |
+          if [ ! -d "crates/devise-rust-${{ matrix.backend }}" ]; then
+            echo "crates/devise-rust-${{ matrix.backend }} not present yet - skipping leg"
+            exit 0
+          fi
+          cargo test -p devise-rust-${{ matrix.backend }} --features e2e-pg
 
   test-msrv:
     name: Test MSRV (1.85)

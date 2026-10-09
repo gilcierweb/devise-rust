@@ -31,6 +31,11 @@ mod sqlite_common {
     pub type SqliteConn = SyncConnectionWrapper<SqliteConnection>;
 
     /// Live adapters over one freshly-migrated `:memory:` database.
+    ///
+    /// Constructed only by the sqlite contract entry; the pg entry compiles
+    /// this module too under feature unions (`--all-features`), where the
+    /// struct is legitimately unreferenced.
+    #[allow(dead_code)]
     pub struct SqliteRig {
         /// Adapter over the integer-PK `users` table.
         pub users: DieselOrmAdapter<FixtureUser, Sqlite, SqliteConn>,
@@ -45,6 +50,7 @@ mod sqlite_common {
     ///
     /// Panics when the pool cannot be built or the emitted DDL does not apply —
     /// both are rig bugs, never test-input failures.
+    #[allow(dead_code)]
     pub async fn bootstrap_sqlite_memory() -> SqliteRig {
         let pool: SqlitePool = sqlite_memory_pool().expect("in-memory pool builds");
 
@@ -75,7 +81,11 @@ mod sqlite_common {
     }
 }
 
+// The two re-export lines below serve DIFFERENT test targets (sqlite entry
+// vs e2e-pg entry); under a feature union each target sees the other's
+// re-export as unused, so the allow documents the cross-target sharing.
 #[cfg(feature = "sqlite")]
+#[allow(unused_imports)]
 pub use sqlite_common::{SqliteConn, bootstrap_sqlite_memory};
 
 /// Fixed sample timestamp (`2026-01-02 03:04:05`) for deterministic fixtures.
@@ -85,27 +95,18 @@ pub fn sample_time() -> chrono::NaiveDateTime {
         .expect("fixed sample time parses")
 }
 
-/// A second fixed timestamp, distinct from [`sample_time`].
-///
-/// Only the pg entry still consumes this: the sqlite entry moved onto the
-/// shared suite helpers with its D-27 retrofit, and the pg retrofit (same
-/// plan) follows; `allow(dead_code)` keeps the sqlite-only build warning
-/// free until then.
-#[allow(dead_code)]
-#[must_use]
-pub fn later_time() -> chrono::NaiveDateTime {
-    chrono::NaiveDateTime::parse_from_str("2026-06-07 08:09:10", "%Y-%m-%d %H:%M:%S")
-        .expect("fixed later time parses")
-}
-
 /// Postgres bootstrap for the `e2e-pg` feature: starts a testcontainers
 /// Postgres instance, applies the same full-module emitted pg DDL via
 /// `batch_execute`, and builds a deadpool pg pool.
 ///
-/// The container is held in a static `Arc<Mutex<Option<...>>>` so all tests in the
-/// suite share one container (Q3 resolution: default pool/container config,
-/// no recycling tuning). The pool is created fresh per bootstrap call but
-/// points to the shared container.
+/// The container is held in a static async `Mutex<Option<...>>` so all
+/// tests in the suite share one container (Q3 resolution: default
+/// pool/container config, no recycling tuning) while the guard may be
+/// held across the container-start await. The pool is created fresh per
+/// bootstrap call but points to the shared container. Items the sqlite
+/// entry does not reference carry `allow(dead_code)`: under a feature
+/// union each test target compiles this module, and the sqlite target
+/// legitimately never reaches for the pg rig.
 ///
 /// # Panics
 ///
@@ -120,35 +121,31 @@ pub mod pg {
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres;
 
-    use crate::models::FixtureUser;
+    use crate::models::{FixtureUser, UuidUser};
     use devise_rust_diesel::{DieselOrmAdapter, pool::PgPool};
     use devise_rust_migrations::{Dialect, EmitOptions, Flow, PkKind};
 
     /// Pooled async Postgres connection type behind [`DieselOrmAdapter`].
+    #[allow(dead_code)]
     pub type PgConn = AsyncPgConnection;
 
     /// Global container holder — one Postgres instance per test process.
-    type SharedContainer = std::sync::LazyLock<
-        std::sync::Arc<
-            std::sync::Mutex<Option<testcontainers::ContainerAsync<postgres::Postgres>>>,
-        >,
-    >;
-    static CONTAINER: SharedContainer =
-        std::sync::LazyLock::new(|| std::sync::Arc::new(std::sync::Mutex::new(None)));
+    static CONTAINER: std::sync::LazyLock<
+        tokio::sync::Mutex<Option<testcontainers::ContainerAsync<postgres::Postgres>>>,
+    > = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
 
     /// Gets the database URL, starting the container and applying DDL on first call.
     async fn get_database_url() -> String {
-        let mut guard = CONTAINER.lock().unwrap();
-        let container = match guard.as_mut() {
-            Some(c) => c,
-            None => {
-                let new_container = postgres::Postgres::default()
-                    .start()
-                    .await
-                    .expect("testcontainers Postgres starts");
-                *guard = Some(new_container);
-                guard.as_mut().unwrap()
-            }
+        let mut guard = CONTAINER.lock().await;
+        let container = if let Some(c) = guard.as_mut() {
+            c
+        } else {
+            let new_container = postgres::Postgres::default()
+                .start()
+                .await
+                .expect("testcontainers Postgres starts");
+            *guard = Some(new_container);
+            guard.as_mut().expect("container just stored")
         };
 
         // Apply DDL and pgcrypto extension on first initialization only
@@ -179,6 +176,31 @@ pub mod pg {
             conn.batch_execute(&files.up_sql)
                 .await
                 .expect("emitted pg DDL applies to testcontainers Postgres");
+
+            // The uuid_users fixture keeps the sqlite-compatible TEXT id
+            // column: diesel_async LoadQuery trait bounds keep native UUID
+            // columns from round-tripping through the TEXT-typed fixture
+            // model (see tests/models.rs). The substitution asserts loudly
+            // if the emitted id column ever changes shape.
+            let uuid_ddl = EmitOptions::new("uuid_users")
+                .with_all_modules()
+                .dialect(Dialect::Postgres)
+                .pk(PkKind::Uuid)
+                .flow(Flow::Create);
+
+            let uuid_files =
+                devise_rust_migrations::emit(&uuid_ddl).expect("fixture pg uuid DDL emits");
+            let text_id_ddl = uuid_files.up_sql.replace(
+                "id UUID PRIMARY KEY DEFAULT gen_random_uuid()",
+                "id TEXT PRIMARY KEY",
+            );
+            assert!(
+                text_id_ddl != uuid_files.up_sql,
+                "pg uuid fixture substitution missed: the emitted id column changed shape"
+            );
+            conn.batch_execute(&text_id_ddl)
+                .await
+                .expect("uuid fixture DDL applies to testcontainers Postgres");
             drop(conn);
         }
 
@@ -191,12 +213,17 @@ pub mod pg {
     }
 
     /// Tracks whether DDL has been applied to the shared container.
+    #[allow(dead_code)]
     static DDL_APPLIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// Live adapters over a testcontainers Postgres database with applied DDL.
+    #[allow(dead_code)]
     pub struct PgRig {
         /// Adapter over the integer-PK `users` table.
         pub users: DieselOrmAdapter<FixtureUser, Pg, PgConn>,
+        /// Adapter over the uuid-PK `uuid_users` table (id stored
+        /// hyphenated as TEXT on the pg fixture).
+        pub uuid_users: DieselOrmAdapter<UuidUser, Pg, PgConn>,
     }
 
     /// Builds a deadpool pg pool pointing at the shared testcontainers
@@ -205,6 +232,7 @@ pub mod pg {
     /// # Panics
     ///
     /// Panics when the pool cannot be built.
+    #[allow(dead_code)]
     pub async fn bootstrap_pg() -> PgRig {
         let database_url = get_database_url().await;
 
@@ -212,10 +240,12 @@ pub mod pg {
         let pool: PgPool = Pool::builder(manager).build().expect("pg pool builds");
 
         PgRig {
-            users: DieselOrmAdapter::new(pool),
+            users: DieselOrmAdapter::new(pool.clone()),
+            uuid_users: DieselOrmAdapter::new(pool),
         }
     }
 }
 
 #[cfg(feature = "e2e-pg")]
+#[allow(unused_imports)]
 pub use pg::{PgRig, bootstrap_pg};

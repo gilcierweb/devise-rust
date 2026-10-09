@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use chrono::NaiveDateTime;
 use devise_rust::adapter::{DeviseKey, OrmError, Value};
+use devise_rust_adapter_tests::ContractModel;
 use devise_rust_diesel::changeset::{
     nullable_datetime, nullable_string, required_datetime, required_i32, required_string,
 };
@@ -375,10 +376,7 @@ type FixtureUserIncrement = (
         >,
     >,
     Option<
-        diesel::dsl::Eq<
-            users::sign_in_count,
-            <users::sign_in_count as std::ops::Add<i32>>::Output,
-        >,
+        diesel::dsl::Eq<users::sign_in_count, <users::sign_in_count as std::ops::Add<i32>>::Output>,
     >,
 );
 
@@ -833,9 +831,7 @@ impl DieselPredicates<diesel::sqlite::Sqlite> for UuidUser {
 /// Postgres predicates for [`FixtureUser`]: native UUID + INET support.
 #[cfg(feature = "postgres")]
 impl DieselPredicates<diesel::pg::Pg> for FixtureUser {
-    fn pk_predicate(
-        key: &DeviseKey,
-    ) -> Result<BoxPred<Self::Table, diesel::pg::Pg>, OrmError> {
+    fn pk_predicate(key: &DeviseKey) -> Result<BoxPred<Self::Table, diesel::pg::Pg>, OrmError> {
         match key {
             DeviseKey::Integer(id) => Ok(Box::new(users::id.eq(*id).nullable())),
             DeviseKey::Uuid(_) => Err(OrmError::InvalidKey(
@@ -860,6 +856,175 @@ impl DieselPredicates<diesel::pg::Pg> for FixtureUser {
             "confirmation_token" => Some(Box::new(users::confirmation_token.eq(text.clone()))),
             "unlock_token" => Some(Box::new(users::unlock_token.eq(text.clone()))),
             "unconfirmed_email" => Some(Box::new(users::unconfirmed_email.eq(text.clone()))),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared contract-suite fixture bridge (D-24/D-27)
+// ---------------------------------------------------------------------------
+
+/// Backend-neutral accessors for the shared adapter contract suite: the
+/// identical generic cases run against this backend's rows and the
+/// `MemoryAdapter` oracle through this bridge (D-29).
+impl ContractModel for FixtureUser {
+    type New = NewFixtureUser;
+
+    fn sample_new(email: &str, now: NaiveDateTime) -> Self::New {
+        NewFixtureUser::sample(email, now)
+    }
+
+    fn contract_email(&self) -> &str {
+        &self.email
+    }
+
+    fn contract_encrypted_password(&self) -> &str {
+        &self.encrypted_password
+    }
+
+    fn contract_reset_password_token(&self) -> Option<&str> {
+        self.reset_password_token.as_deref()
+    }
+
+    fn contract_reset_password_sent_at(&self) -> Option<NaiveDateTime> {
+        self.reset_password_sent_at
+    }
+
+    fn contract_confirmation_token(&self) -> Option<&str> {
+        self.confirmation_token.as_deref()
+    }
+
+    fn contract_confirmation_sent_at(&self) -> Option<NaiveDateTime> {
+        self.confirmation_sent_at
+    }
+
+    fn contract_unconfirmed_email(&self) -> Option<&str> {
+        self.unconfirmed_email.as_deref()
+    }
+
+    fn contract_failed_attempts(&self) -> i64 {
+        i64::from(self.failed_attempts)
+    }
+
+    fn contract_sign_in_count(&self) -> i64 {
+        i64::from(self.sign_in_count)
+    }
+
+    fn contract_unlock_token(&self) -> Option<&str> {
+        self.unlock_token.as_deref()
+    }
+
+    fn contract_locked_at(&self) -> Option<NaiveDateTime> {
+        self.locked_at
+    }
+
+    fn contract_created_at(&self) -> NaiveDateTime {
+        self.created_at
+    }
+
+    fn contract_updated_at(&self) -> NaiveDateTime {
+        self.updated_at
+    }
+}
+
+/// Shared-suite bridge for the uuid-PK fixture row (see [`FixtureUser`]'s
+/// impl for the rationale).
+impl ContractModel for UuidUser {
+    type New = NewUuidUser;
+
+    fn sample_new(email: &str, now: NaiveDateTime) -> Self::New {
+        NewUuidUser::sample(email, now)
+    }
+
+    fn contract_email(&self) -> &str {
+        &self.email
+    }
+
+    fn contract_encrypted_password(&self) -> &str {
+        &self.encrypted_password
+    }
+
+    fn contract_reset_password_token(&self) -> Option<&str> {
+        self.reset_password_token.as_deref()
+    }
+
+    fn contract_reset_password_sent_at(&self) -> Option<NaiveDateTime> {
+        self.reset_password_sent_at
+    }
+
+    fn contract_confirmation_token(&self) -> Option<&str> {
+        self.confirmation_token.as_deref()
+    }
+
+    fn contract_confirmation_sent_at(&self) -> Option<NaiveDateTime> {
+        self.confirmation_sent_at
+    }
+
+    fn contract_unconfirmed_email(&self) -> Option<&str> {
+        self.unconfirmed_email.as_deref()
+    }
+
+    fn contract_failed_attempts(&self) -> i64 {
+        i64::from(self.failed_attempts)
+    }
+
+    fn contract_sign_in_count(&self) -> i64 {
+        i64::from(self.sign_in_count)
+    }
+
+    fn contract_unlock_token(&self) -> Option<&str> {
+        self.unlock_token.as_deref()
+    }
+
+    fn contract_locked_at(&self) -> Option<NaiveDateTime> {
+        self.locked_at
+    }
+
+    fn contract_created_at(&self) -> NaiveDateTime {
+        self.created_at
+    }
+
+    fn contract_updated_at(&self) -> NaiveDateTime {
+        self.updated_at
+    }
+}
+
+/// Postgres predicates for [`UuidUser`]: the pg `uuid_users` fixture stores
+/// the id hyphenated as TEXT (the `diesel_async` `LoadQuery` bound
+/// limitation documented in the rig bootstrap), so the pk binds the same
+/// hyphenated spelling as the sqlite leg; the finder set is identical.
+#[cfg(feature = "postgres")]
+impl DieselPredicates<diesel::pg::Pg> for UuidUser {
+    fn pk_predicate(key: &DeviseKey) -> Result<BoxPred<Self::Table, diesel::pg::Pg>, OrmError> {
+        match key {
+            DeviseKey::Uuid(id) => Ok(Box::new(
+                uuid_users::id.eq(id.hyphenated().to_string()).nullable(),
+            )),
+            DeviseKey::Integer(_) => Err(OrmError::InvalidKey(
+                "uuid_users.id is a uuid primary key".to_owned(),
+            )),
+        }
+    }
+
+    fn finder_predicate(
+        column: &str,
+        value: &Value,
+    ) -> Option<BoxPred<Self::Table, diesel::pg::Pg>> {
+        if !FINDER_COLUMNS.contains(&column) {
+            return None;
+        }
+        let Value::String(text) = value else {
+            return None;
+        };
+        match column {
+            "email" => Some(Box::new(uuid_users::email.eq(text.clone()).nullable())),
+            "reset_password_token" => {
+                Some(Box::new(uuid_users::reset_password_token.eq(text.clone())))
+            }
+            "confirmation_token" => Some(Box::new(uuid_users::confirmation_token.eq(text.clone()))),
+            "unlock_token" => Some(Box::new(uuid_users::unlock_token.eq(text.clone()))),
+            "unconfirmed_email" => Some(Box::new(uuid_users::unconfirmed_email.eq(text.clone()))),
             _ => None,
         }
     }
