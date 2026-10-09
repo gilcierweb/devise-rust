@@ -1,0 +1,76 @@
+[package]
+name = "devise-rust-sqlx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "sqlx ORM adapter for devise-rust"
+repository.workspace = true
+homepage.workspace = true
+# Only named test targets: `tests/models.rs` and `tests/common/mod.rs` are
+# shared support modules, never targets on their own (diesel precedent).
+autotests = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Per-dialect features mirror the diesel posture (D-14): each feature opts the
+# application into one sqlx driver plus this crate's adapter arm for it.
+postgres = ["sqlx/postgres"]
+# sqlx bundles its own libsqlite3-sys C sources (unconditional `bundled`
+# feature in sqlx-sqlite), so - unlike the diesel crate - no direct
+# libsqlite3-sys dependency is needed for a hermetic build.
+sqlite = ["sqlx/sqlite"]
+# Experimental (D-33): the mysql arm compiles behind this feature but has no
+# CI execution and no execution verification - the crate docs say so.
+mysql = ["sqlx/mysql"]
+# End-to-end Postgres testcontainers harness (CI's backend-by-database matrix
+# job runs `cargo test -p devise-rust-sqlx --features e2e-pg`). The pg rig
+# itself lands with the pg plan; until then the flag only widens the compiled
+# feature set so the CI command stays valid.
+e2e-pg = ["postgres"]
+
+[dependencies]
+devise-rust = { path = "../devise-rust", version = "0.1" }
+# Pinned EXACT per D-31/Pitfall 12: sqlx declares no rust-version, so a caret
+# `0.8` could silently resolve a future 0.8.7 with newer transitive deps that
+# break the 1.85 MSRV job. `macros` stays OFF - the `query!` family would leak
+# DATABASE_URL/.sqlx build requirements into downstream apps; this crate uses
+# runtime `query_as` + `QueryBuilder` only (D-01/D-14 house rule).
+sqlx = { version = "=0.8.6", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "chrono",
+    "uuid",
+    "derive",
+    "migrate",
+] }
+async-trait.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+# Only for `serde::de::Error::custom` in the tristate bridge (diesel changeset
+# precedent): writing `Value::Null` into a NOT NULL column surfaces as
+# `OrmError::Serialization`.
+serde.workspace = true
+serde_json.workspace = true
+# D-12: statement skeletons (`qb.sql()`, `?`/`$N` placeholders only) at debug
+# level; bound values never reach logs.
+log = "0.4"
+
+[dev-dependencies]
+tokio.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+# DDL bootstrap for the sqlite rig: the fixture schema is the DDL that
+# `devise-rust-migrations::emit()` generates, applied verbatim (D-08).
+devise-rust-migrations = { path = "../devise-rust-migrations" }
+# Shared contract suite (D-24): this crate's integration tests are thin
+# wrappers that run the shared cases against the sqlite rigs (D-26).
+devise-rust-adapter-tests = { path = "../devise-rust-adapter-tests" }
+
+[[test]]
+name = "adapter"
+path = "tests/adapter.rs"
+required-features = ["sqlite"]

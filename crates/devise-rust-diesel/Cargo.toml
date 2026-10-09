@@ -52,7 +52,11 @@ chrono.workspace = true
 # Hermetic SQLite engine: this environment (and possibly contributors')
 # ships only the sqlite runtime without linkable dev files, so the `sqlite`
 # feature builds from bundled C sources instead of `-lsqlite3`.
-libsqlite3-sys = { version = "0.35", features = ["bundled"], optional = true }
+# Pinned to the 0.30 line (not newer) because sqlx 0.8.6 requires
+# libsqlite3-sys ^0.30.1 and cargo allows only ONE `links = "sqlite3"`
+# package in the workspace graph - diesel 2.2.12 accepts <0.36.0, so 0.30.x
+# satisfies every consumer.
+libsqlite3-sys = { version = "0.30", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 # "sync" adds tokio::sync::Mutex: the pg leg serializes its tests against

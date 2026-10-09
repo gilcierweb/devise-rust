@@ -9,6 +9,7 @@ members = [
     "crates/devise-rust-axum",
     "crates/devise-rust-diesel",
     "crates/devise-rust-migrations",
+    "crates/devise-rust-sqlx",
 ]
 exclude = [".tmp"]
 
