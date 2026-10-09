@@ -76,7 +76,7 @@ mod sqlite_common {
 }
 
 #[cfg(feature = "sqlite")]
-pub use sqlite_common::{bootstrap_sqlite_memory, SqliteConn, SqliteRig};
+pub use sqlite_common::{SqliteConn, bootstrap_sqlite_memory};
 
 /// Fixed sample timestamp (`2026-01-02 03:04:05`) for deterministic fixtures.
 #[must_use]
@@ -86,6 +86,12 @@ pub fn sample_time() -> chrono::NaiveDateTime {
 }
 
 /// A second fixed timestamp, distinct from [`sample_time`].
+///
+/// Only the pg entry still consumes this: the sqlite entry moved onto the
+/// shared suite helpers with its D-27 retrofit, and the pg retrofit (same
+/// plan) follows; `allow(dead_code)` keeps the sqlite-only build warning
+/// free until then.
+#[allow(dead_code)]
 #[must_use]
 pub fn later_time() -> chrono::NaiveDateTime {
     chrono::NaiveDateTime::parse_from_str("2026-06-07 08:09:10", "%Y-%m-%d %H:%M:%S")
@@ -108,9 +114,9 @@ pub fn later_time() -> chrono::NaiveDateTime {
 #[cfg(feature = "e2e-pg")]
 pub mod pg {
     use diesel::pg::Pg;
-    use diesel_async::pooled_connection::{AsyncDieselConnectionManager, deadpool::Pool};
     use diesel_async::AsyncPgConnection;
     use diesel_async::SimpleAsyncConnection;
+    use diesel_async::pooled_connection::{AsyncDieselConnectionManager, deadpool::Pool};
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres;
 
@@ -122,8 +128,13 @@ pub mod pg {
     pub type PgConn = AsyncPgConnection;
 
     /// Global container holder — one Postgres instance per test process.
-    type SharedContainer = std::sync::LazyLock<std::sync::Arc<std::sync::Mutex<Option<testcontainers::ContainerAsync<postgres::Postgres>>>>>;
-    static CONTAINER: SharedContainer = std::sync::LazyLock::new(|| std::sync::Arc::new(std::sync::Mutex::new(None)));
+    type SharedContainer = std::sync::LazyLock<
+        std::sync::Arc<
+            std::sync::Mutex<Option<testcontainers::ContainerAsync<postgres::Postgres>>>,
+        >,
+    >;
+    static CONTAINER: SharedContainer =
+        std::sync::LazyLock::new(|| std::sync::Arc::new(std::sync::Mutex::new(None)));
 
     /// Gets the database URL, starting the container and applying DDL on first call.
     async fn get_database_url() -> String {
@@ -143,7 +154,10 @@ pub mod pg {
         // Apply DDL and pgcrypto extension on first initialization only
         if !DDL_APPLIED.swap(true, std::sync::atomic::Ordering::AcqRel) {
             let host = container.get_host().await.expect("container host");
-            let port = container.get_host_port_ipv4(5432).await.expect("container port");
+            let port = container
+                .get_host_port_ipv4(5432)
+                .await
+                .expect("container port");
             let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
             let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
@@ -169,7 +183,10 @@ pub mod pg {
         }
 
         let host = container.get_host().await.expect("container host");
-        let port = container.get_host_port_ipv4(5432).await.expect("container port");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("container port");
         format!("postgres://postgres:postgres@{host}:{port}/postgres")
     }
 
@@ -201,4 +218,4 @@ pub mod pg {
 }
 
 #[cfg(feature = "e2e-pg")]
-pub use pg::{bootstrap_pg, PgRig};
+pub use pg::{PgRig, bootstrap_pg};

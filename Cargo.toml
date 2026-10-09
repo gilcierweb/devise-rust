@@ -4,9 +4,10 @@
 resolver = "3"
 members = [
     "crates/devise-rust",
-    "crates/devise-rust-diesel",
     "crates/devise-rust-actix",
+    "crates/devise-rust-adapter-tests",
     "crates/devise-rust-axum",
+    "crates/devise-rust-diesel",
     "crates/devise-rust-migrations",
 ]
 exclude = [".tmp"]

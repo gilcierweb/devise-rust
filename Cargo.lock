@@ -657,6 +657,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "devise-rust-adapter-tests"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "devise-rust",
+ "rstest",
+ "serde",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "devise-rust-axum"
 version = "0.1.0"
 dependencies = [
@@ -670,6 +682,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "devise-rust",
+ "devise-rust-adapter-tests",
  "devise-rust-migrations",
  "diesel",
  "diesel-async",

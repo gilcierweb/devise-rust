@@ -1,0 +1,31 @@
+[package]
+name = "devise-rust-adapter-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared data-parameterized OrmAdapter contract suite for devise-rust backends"
+repository.workspace = true
+homepage.workspace = true
+# Only named test targets: the MemoryAdapter oracle leg lives here; backend
+# crates run the shared library cases from their own integration tests
+# against their rigs (D-24).
+autotests = false
+
+[lints]
+workspace = true
+
+[dependencies]
+devise-rust = { path = "../devise-rust", version = "0.1" }
+chrono.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+rstest.workspace = true
+serde.workspace = true
+uuid.workspace = true
+
+[[test]]
+name = "oracle"
+path = "tests/oracle.rs"
