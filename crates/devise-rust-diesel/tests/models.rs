@@ -363,10 +363,30 @@ fn fill_fixture_changeset(
     Ok(out)
 }
 
+/// `SET column = column + 1` assignment tuple for [`FixtureUser`] (D-11):
+/// one `Option` slot per counter column - only the named column's slot is
+/// filled; `None` slots are skipped by the changeset, so the single tuple
+/// type serves both counters.
+type FixtureUserIncrement = (
+    Option<
+        diesel::dsl::Eq<
+            users::failed_attempts,
+            <users::failed_attempts as std::ops::Add<i32>>::Output,
+        >,
+    >,
+    Option<
+        diesel::dsl::Eq<
+            users::sign_in_count,
+            <users::sign_in_count as std::ops::Add<i32>>::Output,
+        >,
+    >,
+);
+
 impl DieselModel for FixtureUser {
     type Table = users::table;
     type New = NewFixtureUser;
     type Changeset = FixtureUserChangeset;
+    type IncrementChangeset = FixtureUserIncrement;
 
     fn table() -> Self::Table {
         users::table
@@ -378,6 +398,23 @@ impl DieselModel for FixtureUser {
 
     fn changeset_from_map(fields: &HashMap<String, Value>) -> Result<Self::Changeset, OrmError> {
         fill_fixture_changeset(fields)
+    }
+
+    fn increment_changeset(column: &'static str) -> Result<Self::IncrementChangeset, OrmError> {
+        match column {
+            "failed_attempts" => Ok((
+                Some(users::failed_attempts.eq(users::failed_attempts + 1)),
+                None,
+            )),
+            "sign_in_count" => Ok((
+                None,
+                Some(users::sign_in_count.eq(users::sign_in_count + 1)),
+            )),
+            other => Err(OrmError::Query {
+                message: format!("unsupported counter column: {other}"),
+                source: None,
+            }),
+        }
     }
 }
 
@@ -690,10 +727,28 @@ fn fill_uuid_changeset(fields: &HashMap<String, Value>) -> Result<UuidUserChange
     Ok(out)
 }
 
+/// `SET column = column + 1` assignment tuple for [`UuidUser`] (D-11):
+/// same shape as [`FixtureUserIncrement`] over the `uuid_users` columns.
+type UuidUserIncrement = (
+    Option<
+        diesel::dsl::Eq<
+            uuid_users::failed_attempts,
+            <uuid_users::failed_attempts as std::ops::Add<i32>>::Output,
+        >,
+    >,
+    Option<
+        diesel::dsl::Eq<
+            uuid_users::sign_in_count,
+            <uuid_users::sign_in_count as std::ops::Add<i32>>::Output,
+        >,
+    >,
+);
+
 impl DieselModel for UuidUser {
     type Table = uuid_users::table;
     type New = NewUuidUser;
     type Changeset = UuidUserChangeset;
+    type IncrementChangeset = UuidUserIncrement;
 
     fn table() -> Self::Table {
         uuid_users::table
@@ -713,6 +768,23 @@ impl DieselModel for UuidUser {
 
     fn changeset_from_map(fields: &HashMap<String, Value>) -> Result<Self::Changeset, OrmError> {
         fill_uuid_changeset(fields)
+    }
+
+    fn increment_changeset(column: &'static str) -> Result<Self::IncrementChangeset, OrmError> {
+        match column {
+            "failed_attempts" => Ok((
+                Some(uuid_users::failed_attempts.eq(uuid_users::failed_attempts + 1)),
+                None,
+            )),
+            "sign_in_count" => Ok((
+                None,
+                Some(uuid_users::sign_in_count.eq(uuid_users::sign_in_count + 1)),
+            )),
+            other => Err(OrmError::Query {
+                message: format!("unsupported counter column: {other}"),
+                source: None,
+            }),
+        }
     }
 }
 

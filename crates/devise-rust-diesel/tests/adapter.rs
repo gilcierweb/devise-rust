@@ -273,6 +273,42 @@ async fn sqlite_full_op_roundtrip() {
     uniqueness_and_delete_steps(&rig, &key).await;
 }
 
+/// D-11 tracer slice: two sequential `increment_counter` calls raise the
+/// stored `failed_attempts` by exactly 2 on the live sqlite adapter - the
+/// single-statement `SET col = col + 1` plus re-read, end to end.
+#[tokio::test]
+async fn sqlite_counter_two_increments_raise_by_exactly_two() {
+    let rig = bootstrap_sqlite_memory().await;
+    let now = sample_time();
+    let created: FixtureUser = rig
+        .users
+        .create(NewFixtureUser::sample("counter@example.com", now))
+        .await
+        .expect("create stores the row");
+    assert_eq!(created.failed_attempts, 0);
+    let key = DeviseKey::from_i64(created.id);
+
+    let first = rig
+        .users
+        .increment_counter(&key, "failed_attempts")
+        .await
+        .expect("first increment works");
+    assert_eq!(first.failed_attempts, 1);
+    let second = rig
+        .users
+        .increment_counter(&key, "failed_attempts")
+        .await
+        .expect("second increment works");
+    assert_eq!(
+        second.failed_attempts, 2,
+        "two sequential increments raise the stored value by exactly 2"
+    );
+
+    // The returned row is the stored row (Devise's increment + reload).
+    let reread = rig.users.get(&key).await.expect("get works");
+    assert_eq!(reread.expect("row exists").failed_attempts, 2);
+}
+
 #[tokio::test]
 async fn test_pool_basic() {
     use devise_rust_diesel::pool::sqlite_memory_pool;

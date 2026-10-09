@@ -354,6 +354,15 @@ mod tests {
             self.inner.update_columns(key, fields).await
         }
 
+        async fn increment_counter(
+            &self,
+            key: &crate::adapter::DeviseKey,
+            column: &'static str,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.increment_counter(key, column).await
+        }
+
         async fn delete(
             &self,
             id: &crate::adapter::DeviseKey,
@@ -977,6 +986,15 @@ mod security_regression {
         ) -> Result<SweepUser, crate::adapter::OrmError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.inner.update_columns(key, fields).await
+        }
+
+        async fn increment_counter(
+            &self,
+            key: &crate::adapter::DeviseKey,
+            column: &'static str,
+        ) -> Result<SweepUser, crate::adapter::OrmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.increment_counter(key, column).await
         }
 
         async fn delete(

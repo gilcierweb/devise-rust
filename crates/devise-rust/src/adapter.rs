@@ -324,6 +324,31 @@ impl ChangeSet {
     }
 }
 
+/// The only columns [`OrmAdapter::increment_counter`] accepts (D-11):
+/// Devise's two counters - lockable's `failed_attempts` and trackable's
+/// `sign_in_count`.
+pub const COUNTER_COLUMNS: &[&str] = &["failed_attempts", "sign_in_count"];
+
+/// Validates a counter column name against [`COUNTER_COLUMNS`] before any
+/// backend SQL exists (D-11): the adapter layer and every backend share this
+/// one allowlist, so the out-of-set rejection is identical everywhere.
+///
+/// # Errors
+///
+/// Returns [`OrmError::Query`] naming `column` when it is not one of
+/// [`COUNTER_COLUMNS`] - the same clear-contract shape as an out-of-set
+/// finder column.
+pub fn validate_counter_column(column: &str) -> Result<(), OrmError> {
+    if COUNTER_COLUMNS.contains(&column) {
+        Ok(())
+    } else {
+        Err(OrmError::Query {
+            message: format!("unsupported counter column: {column}"),
+            source: None,
+        })
+    }
+}
+
 /// Core persistence contract - every backend implements this.
 ///
 /// Mirrors the `orm_adapter` gem surface Devise programs against
@@ -493,6 +518,60 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
         fields: &HashMap<String, Value>,
     ) -> Result<M, OrmError>;
 
+    /// Atomically increments one counter column by one and returns the
+    /// updated row - Devise's `increment_counter(:failed_attempts, id)`
+    /// plus reload (D-11): lockable's `failed_attempts` and trackable's
+    /// `sign_in_count` must never ride a read-modify-write
+    /// [`ChangeSet`](OrmAdapter::update), whose last-write-wins semantics
+    /// lose counts under concurrent sign-ins. Backends render one
+    /// `SET column = column + 1` statement and re-read; the oracle performs
+    /// the read-modify-write under a single store lock.
+    ///
+    /// # Options
+    ///
+    /// * `column` - one of [`COUNTER_COLUMNS`] (`"failed_attempts"`,
+    ///   `"sign_in_count"`); any other name is rejected with
+    ///   [`OrmError::Query`] naming the column, before any SQL exists -
+    ///   the same curated-allowlist contract as the finder columns.
+    /// * `key` - the record's primary key.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use devise_rust::adapter::{DeviseKey, OrmAdapter, memory::MemoryAdapter};
+    ///
+    /// #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    /// struct Widget { id: i64, failed_attempts: i64 }
+    ///
+    /// let rt = tokio::runtime::Builder::new_current_thread()
+    ///     .build()
+    ///     .expect("test runtime builds");
+    /// rt.block_on(async {
+    ///     let adapter = MemoryAdapter::<Widget>::new();
+    ///     adapter.create(Widget { id: 0, failed_attempts: 0 }).await.expect("create works");
+    ///     let bumped = adapter
+    ///         .increment_counter(&DeviseKey::from_i64(1), "failed_attempts")
+    ///         .await
+    ///         .expect("increment works");
+    ///     assert_eq!(bumped.failed_attempts, 1);
+    ///     // Out-of-set counter columns fail before any storage is touched.
+    ///     let rendered = adapter
+    ///         .increment_counter(&DeviseKey::from_i64(1), "locked_at")
+    ///         .await
+    ///         .unwrap_err()
+    ///         .to_string();
+    ///     assert!(rendered.contains("locked_at"));
+    /// });
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrmError::Query`] when `column` is not a counter column,
+    /// [`OrmError::NotFound`] when `key` matches nothing; backend failures
+    /// propagate unchanged.
+    async fn increment_counter(&self, key: &DeviseKey, column: &'static str)
+    -> Result<M, OrmError>;
+
     /// Reports whether `column = value` matches no record (D-13) - the
     /// uniqueness probe behind `crypto::token_generator::generate_with`'s
     /// `is_unique` loop (PLAT-06). Default method composed from
@@ -545,6 +624,7 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
 pub mod memory {
     use super::{
         ChangeSet, Conditions, DeviseKey, HashMap, OrmAdapter, OrmError, Value, async_trait,
+        validate_counter_column,
     };
     use serde::Serialize;
     use serde::de::DeserializeOwned;
@@ -581,6 +661,40 @@ pub mod memory {
     where
         M: Clone + Serialize + DeserializeOwned,
     {
+        /// Locks the store, materializes the record under `key` as a JSON
+        /// object, applies `mutate`, and stores the result back - the
+        /// shared read-modify-write core of every write op, so each op runs
+        /// under one atomic lock scope.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`OrmError::NotFound`] when `key` matches nothing, or
+        /// [`OrmError::Serialization`] when the model does not round-trip
+        /// through a JSON object.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the storage lock is poisoned (a prior holder panicked
+        /// while holding it - unrecoverable by design in this test oracle).
+        fn mutate_record(
+            &self,
+            key: &DeviseKey,
+            mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<(), OrmError>,
+        ) -> Result<M, OrmError> {
+            let mut storage = self.storage.write().unwrap();
+            let stored = storage.get(key).cloned().ok_or(OrmError::NotFound)?;
+            let mut json = serde_json::to_value(&stored)?;
+            let record = json.as_object_mut().ok_or_else(|| {
+                <serde_json::Error as serde::de::Error>::custom(
+                    "memory adapter models must serialize to a JSON object",
+                )
+            })?;
+            mutate(record)?;
+            let merged: M = serde_json::from_value(json)?;
+            storage.insert(key.clone(), merged.clone());
+            Ok(merged)
+        }
+
         /// Merge `fields` into the record stored under `key` through a
         /// `serde_json` round-trip and return the merged record.
         ///
@@ -599,20 +713,12 @@ pub mod memory {
             key: &DeviseKey,
             fields: &HashMap<String, Value>,
         ) -> Result<M, OrmError> {
-            let mut storage = self.storage.write().unwrap();
-            let stored = storage.get(key).cloned().ok_or(OrmError::NotFound)?;
-            let mut json = serde_json::to_value(&stored)?;
-            let record = json.as_object_mut().ok_or_else(|| {
-                <serde_json::Error as serde::de::Error>::custom(
-                    "memory adapter models must serialize to a JSON object",
-                )
-            })?;
-            for (field, value) in fields {
-                record.insert(field.clone(), serde_json::to_value(value)?);
-            }
-            let merged: M = serde_json::from_value(json)?;
-            storage.insert(key.clone(), merged.clone());
-            Ok(merged)
+            self.mutate_record(key, |record| {
+                for (field, value) in fields {
+                    record.insert(field.clone(), serde_json::to_value(value)?);
+                }
+                Ok(())
+            })
         }
     }
 
@@ -635,6 +741,30 @@ pub mod memory {
             }
         }
         Ok(true)
+    }
+
+    /// Reads a counter column's current value for
+    /// [`increment_counter`](OrmAdapter::increment_counter): a missing or
+    /// null column counts from zero (Devise columns are `NOT NULL DEFAULT
+    /// 0`); anything but an integer refuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrmError::Query`] naming `column` when it does not hold
+    /// an integer.
+    fn counter_value(
+        record: &serde_json::Map<String, serde_json::Value>,
+        column: &'static str,
+    ) -> Result<i64, OrmError> {
+        let not_integer = || OrmError::Query {
+            message: format!("counter column {column} does not hold an integer"),
+            source: None,
+        };
+        match record.get(column) {
+            None | Some(serde_json::Value::Null) => Ok(0),
+            Some(serde_json::Value::Number(number)) => number.as_i64().ok_or_else(not_integer),
+            Some(_) => Err(not_integer()),
+        }
     }
 
     #[async_trait]
@@ -682,6 +812,21 @@ pub mod memory {
             fields: &HashMap<String, Value>,
         ) -> Result<M, OrmError> {
             self.apply_fields(key, fields)
+        }
+
+        async fn increment_counter(
+            &self,
+            key: &DeviseKey,
+            column: &'static str,
+        ) -> Result<M, OrmError> {
+            validate_counter_column(column)?;
+            // Read-modify-write inside ONE write-lock scope: the in-memory
+            // analogue of the backends' single SET column = column + 1.
+            self.mutate_record(key, |record| {
+                let current = counter_value(record, column)?;
+                record.insert(column.to_owned(), serde_json::Value::from(current + 1));
+                Ok(())
+            })
         }
 
         async fn delete(&self, id: &DeviseKey) -> Result<(), OrmError> {
@@ -934,6 +1079,128 @@ mod tests {
         // `delete`, then `get` → `None`.
         adapter.delete(&DeviseKey::from_i64(1)).await.unwrap();
         assert_eq!(adapter.get(&DeviseKey::from_i64(1)).await.unwrap(), None);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct CountedUser {
+        id: i64,
+        failed_attempts: i64,
+        sign_in_count: i64,
+    }
+
+    #[tokio::test]
+    async fn test_memory_adapter_increment_counter_two_increments_raise_by_two() {
+        use crate::adapter::memory::MemoryAdapter;
+
+        let adapter = MemoryAdapter::<CountedUser>::new();
+        adapter
+            .create(CountedUser {
+                id: 0,
+                failed_attempts: 0,
+                sign_in_count: 0,
+            })
+            .await
+            .unwrap();
+
+        let first = adapter
+            .increment_counter(&DeviseKey::from_i64(1), "failed_attempts")
+            .await
+            .unwrap();
+        assert_eq!(first.failed_attempts, 1);
+        let second = adapter
+            .increment_counter(&DeviseKey::from_i64(1), "failed_attempts")
+            .await
+            .unwrap();
+        assert_eq!(
+            second.failed_attempts, 2,
+            "two sequential increments raise the stored value by exactly 2"
+        );
+
+        // The returned row is the stored row (Devise's increment + reload).
+        let reread = adapter.get(&DeviseKey::from_i64(1)).await.unwrap();
+        assert_eq!(reread, Some(second));
+    }
+
+    #[tokio::test]
+    async fn test_memory_adapter_increment_counter_columns_are_independent() {
+        use crate::adapter::memory::MemoryAdapter;
+
+        let adapter = MemoryAdapter::<CountedUser>::new();
+        adapter
+            .create(CountedUser {
+                id: 0,
+                failed_attempts: 0,
+                sign_in_count: 0,
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            adapter
+                .increment_counter(&DeviseKey::from_i64(1), "failed_attempts")
+                .await
+                .unwrap();
+        }
+        let tracked = adapter
+            .increment_counter(&DeviseKey::from_i64(1), "sign_in_count")
+            .await
+            .unwrap();
+        assert_eq!(tracked.failed_attempts, 2);
+        assert_eq!(
+            tracked.sign_in_count, 1,
+            "each counter column increments independently"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_adapter_increment_counter_rejects_out_of_set_column_and_missing_key() {
+        use crate::adapter::memory::MemoryAdapter;
+
+        let adapter = MemoryAdapter::<CountedUser>::new();
+        adapter
+            .create(CountedUser {
+                id: 0,
+                failed_attempts: 0,
+                sign_in_count: 0,
+            })
+            .await
+            .unwrap();
+
+        // Out-of-set column names are rejected before any storage is touched.
+        let err = adapter
+            .increment_counter(&DeviseKey::from_i64(1), "locked_at")
+            .await
+            .unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("locked_at"),
+            "the error must name the column: {rendered}"
+        );
+        assert!(
+            !rendered.contains('@'),
+            "the error must not leak record values: {rendered}"
+        );
+        assert!(
+            matches!(err, OrmError::Query { .. }),
+            "out-of-set column must yield OrmError::Query, got {rendered}"
+        );
+        let untouched = adapter.get(&DeviseKey::from_i64(1)).await.unwrap().unwrap();
+        assert_eq!(
+            untouched.failed_attempts, 0,
+            "a rejected increment never touches storage"
+        );
+
+        // Missing keys refuse with NotFound, never a silent zero.
+        assert!(
+            matches!(
+                adapter
+                    .increment_counter(&DeviseKey::from_i64(999), "failed_attempts")
+                    .await
+                    .unwrap_err(),
+                OrmError::NotFound
+            ),
+            "increment on a missing key must refuse with NotFound"
+        );
     }
 
     #[test]

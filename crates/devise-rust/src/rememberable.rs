@@ -1049,6 +1049,16 @@ mod tests {
             self.inner.update_columns(key, fields).await
         }
 
+        async fn increment_counter(
+            &self,
+            key: &DeviseKey,
+            column: &'static str,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.increment_counter(key, column).await
+        }
+
         async fn delete(&self, id: &DeviseKey) -> Result<(), crate::adapter::OrmError> {
             self.inner.delete(id).await
         }

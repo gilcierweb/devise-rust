@@ -11,7 +11,7 @@
 //! - `crypto` - `Encryptor` (bcrypt), `TokenGenerator` (HMAC-SHA256), `secure_compare`
 //! - `i18n` - Embedded Devise I18n catalog with key-based lookup
 //! - `parameter` - `ParameterFilter` and `ParameterSanitizer`
-//! - `adapter` - `OrmAdapter` trait (`get`/`find_first`/`create`+`insert` alias/`update`/`update_columns`/`delete` + defaults), `OrmError`, `Conditions`, `ChangeSet`, `DeviseKey`, in-memory adapter
+//! - `adapter` - `OrmAdapter` trait (`get`/`find_first`/`create`+`insert` alias/`update`/`update_columns`/`increment_counter`/`delete` + defaults), `OrmError`, `Conditions`, `ChangeSet`, `DeviseKey`, in-memory adapter
 //! - `time` - `Clock` trait for time abstraction
 //! - `error` - `DeviseError`, `ValidationErrors`, `ResourceWithErrors`, `BlankRecord`
 //! - `failure` - `Failure` enum, `AuthOutcome`, `AnyDeviseModel` trait

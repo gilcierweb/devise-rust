@@ -45,6 +45,10 @@
 //!   `ActiveRecord::Persistence#update_columns` parity: no validations, no
 //!   callbacks, `updated_at` untouched unless named — which is also what
 //!   carries an unchanged-value force-write (devise #5783).
+//! * `increment_counter` renders one atomic `SET column = column + 1`
+//!   statement through the [`BackendWrites`] seam and re-reads on the same
+//!   connection (D-11): counters never ride a value-typed changeset path,
+//!   whose last-write-wins semantics lose counts under concurrent sign-ins.
 //!
 //! [`OrmAdapter`]: devise_rust::adapter::OrmAdapter
 
@@ -53,7 +57,9 @@ use std::marker::PhantomData;
 use std::ops::DerefMut;
 
 use async_trait::async_trait;
-use devise_rust::adapter::{ChangeSet, Conditions, DeviseKey, OrmAdapter, OrmError, Value};
+use devise_rust::adapter::{
+    ChangeSet, Conditions, DeviseKey, OrmAdapter, OrmError, Value, validate_counter_column,
+};
 use diesel::associations::HasTable;
 use diesel::deserialize::FromSqlRow;
 use diesel::expression::is_aggregate::No;
@@ -137,6 +143,17 @@ pub trait BackendWrites<M: DieselModel, Conn>: Send + Sync {
     ) -> Result<(), OrmError>;
     /// Executes one primary-key `DELETE` (missing rows are a no-op).
     async fn delete_row(conn: &mut Conn, table: M::Table, key: &DeviseKey) -> Result<(), OrmError>;
+    /// Executes one atomic `UPDATE ... SET column = column + 1 WHERE pk`
+    /// for the named counter column (D-11): one statement, no
+    /// read-modify-write. `column` has already passed the core counter
+    /// allowlist and the assignment expression comes from the model glue -
+    /// never user input.
+    async fn increment_field(
+        conn: &mut Conn,
+        table: M::Table,
+        key: &DeviseKey,
+        column: &'static str,
+    ) -> Result<(), OrmError>;
 }
 
 /// Postgres write arm (`RETURNING` for create; `execute` for the rest).
@@ -151,6 +168,8 @@ where
     M::Table: QueryId,
     M::Changeset: AsChangeset<Target = M::Table>,
     <M::Changeset as AsChangeset>::Changeset: Send + QueryFragment<diesel::pg::Pg>,
+    M::IncrementChangeset: AsChangeset<Target = M::Table>,
+    <M::IncrementChangeset as AsChangeset>::Changeset: Send + QueryFragment<diesel::pg::Pg>,
     <M::Table as QuerySource>::FromClause: Send + QueryFragment<diesel::pg::Pg>,
     M::Table: FilterDsl<BoxPred<M::Table, diesel::pg::Pg>>,
     <M::Table as FilterDsl<BoxPred<M::Table, diesel::pg::Pg>>>::Output:
@@ -205,6 +224,22 @@ where
             .map_err(map_diesel_error)?;
         Ok(())
     }
+
+    async fn increment_field(
+        conn: &mut Conn,
+        table: M::Table,
+        key: &DeviseKey,
+        column: &'static str,
+    ) -> Result<(), OrmError> {
+        let pk = M::pk_predicate(key)?;
+        let changeset = M::increment_changeset(column)?;
+        update(FilterDsl::filter(table, pk))
+            .set(changeset)
+            .execute(conn)
+            .await
+            .map_err(map_diesel_error)?;
+        Ok(())
+    }
 }
 
 /// SQLite write arm (`RETURNING` via `returning_clauses_for_sqlite_3_35`).
@@ -219,6 +254,8 @@ where
     M::Table: QueryId,
     M::Changeset: AsChangeset<Target = M::Table>,
     <M::Changeset as AsChangeset>::Changeset: Send + QueryFragment<diesel::sqlite::Sqlite>,
+    M::IncrementChangeset: AsChangeset<Target = M::Table>,
+    <M::IncrementChangeset as AsChangeset>::Changeset: Send + QueryFragment<diesel::sqlite::Sqlite>,
     <M::Table as QuerySource>::FromClause: Send + QueryFragment<diesel::sqlite::Sqlite>,
     M::Table: FilterDsl<BoxPred<M::Table, diesel::sqlite::Sqlite>>,
     <M::Table as FilterDsl<BoxPred<M::Table, diesel::sqlite::Sqlite>>>::Output:
@@ -268,6 +305,22 @@ where
     ) -> Result<(), OrmError> {
         let pk = M::pk_predicate(key)?;
         delete(FilterDsl::filter(table, pk))
+            .execute(conn)
+            .await
+            .map_err(map_diesel_error)?;
+        Ok(())
+    }
+
+    async fn increment_field(
+        conn: &mut Conn,
+        table: M::Table,
+        key: &DeviseKey,
+        column: &'static str,
+    ) -> Result<(), OrmError> {
+        let pk = M::pk_predicate(key)?;
+        let changeset = M::increment_changeset(column)?;
+        update(FilterDsl::filter(table, pk))
+            .set(changeset)
             .execute(conn)
             .await
             .map_err(map_diesel_error)?;
@@ -366,6 +419,22 @@ where
         fields: &HashMap<String, Value>,
     ) -> Result<M, OrmError> {
         self.write_map(key, fields).await
+    }
+
+    async fn increment_counter(
+        &self,
+        key: &DeviseKey,
+        column: &'static str,
+    ) -> Result<M, OrmError> {
+        validate_counter_column(column)?;
+        let mut guard = self.pooled().await?;
+        let conn: &mut Conn = &mut guard;
+        DB::increment_field(conn, M::table(), key, column).await?;
+        // Re-read using the SAME connection to avoid deadlock with pool size = 1
+        // (mirrors write_map); a miss reports NotFound, never a silent zero.
+        let filtered: Filt<M, DB> = FilterDsl::filter(M::table(), M::pk_predicate(key)?);
+        let rows: Vec<M> = filtered.load(conn).await.map_err(map_diesel_error)?;
+        rows.into_iter().next().ok_or(OrmError::NotFound)
     }
 
     async fn delete(&self, id: &DeviseKey) -> Result<(), OrmError> {

@@ -68,6 +68,12 @@
 //!         // Hand-rolled per-field fill via `crate::changeset` extractors.
 //!         # Err::<UserChangeset, _>(OrmError::NotFound)
 //!     }
+//!
+//!     fn increment_changeset(column: &'static str) -> Result<Self::IncrementChangeset, OrmError> {
+//!         // `SET column = column + 1` in the named slot, e.g.
+//!         // `users::failed_attempts.eq(users::failed_attempts + 1)`.
+//!         # Err::<_, _>(OrmError::NotFound)
+//!     }
 //! }
 //! ```
 
@@ -105,6 +111,20 @@ pub trait DieselModel: Send + Sync + Sized + 'static {
     /// The `AsChangeset` struct carrying the tristate write legs (D-05):
     /// NULL-capable columns as `Option<Option<T>>`, the rest as `Option<T>`.
     type Changeset: Send + Sync + 'static;
+    /// The `AsChangeset` tuple carrying one `SET column = column + 1`
+    /// assignment for
+    /// [`increment_changeset`](DieselModel::increment_changeset) (D-11):
+    /// one `Option` slot per counter column, with only the named column's
+    /// slot filled - `None` slots are skipped by the changeset, so the
+    /// single tuple type serves both counters.
+    ///
+    /// A value-typed changeset like [`Changeset`](DieselModel::Changeset)
+    /// cannot express the assignment (its fields carry values, but
+    /// `column = column + 1` needs a diesel expression on the right-hand
+    /// side), hence the dedicated type: typically
+    /// `(Option<Eq<col, <col as std::ops::Add<i32>>::Output>>, ...)` per
+    /// counter column.
+    type IncrementChangeset: Send + Sync + 'static;
 
     /// The table value for query roots (`users::table`).
     fn table() -> Self::Table;
@@ -125,6 +145,20 @@ pub trait DieselModel: Send + Sync + Sized + 'static {
     /// Returns [`OrmError`] when a value does not fit its column (null into
     /// NOT NULL, wrong type, unknown column). See [`crate::changeset`].
     fn changeset_from_map(fields: &HashMap<String, Value>) -> Result<Self::Changeset, OrmError>;
+
+    /// Builds the atomic `SET column = column + 1` assignment for the named
+    /// counter column (D-11) - e.g.
+    /// `users::failed_attempts.eq(users::failed_attempts + 1)` in the named
+    /// slot of [`IncrementChangeset`](DieselModel::IncrementChangeset),
+    /// every other slot `None`. The adapter validates `column` against the
+    /// core counter allowlist before calling; a hand-written impl receiving
+    /// anything else still errors rather than writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrmError::Query`] naming `column` when it is not one of
+    /// the D-11 counter columns (`failed_attempts`, `sign_in_count`).
+    fn increment_changeset(column: &'static str) -> Result<Self::IncrementChangeset, OrmError>;
 }
 
 /// Backend-bound predicate constructors for a [`DieselModel`].
