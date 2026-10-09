@@ -28,10 +28,10 @@ sqlite = ["sqlx/sqlite"]
 # CI execution and no execution verification - the crate docs say so.
 mysql = ["sqlx/mysql"]
 # End-to-end Postgres testcontainers harness (CI's backend-by-database matrix
-# job runs `cargo test -p devise-rust-sqlx --features e2e-pg`). The pg rig
+# job runs `cargo test -p devise-rust-sqlx --features e2e-pg-sqlx`). The pg rig
 # itself lands with the pg plan; until then the flag only widens the compiled
 # feature set so the CI command stays valid.
-e2e-pg = ["postgres"]
+e2e-pg-sqlx = ["postgres"]
 
 [dependencies]
 devise-rust = { path = "../devise-rust", version = "0.1" }
@@ -69,8 +69,17 @@ devise-rust-migrations = { path = "../devise-rust-migrations" }
 # Shared contract suite (D-24): this crate's integration tests are thin
 # wrappers that run the shared cases against the sqlite rigs (D-26).
 devise-rust-adapter-tests = { path = "../devise-rust-adapter-tests" }
+# testcontainers for the pg rig (D-25/D-32): pinned to 0.25.0 / modules 0.13.0
+# per STATE.md decisions; never in default/MSRV builds.
+testcontainers = { version = "=0.25.0", default-features = false }
+testcontainers-modules = { version = "0.13.0", default-features = false, features = ["postgres"] }
 
 [[test]]
 name = "adapter"
 path = "tests/adapter.rs"
 required-features = ["sqlite"]
+
+[[test]]
+name = "adapter_pg"
+path = "tests/adapter_pg.rs"
+required-features = ["e2e-pg-sqlx"]

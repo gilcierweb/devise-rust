@@ -64,6 +64,7 @@
 
 use chrono::NaiveDateTime;
 use devise_rust::adapter::{DeviseKey, OrmError, Value};
+use std::net::IpAddr;
 use uuid::Uuid;
 
 /// Primary-key shape a model stores under (D-35): integer identity columns
@@ -101,6 +102,10 @@ pub enum Bind {
     NullableTimestamp(Option<NaiveDateTime>),
     /// Native uuid bind (Postgres primary keys — D-35).
     Uuid(Uuid),
+    /// INET column value (Postgres `INET` type for IP addresses).
+    Inet(IpAddr),
+    /// Nullable INET column insert (`None` binds a typed `NULL`).
+    NullableInet(Option<IpAddr>),
 }
 
 /// The write-state of one named column (D-03 tristate).
@@ -303,5 +308,40 @@ pub fn nullable_datetime(column: &str, value: &Value) -> Result<WriteValue, OrmE
         Value::Null => Ok(WriteValue::Null),
         Value::String(_) => required_datetime(column, value),
         _ => Err(type_mismatch(column, "datetime string")),
+    }
+}
+
+/// Extracts a required (NOT NULL) INET field from its string spelling,
+/// binding the parsed `IpAddr` directly.
+///
+/// # Errors
+///
+/// Returns [`OrmError::Serialization`] for `Value::Null`, [`OrmError::Query`]
+/// for non-string values or unparseable strings.
+pub fn required_inet(column: &str, value: &Value) -> Result<WriteValue, OrmError> {
+    match value {
+        Value::Null => Err(null_into_required(column)),
+        Value::String(s) => {
+            let parsed = s.parse::<IpAddr>().map_err(|_| OrmError::Query {
+                message: format!("column {column} expects an IP address"),
+                source: None,
+            })?;
+            Ok(WriteValue::Bind(Bind::Inet(parsed)))
+        }
+        _ => Err(type_mismatch(column, "IP address")),
+    }
+}
+
+/// Extracts a nullable INET field: `Null` becomes the SQL `NULL` write.
+///
+/// # Errors
+///
+/// Returns [`OrmError::Query`] for non-string, non-null values or
+/// unparseable strings.
+pub fn nullable_inet(column: &str, value: &Value) -> Result<WriteValue, OrmError> {
+    match value {
+        Value::Null => Ok(WriteValue::Null),
+        Value::String(_) => required_inet(column, value),
+        _ => Err(type_mismatch(column, "IP address")),
     }
 }

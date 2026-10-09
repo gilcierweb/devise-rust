@@ -349,7 +349,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// SQLite arm: text uuids bind hyphenated (D-35, diesel precedent), all
-/// other binds encode through sqlx's own codecs.
+/// other binds encode through sqlx's own codecs. INET binds as text.
 #[cfg(feature = "sqlite")]
 impl Dialect for sqlx::Sqlite {
     fn add_bind(
@@ -367,6 +367,9 @@ impl Dialect for sqlx::Sqlite {
             Bind::Integer(i) => args.add(i).map_err(encoding_failed),
             Bind::Timestamp(t) => args.add(t).map_err(encoding_failed),
             Bind::NullableTimestamp(t) => args.add(t).map_err(encoding_failed),
+            // INET columns store as text on SQLite.
+            Bind::Inet(ip) => args.add(ip.to_string()).map_err(encoding_failed),
+            Bind::NullableInet(ip) => args.add(ip.map(|i| i.to_string())).map_err(encoding_failed),
             // Deterministic hyphenated TEXT spelling — never the driver's
             // private uuid storage choice (Pitfall 10).
             Bind::Uuid(id) => args
@@ -380,7 +383,7 @@ impl Dialect for sqlx::Sqlite {
     }
 }
 
-/// Postgres arm: uuids bind native (`UUID` column — D-35).
+/// Postgres arm: uuids bind native (`UUID` column — D-35), INET binds native.
 #[cfg(feature = "postgres")]
 impl Dialect for sqlx::Postgres {
     fn add_bind(
@@ -399,6 +402,9 @@ impl Dialect for sqlx::Postgres {
             Bind::Timestamp(t) => args.add(t).map_err(encoding_failed),
             Bind::NullableTimestamp(t) => args.add(t).map_err(encoding_failed),
             Bind::Uuid(id) => args.add(id).map_err(encoding_failed),
+            // INET columns use TEXT in test rig (sqlx 0.8.6 INET binding not supported).
+            Bind::Inet(ip) => args.add(ip.to_string()).map_err(encoding_failed),
+            Bind::NullableInet(ip) => args.add(ip.map(|i| i.to_string())).map_err(encoding_failed),
         }
     }
 
@@ -409,6 +415,7 @@ impl Dialect for sqlx::Postgres {
 
 /// MySQL arm (experimental, D-33: compiles without CI execution): the
 /// emitted mysql DDL stores uuids as `CHAR(36)`, so keys bind hyphenated.
+/// INET columns store as text.
 #[cfg(feature = "mysql")]
 impl Dialect for sqlx::MySql {
     fn add_bind(
@@ -426,6 +433,9 @@ impl Dialect for sqlx::MySql {
             Bind::Integer(i) => args.add(i).map_err(encoding_failed),
             Bind::Timestamp(t) => args.add(t).map_err(encoding_failed),
             Bind::NullableTimestamp(t) => args.add(t).map_err(encoding_failed),
+            // INET columns store as text on MySQL.
+            Bind::Inet(ip) => args.add(ip.to_string()).map_err(encoding_failed),
+            Bind::NullableInet(ip) => args.add(ip.map(|i| i.to_string())).map_err(encoding_failed),
             Bind::Uuid(id) => args
                 .add(id.hyphenated().to_string())
                 .map_err(encoding_failed),

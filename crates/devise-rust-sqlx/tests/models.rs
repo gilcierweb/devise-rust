@@ -12,9 +12,54 @@ use chrono::NaiveDateTime;
 use devise_rust::adapter::{DeviseKey, OrmError, Value};
 use devise_rust_adapter_tests::ContractModel;
 use devise_rust_sqlx::glue::{
-    Bind, KeyShape, SqlxModel, WriteValue, nullable_datetime, nullable_string, required_datetime,
-    required_i64, required_string,
+    Bind, KeyShape, SqlxModel, WriteValue, nullable_datetime, nullable_inet, nullable_string,
+    required_datetime, required_i64, required_string,
 };
+use sqlx::Type;
+use sqlx::decode::Decode;
+#[cfg(feature = "postgres")]
+use sqlx::postgres::{PgTypeInfo, PgValueRef};
+#[cfg(feature = "sqlite")]
+use sqlx::sqlite::{SqliteTypeInfo, SqliteValueRef};
+use std::net::IpAddr;
+
+/// A UUID type that decodes both native UUID (Postgres) and hyphenated TEXT (SQLite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HybridUuid(pub uuid::Uuid);
+
+#[cfg(feature = "postgres")]
+impl<'r> Decode<'r, sqlx::Postgres> for HybridUuid {
+    fn decode(
+        value: PgValueRef<'r>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        uuid::Uuid::decode(value).map(HybridUuid)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl<'r> Decode<'r, sqlx::Sqlite> for HybridUuid {
+    fn decode(
+        value: SqliteValueRef<'r>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        // Decode as TEXT and parse
+        let text: &str = Decode::decode(value)?;
+        Ok(HybridUuid(uuid::Uuid::parse_str(text)?))
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl Type<sqlx::Postgres> for HybridUuid {
+    fn type_info() -> PgTypeInfo {
+        <uuid::Uuid as Type<sqlx::Postgres>>::type_info()
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl Type<sqlx::Sqlite> for HybridUuid {
+    fn type_info() -> SqliteTypeInfo {
+        <String as Type<sqlx::Sqlite>>::type_info()
+    }
+}
 
 /// The full-module column list in emitted-DDL order — the explicit SELECT
 /// list (Pitfall 2) and the `RETURNING` projection.
@@ -90,7 +135,7 @@ pub struct FixtureUser {
     /// Rememberable timestamp.
     pub remember_created_at: Option<NaiveDateTime>,
     /// Trackable counter (`NOT NULL DEFAULT 0`).
-    pub sign_in_count: i64,
+    pub sign_in_count: i32,
     /// Trackable timestamps.
     pub current_sign_in_at: Option<NaiveDateTime>,
     /// Trackable timestamps.
@@ -108,7 +153,7 @@ pub struct FixtureUser {
     /// Reconfirmable pending email.
     pub unconfirmed_email: Option<String>,
     /// Lockable counter (`NOT NULL DEFAULT 0`).
-    pub failed_attempts: i64,
+    pub failed_attempts: i32,
     /// HMAC digest; `None` means cleared.
     pub unlock_token: Option<String>,
     /// Lockable timestamp.
@@ -133,7 +178,7 @@ pub struct NewFixtureUser {
     /// Rememberable timestamp.
     pub remember_created_at: Option<NaiveDateTime>,
     /// Trackable counter.
-    pub sign_in_count: i64,
+    pub sign_in_count: i32,
     /// Trackable timestamps.
     pub current_sign_in_at: Option<NaiveDateTime>,
     /// Trackable timestamps.
@@ -151,7 +196,7 @@ pub struct NewFixtureUser {
     /// Reconfirmable pending email.
     pub unconfirmed_email: Option<String>,
     /// Lockable counter.
-    pub failed_attempts: i64,
+    pub failed_attempts: i32,
     /// HMAC digest; `None` inserts `NULL`.
     pub unlock_token: Option<String>,
     /// Lockable timestamp.
@@ -206,8 +251,8 @@ fn write_bind(column: &str, value: &Value) -> Result<(&'static str, WriteValue),
         "sign_in_count" => ("sign_in_count", required_i64(column, value)?),
         "current_sign_in_at" => ("current_sign_in_at", nullable_datetime(column, value)?),
         "last_sign_in_at" => ("last_sign_in_at", nullable_datetime(column, value)?),
-        "current_sign_in_ip" => ("current_sign_in_ip", nullable_string(column, value)?),
-        "last_sign_in_ip" => ("last_sign_in_ip", nullable_string(column, value)?),
+        "current_sign_in_ip" => ("current_sign_in_ip", nullable_inet(column, value)?),
+        "last_sign_in_ip" => ("last_sign_in_ip", nullable_inet(column, value)?),
         "confirmation_token" => ("confirmation_token", nullable_string(column, value)?),
         "confirmed_at" => ("confirmed_at", nullable_datetime(column, value)?),
         "confirmation_sent_at" => ("confirmation_sent_at", nullable_datetime(column, value)?),
@@ -271,16 +316,24 @@ impl SqlxModel for FixtureUser {
             Bind::NullableText(new.reset_password_token.clone()),
             Bind::NullableTimestamp(new.reset_password_sent_at),
             Bind::NullableTimestamp(new.remember_created_at),
-            Bind::Integer(new.sign_in_count),
+            Bind::Integer(new.sign_in_count.into()),
             Bind::NullableTimestamp(new.current_sign_in_at),
             Bind::NullableTimestamp(new.last_sign_in_at),
-            Bind::NullableText(new.current_sign_in_ip.clone()),
-            Bind::NullableText(new.last_sign_in_ip.clone()),
+            Bind::NullableInet(
+                new.current_sign_in_ip
+                    .clone()
+                    .and_then(|s| s.parse::<IpAddr>().ok()),
+            ),
+            Bind::NullableInet(
+                new.last_sign_in_ip
+                    .clone()
+                    .and_then(|s| s.parse::<IpAddr>().ok()),
+            ),
             Bind::NullableText(new.confirmation_token.clone()),
             Bind::NullableTimestamp(new.confirmed_at),
             Bind::NullableTimestamp(new.confirmation_sent_at),
             Bind::NullableText(new.unconfirmed_email.clone()),
-            Bind::Integer(new.failed_attempts),
+            Bind::Integer(new.failed_attempts.into()),
             Bind::NullableText(new.unlock_token.clone()),
             Bind::NullableTimestamp(new.locked_at),
             Bind::Timestamp(new.created_at),
@@ -331,11 +384,11 @@ impl ContractModel for FixtureUser {
     }
 
     fn contract_failed_attempts(&self) -> i64 {
-        self.failed_attempts
+        self.failed_attempts.into()
     }
 
     fn contract_sign_in_count(&self) -> i64 {
-        self.sign_in_count
+        self.sign_in_count.into()
     }
 
     fn contract_unlock_token(&self) -> Option<&str> {
@@ -359,8 +412,8 @@ impl ContractModel for FixtureUser {
 /// (D-35 — the diesel sqlite precedent).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct UuidUser {
-    /// Hyphenated uuid primary key.
-    pub id: String,
+    /// Hybrid UUID primary key: native UUID on Postgres, hyphenated TEXT on SQLite.
+    pub id: HybridUuid,
     /// Authentication key (`NOT NULL DEFAULT ''`).
     pub email: String,
     /// Bcrypt digest (`NOT NULL DEFAULT ''`).
@@ -372,7 +425,7 @@ pub struct UuidUser {
     /// Rememberable timestamp.
     pub remember_created_at: Option<NaiveDateTime>,
     /// Trackable counter (`NOT NULL DEFAULT 0`).
-    pub sign_in_count: i64,
+    pub sign_in_count: i32,
     /// Trackable timestamps.
     pub current_sign_in_at: Option<NaiveDateTime>,
     /// Trackable timestamps.
@@ -390,7 +443,7 @@ pub struct UuidUser {
     /// Reconfirmable pending email.
     pub unconfirmed_email: Option<String>,
     /// Lockable counter (`NOT NULL DEFAULT 0`).
-    pub failed_attempts: i64,
+    pub failed_attempts: i32,
     /// HMAC digest; `None` means cleared.
     pub unlock_token: Option<String>,
     /// Lockable timestamp.
@@ -405,8 +458,8 @@ pub struct UuidUser {
 /// hyphenated id (the database does not generate uuids on sqlite).
 #[derive(Debug, Clone)]
 pub struct NewUuidUser {
-    /// Hyphenated uuid primary key (caller-assigned).
-    pub id: String,
+    /// Hybrid UUID primary key (caller-assigned).
+    pub id: HybridUuid,
     /// Authentication key.
     pub email: String,
     /// Bcrypt digest.
@@ -418,7 +471,7 @@ pub struct NewUuidUser {
     /// Rememberable timestamp.
     pub remember_created_at: Option<NaiveDateTime>,
     /// Trackable counter.
-    pub sign_in_count: i64,
+    pub sign_in_count: i32,
     /// Trackable timestamps.
     pub current_sign_in_at: Option<NaiveDateTime>,
     /// Trackable timestamps.
@@ -436,7 +489,7 @@ pub struct NewUuidUser {
     /// Reconfirmable pending email.
     pub unconfirmed_email: Option<String>,
     /// Lockable counter.
-    pub failed_attempts: i64,
+    pub failed_attempts: i32,
     /// HMAC digest; `None` inserts `NULL`.
     pub unlock_token: Option<String>,
     /// Lockable timestamp.
@@ -452,7 +505,7 @@ impl NewUuidUser {
     #[must_use]
     pub fn sample(email: &str, now: NaiveDateTime) -> Self {
         Self {
-            id: uuid::Uuid::new_v4().hyphenated().to_string(),
+            id: HybridUuid(uuid::Uuid::new_v4()),
             email: email.to_owned(),
             encrypted_password: "bcrypt-digest".to_owned(),
             reset_password_token: Some(format!("enc-reset-{email}")),
@@ -507,16 +560,8 @@ impl SqlxModel for UuidUser {
         KeyShape::Uuid
     }
 
-    /// Parses the hyphenated `TEXT` id back into a [`DeviseKey::Uuid`].
-    ///
-    /// # Panics
-    ///
-    /// Panics when the stored id is not a valid uuid (fixture rows always
-    /// carry caller-assigned hyphenated ids).
     fn key_of(model: &Self) -> DeviseKey {
-        DeviseKey::from_uuid(
-            uuid::Uuid::parse_str(&model.id).expect("uuid fixture ids are hyphenated uuids"),
-        )
+        DeviseKey::from_uuid(model.id.0)
     }
 
     fn finder_columns() -> &'static [&'static str] {
@@ -529,7 +574,8 @@ impl SqlxModel for UuidUser {
 
     fn insert_values(new: &Self::New) -> Vec<Bind> {
         let mut values = Vec::with_capacity(UUID_USER_INSERT_COLUMNS.len());
-        values.push(Bind::Text(new.id.clone()));
+        // Use the native UUID directly for binding
+        values.push(Bind::Uuid(new.id.0));
         values.extend(uuid_insert_tail(new));
         values
     }
@@ -574,16 +620,24 @@ fn uuid_insert_tail(new: &NewUuidUser) -> Vec<Bind> {
         Bind::NullableText(new.reset_password_token.clone()),
         Bind::NullableTimestamp(new.reset_password_sent_at),
         Bind::NullableTimestamp(new.remember_created_at),
-        Bind::Integer(new.sign_in_count),
+        Bind::Integer(new.sign_in_count.into()),
         Bind::NullableTimestamp(new.current_sign_in_at),
         Bind::NullableTimestamp(new.last_sign_in_at),
-        Bind::NullableText(new.current_sign_in_ip.clone()),
-        Bind::NullableText(new.last_sign_in_ip.clone()),
+        Bind::NullableInet(
+            new.current_sign_in_ip
+                .clone()
+                .and_then(|s| s.parse::<IpAddr>().ok()),
+        ),
+        Bind::NullableInet(
+            new.last_sign_in_ip
+                .clone()
+                .and_then(|s| s.parse::<IpAddr>().ok()),
+        ),
         Bind::NullableText(new.confirmation_token.clone()),
         Bind::NullableTimestamp(new.confirmed_at),
         Bind::NullableTimestamp(new.confirmation_sent_at),
         Bind::NullableText(new.unconfirmed_email.clone()),
-        Bind::Integer(new.failed_attempts),
+        Bind::Integer(new.failed_attempts.into()),
         Bind::NullableText(new.unlock_token.clone()),
         Bind::NullableTimestamp(new.locked_at),
         Bind::Timestamp(new.created_at),
@@ -629,11 +683,11 @@ impl ContractModel for UuidUser {
     }
 
     fn contract_failed_attempts(&self) -> i64 {
-        self.failed_attempts
+        self.failed_attempts.into()
     }
 
     fn contract_sign_in_count(&self) -> i64 {
-        self.sign_in_count
+        self.sign_in_count.into()
     }
 
     fn contract_unlock_token(&self) -> Option<&str> {

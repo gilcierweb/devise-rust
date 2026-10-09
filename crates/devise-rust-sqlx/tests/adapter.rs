@@ -52,7 +52,7 @@ impl ContractFactory for SqliteUuidUsersFactory {
     }
 
     fn key_of_created(&self, row: &UuidUser) -> DeviseKey {
-        DeviseKey::from_uuid(uuid::Uuid::parse_str(&row.id).expect("uuid ids are hyphenated"))
+        DeviseKey::from_uuid(row.id.0)
     }
 
     fn missing_key(&self) -> DeviseKey {
