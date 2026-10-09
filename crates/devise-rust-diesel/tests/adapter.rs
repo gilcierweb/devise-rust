@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use common::{SqliteRig, bootstrap_sqlite_memory, later_time, sample_time};
 use devise_rust::adapter::{ChangeSet, Conditions, DeviseKey, OrmAdapter, OrmError, Value};
-use models::{FixtureUser, NewFixtureUser};
+use models::{FixtureUser, NewFixtureUser, NewUuidUser, UuidUser};
 
 const TRACER_EMAIL: &str = "tracer@example.com";
 
@@ -307,6 +307,176 @@ async fn sqlite_counter_two_increments_raise_by_exactly_two() {
     // The returned row is the stored row (Devise's increment + reload).
     let reread = rig.users.get(&key).await.expect("get works");
     assert_eq!(reread.expect("row exists").failed_attempts, 2);
+}
+
+/// D-11 counter cases on the integer-PK `users` table (the diesel forcing
+/// function the shared suite in 06-02 later generalizes): both counters
+/// raise by exactly 2 across two increments, columns increment
+/// independently, an out-of-set column refuses with a value-free Query
+/// naming the column, and missing keys refuse with `NotFound`.
+async fn counter_cases_integer(rig: &SqliteRig) {
+    let now = sample_time();
+    let created: FixtureUser = rig
+        .users
+        .create(NewFixtureUser::sample("counter-i64@example.com", now))
+        .await
+        .expect("create stores the row");
+    assert_eq!(created.failed_attempts, 0);
+    assert_eq!(created.sign_in_count, 0);
+    let key = DeviseKey::from_i64(created.id);
+
+    let bumped = rig
+        .users
+        .increment_counter(&key, "failed_attempts")
+        .await
+        .expect("first failed_attempts increment works");
+    assert_eq!(bumped.failed_attempts, 1);
+    let locked = rig
+        .users
+        .increment_counter(&key, "failed_attempts")
+        .await
+        .expect("second failed_attempts increment works");
+    assert_eq!(
+        locked.failed_attempts, 2,
+        "two increments raise the stored counter by exactly 2"
+    );
+    assert_eq!(
+        locked.sign_in_count, 0,
+        "counter columns increment independently"
+    );
+
+    let tracked = rig
+        .users
+        .increment_counter(&key, "sign_in_count")
+        .await
+        .expect("first sign_in_count increment works");
+    assert_eq!(tracked.sign_in_count, 1);
+    let revisits = rig
+        .users
+        .increment_counter(&key, "sign_in_count")
+        .await
+        .expect("second sign_in_count increment works");
+    assert_eq!(
+        revisits.sign_in_count, 2,
+        "two increments raise the stored counter by exactly 2"
+    );
+    assert_eq!(
+        revisits.failed_attempts, 2,
+        "counter columns increment independently"
+    );
+
+    // Out-of-set column names refuse with a Query naming the column.
+    let err = rig
+        .users
+        .increment_counter(&key, "locked_at")
+        .await
+        .unwrap_err();
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("locked_at"),
+        "the error must name the column: {rendered}"
+    );
+    assert!(
+        !rendered.contains('@'),
+        "the error must not leak record values: {rendered}"
+    );
+    assert!(
+        matches!(err, OrmError::Query { .. }),
+        "out-of-set column must yield OrmError::Query, got {rendered}"
+    );
+    let untouched = rig.users.get_strict(&key).await.expect("row exists");
+    assert_eq!(
+        untouched.failed_attempts, 2,
+        "a rejected increment never reaches the database"
+    );
+
+    // Missing keys refuse with NotFound, never a silent zero.
+    assert!(
+        matches!(
+            rig.users
+                .increment_counter(&DeviseKey::from_i64(999_999), "failed_attempts")
+                .await
+                .unwrap_err(),
+            OrmError::NotFound
+        ),
+        "increment on a missing key must refuse with NotFound"
+    );
+}
+
+/// D-11 counter cases on the uuid-PK `uuid_users` table: identical
+/// behavior through the same contract on the second PK kind.
+async fn counter_cases_uuid(rig: &SqliteRig) {
+    let now = sample_time();
+    let uuid_created: UuidUser = rig
+        .uuid_users
+        .create(NewUuidUser::sample("counter-uuid@example.com", now))
+        .await
+        .expect("uuid create stores the row");
+    assert_eq!(uuid_created.failed_attempts, 0);
+    let uuid_key = DeviseKey::from_uuid(
+        uuid::Uuid::parse_str(&uuid_created.id).expect("fixture ids are hyphenated uuids"),
+    );
+
+    let uuid_locked = rig
+        .uuid_users
+        .increment_counter(&uuid_key, "failed_attempts")
+        .await
+        .expect("first uuid failed_attempts increment works");
+    assert_eq!(uuid_locked.failed_attempts, 1);
+    let uuid_twice = rig
+        .uuid_users
+        .increment_counter(&uuid_key, "failed_attempts")
+        .await
+        .expect("second uuid failed_attempts increment works");
+    assert_eq!(uuid_twice.failed_attempts, 2);
+
+    let uuid_tracked = rig
+        .uuid_users
+        .increment_counter(&uuid_key, "sign_in_count")
+        .await
+        .expect("first uuid sign_in_count increment works");
+    assert_eq!(uuid_tracked.sign_in_count, 1);
+    let uuid_revisits = rig
+        .uuid_users
+        .increment_counter(&uuid_key, "sign_in_count")
+        .await
+        .expect("second uuid sign_in_count increment works");
+    assert_eq!(uuid_revisits.sign_in_count, 2);
+    assert_eq!(uuid_revisits.failed_attempts, 2);
+
+    let uuid_err = rig
+        .uuid_users
+        .increment_counter(&uuid_key, "locked_at")
+        .await
+        .unwrap_err();
+    let uuid_rendered = uuid_err.to_string();
+    assert!(
+        uuid_rendered.contains("locked_at"),
+        "the uuid-table error must name the column: {uuid_rendered}"
+    );
+    assert!(
+        matches!(uuid_err, OrmError::Query { .. }),
+        "uuid out-of-set column must yield OrmError::Query, got {uuid_rendered}"
+    );
+
+    let uuid_missing = DeviseKey::from_uuid(uuid::Uuid::new_v4());
+    assert!(
+        matches!(
+            rig.uuid_users
+                .increment_counter(&uuid_missing, "sign_in_count")
+                .await
+                .unwrap_err(),
+            OrmError::NotFound
+        ),
+        "uuid increment on a missing key must refuse with NotFound"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_counter_cases() {
+    let rig = bootstrap_sqlite_memory().await;
+    counter_cases_integer(&rig).await;
+    counter_cases_uuid(&rig).await;
 }
 
 #[tokio::test]

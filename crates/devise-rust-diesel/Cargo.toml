@@ -55,7 +55,10 @@ chrono.workspace = true
 libsqlite3-sys = { version = "0.35", features = ["bundled"], optional = true }
 
 [dev-dependencies]
-tokio.workspace = true
+# "sync" adds tokio::sync::Mutex: the pg leg serializes its tests against
+# the shared testcontainers instance (a second test inserting between the
+# roundtrip's two inserts would break its id-adjacency assertion).
+tokio = { workspace = true, features = ["sync"] }
 rstest.workspace = true
 pretty_assertions.workspace = true
 chrono.workspace = true

@@ -266,6 +266,10 @@ async fn uniqueness_and_delete_steps(rig: &PgRig, key: &DeviseKey) {
 
 #[tokio::test]
 async fn pg_full_op_roundtrip_integer_pk() {
+    // One pg test at a time: the container is shared, and the roundtrip
+    // asserts id adjacency (`second.id == created.id + 1`), which a
+    // concurrent insert into the same table would break.
+    let _guard = PG_TEST_SERIALIZER.lock().await;
     let rig = bootstrap_pg().await;
     let key = create_and_alias_step(&rig).await;
     get_steps(&rig, &key).await;
@@ -273,4 +277,109 @@ async fn pg_full_op_roundtrip_integer_pk() {
     update_steps(&rig, &key).await;
     update_columns_steps(&rig, &key).await;
     uniqueness_and_delete_steps(&rig, &key).await;
+}
+
+/// Serializes the pg test fns against the shared testcontainers instance
+/// (see the guard in [`pg_full_op_roundtrip_integer_pk`]).
+static PG_TEST_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// D-11 counter cases on the Postgres leg (the sqlite leg runs the full
+/// both-PK-kinds matrix; the uuid-on-pg matrix cell is 06-02's shared-suite
+/// retrofit): both counter columns raise by exactly 2 across two
+/// increments, columns stay independent, and an out-of-set column refuses
+/// with a value-free Query naming the column.
+async fn counter_steps_pg(rig: &PgRig) {
+    let now = common::sample_time();
+    let created: FixtureUser = rig
+        .users
+        .create(NewFixtureUser::sample("pg-counter@example.com", now))
+        .await
+        .expect("pg create stores the row");
+    assert_eq!(created.failed_attempts, 0);
+    assert_eq!(created.sign_in_count, 0);
+    let key = DeviseKey::from_i64(created.id);
+
+    let bumped = rig
+        .users
+        .increment_counter(&key, "failed_attempts")
+        .await
+        .expect("first pg failed_attempts increment works");
+    assert_eq!(bumped.failed_attempts, 1);
+    let locked = rig
+        .users
+        .increment_counter(&key, "failed_attempts")
+        .await
+        .expect("second pg failed_attempts increment works");
+    assert_eq!(
+        locked.failed_attempts, 2,
+        "two increments raise the stored counter by exactly 2 on pg"
+    );
+    assert_eq!(
+        locked.sign_in_count, 0,
+        "counter columns increment independently on pg"
+    );
+
+    let tracked = rig
+        .users
+        .increment_counter(&key, "sign_in_count")
+        .await
+        .expect("first pg sign_in_count increment works");
+    assert_eq!(tracked.sign_in_count, 1);
+    let revisits = rig
+        .users
+        .increment_counter(&key, "sign_in_count")
+        .await
+        .expect("second pg sign_in_count increment works");
+    assert_eq!(
+        revisits.sign_in_count, 2,
+        "two increments raise the stored counter by exactly 2 on pg"
+    );
+    assert_eq!(
+        revisits.failed_attempts, 2,
+        "counter columns increment independently on pg"
+    );
+
+    // Out-of-set column names refuse with a Query naming the column.
+    let err = rig
+        .users
+        .increment_counter(&key, "locked_at")
+        .await
+        .unwrap_err();
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("locked_at"),
+        "the pg error must name the column: {rendered}"
+    );
+    assert!(
+        !rendered.contains('@'),
+        "the pg error must not leak record values: {rendered}"
+    );
+    assert!(
+        matches!(err, OrmError::Query { .. }),
+        "pg out-of-set column must yield OrmError::Query, got {rendered}"
+    );
+    let untouched = rig.users.get_strict(&key).await.expect("row exists");
+    assert_eq!(
+        untouched.failed_attempts, 2,
+        "a rejected pg increment never reaches the database"
+    );
+
+    // Missing keys refuse with NotFound, never a silent zero.
+    assert!(
+        matches!(
+            rig.users
+                .increment_counter(&DeviseKey::from_i64(999_999), "failed_attempts")
+                .await
+                .unwrap_err(),
+            OrmError::NotFound
+        ),
+        "pg increment on a missing key must refuse with NotFound"
+    );
+}
+
+#[tokio::test]
+async fn pg_counter_cases_integer_pk() {
+    let _guard = PG_TEST_SERIALIZER.lock().await;
+    let rig = bootstrap_pg().await;
+    counter_steps_pg(&rig).await;
 }

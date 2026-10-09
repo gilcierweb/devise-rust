@@ -35,7 +35,6 @@ mod sqlite_common {
         /// Adapter over the integer-PK `users` table.
         pub users: DieselOrmAdapter<FixtureUser, Sqlite, SqliteConn>,
         /// Adapter over the uuid-PK `uuid_users` table (uuid stored hyphenated).
-        #[expect(dead_code)]
         pub uuid_users: DieselOrmAdapter<UuidUser, Sqlite, SqliteConn>,
     }
 
