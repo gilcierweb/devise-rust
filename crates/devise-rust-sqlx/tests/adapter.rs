@@ -14,7 +14,7 @@ mod models;
 
 use common::bootstrap_sqlite_memory;
 use devise_rust::adapter::{Conditions, DeviseKey, OrmAdapter, OrmError, Value};
-use devise_rust_adapter_tests::{ContractFactory, run_contract_suite};
+use devise_rust_adapter_tests::{ContractFactory, run_contract_suite, sample_time};
 use devise_rust_sqlx::SqlxModel;
 use models::{FixtureUser, NewFixtureUser, UuidUser};
 
@@ -68,6 +68,35 @@ async fn sqlite_contract_suite_integer_pk() {
 #[tokio::test]
 async fn sqlite_contract_suite_uuid_pk() {
     run_contract_suite(&SqliteUuidUsersFactory).await;
+}
+
+/// Driver error edge: a duplicate create must discriminate
+/// `UniqueViolation` with a value-free `Display` (PLAT-06). The oracle
+/// store has no constraints, so the violation itself is a
+/// database-driver behavior; this leg-local test pins the sqlite mapping
+/// (the shared suite owns the portable probe/retry loop contract).
+#[tokio::test]
+async fn sqlite_duplicate_create_discriminates_unique_violation() {
+    let rig = bootstrap_sqlite_memory().await;
+    let now = sample_time();
+    rig.users
+        .create(NewFixtureUser::sample("edge-dup@example.test", now))
+        .await
+        .expect("first row stores");
+    let dupe = rig
+        .users
+        .create(NewFixtureUser::sample("edge-dup@example.test", now))
+        .await
+        .expect_err("a duplicate email violates the unique index");
+    assert!(
+        matches!(dupe, OrmError::UniqueViolation { .. }),
+        "duplicate email must discriminate UniqueViolation, got {dupe:?}"
+    );
+    let rendered = dupe.to_string();
+    assert!(
+        !rendered.contains("edge-dup@example.test"),
+        "error Display must not leak the value: {rendered}"
+    );
 }
 
 /// Out-of-set finder columns are rejected with a value-free
