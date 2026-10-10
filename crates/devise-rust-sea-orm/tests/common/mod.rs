@@ -102,7 +102,7 @@ pub mod pg {
     use crate::models::{users, uuid_users};
     use devise_rust_migrations::{Dialect, EmitOptions, Flow, PkKind, emit};
     use devise_rust_sea_orm::SeaOrmAdapter;
-    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection};
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database};
     use sea_orm_migration::SchemaManager;
 
     /// Global container holder — one Postgres instance per test process.
@@ -174,8 +174,7 @@ pub mod pg {
                 .pk(PkKind::Uuid)
                 .flow(Flow::Create);
 
-            let uuid_files =
-                emit(&uuid_ddl).expect("fixture pg uuid DDL emits");
+            let uuid_files = emit(&uuid_ddl).expect("fixture pg uuid DDL emits");
             let uuid_up_sql = uuid_files
                 .up_sql
                 .replace("current_sign_in_ip INET", "current_sign_in_ip TEXT")

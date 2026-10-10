@@ -52,10 +52,15 @@ jobs:
       fail-fast: false
       matrix:
         # D-32: one backend-by-database matrix job - the single place to
-        # read backend health. The sqlx and sea-orm legs activate when
-        # their crates land (06-03 / Phase 7); until then the presence
-        # guard skips the leg without masking diesel health.
-        backend: [diesel, sqlx, sea-orm]
+        # read backend health. Each backend has its own e2e feature name:
+        # diesel=e2e-pg, sqlx=e2e-pg-sqlx, sea-orm=e2e-pg-sea.
+        include:
+          - backend: diesel
+            feature: e2e-pg
+          - backend: sqlx
+            feature: e2e-pg-sqlx
+          - backend: sea-orm
+            feature: e2e-pg-sea
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -65,7 +70,7 @@ jobs:
             echo "crates/devise-rust-${{ matrix.backend }} not present yet - skipping leg"
             exit 0
           fi
-          cargo test -p devise-rust-${{ matrix.backend }} --features e2e-pg
+          cargo test -p devise-rust-${{ matrix.backend }} --features ${{ matrix.feature }}
 
   test-msrv:
     name: Test MSRV (1.85)

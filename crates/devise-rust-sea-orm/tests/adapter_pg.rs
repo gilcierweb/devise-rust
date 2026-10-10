@@ -225,22 +225,29 @@ async fn pg_native_uuid_roundtrip() {
 /// exposes the full [`SeaOrmModel`] contract (D-01/D-15).
 #[test]
 fn pg_fixture_glue_surface() {
+    use devise_rust::adapter::{DeviseKey, Value};
+
     // Table name
     assert_eq!(users::Entity::table_name(), "users");
     assert_eq!(uuid_users::Entity::table_name(), "uuid_users");
 
     // Finder columns exist and are properly mapped
-    use devise_rust::adapter::Value;
     assert!(users::Entity::finder_column("email", &Value::String("x".into())).is_some());
-    assert!(users::Entity::finder_column("reset_password_token", &Value::String("x".into())).is_some());
-    assert!(users::Entity::finder_column("confirmation_token", &Value::String("x".into())).is_some());
+    assert!(
+        users::Entity::finder_column("reset_password_token", &Value::String("x".into())).is_some()
+    );
+    assert!(
+        users::Entity::finder_column("confirmation_token", &Value::String("x".into())).is_some()
+    );
     assert!(users::Entity::finder_column("unlock_token", &Value::String("x".into())).is_some());
-    assert!(users::Entity::finder_column("unconfirmed_email", &Value::String("x".into())).is_some());
-    assert!(users::Entity::finder_column("encrypted_password", &Value::String("x".into())).is_none());
+    assert!(
+        users::Entity::finder_column("unconfirmed_email", &Value::String("x".into())).is_some()
+    );
+    assert!(
+        users::Entity::finder_column("encrypted_password", &Value::String("x".into())).is_none()
+    );
 
     // PK condition works for both key shapes
-    use devise_rust::adapter::DeviseKey;
-    use sea_orm::ColumnTrait as _;
     let int_key = DeviseKey::from_i64(1);
     let uuid_key = DeviseKey::from_uuid(uuid::Uuid::new_v4());
     assert!(users::Entity::pk_condition(&int_key).is_ok());
