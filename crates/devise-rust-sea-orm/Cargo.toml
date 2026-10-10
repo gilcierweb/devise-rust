@@ -36,6 +36,8 @@ devise-rust = { path = "../devise-rust", version = "0.1" }
 # (runtime-tokio-rustls, with-chrono, with-uuid, macros per D-15/D-21
 # `DeriveEntityModel`); per-dialect drivers arrive through this crate's
 # `sqlx-*` features above (D-23) so an app compiles only the driver it uses.
+# [A2 confirmed at compile time: `default-features = false` plus this feature
+# set composes on sea-orm 1.1.20, driverless builds included.]
 sea-orm = { version = "1.1", default-features = false, features = [
     "runtime-tokio-rustls",
     "with-chrono",
@@ -44,6 +46,7 @@ sea-orm = { version = "1.1", default-features = false, features = [
 ] }
 # D-18: `SchemaManager::execute_unprepared` applies the migrations-crate
 # plain-SQL DDL verbatim; the generator ships no sea-orm-native migrations.
+# [A1 confirmed: the sea-orm-migration 1.1 line pairs with sea-orm 1.1.20.]
 sea-orm-migration = "1.1"
 async-trait.workspace = true
 chrono.workspace = true

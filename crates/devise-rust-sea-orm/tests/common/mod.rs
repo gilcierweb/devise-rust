@@ -18,21 +18,23 @@ use sea_orm_migration::SchemaManager;
 use devise_rust_migrations::{Dialect, EmitOptions, Flow, PkKind, emit};
 use devise_rust_sea_orm::SeaOrmAdapter;
 
-use crate::models::users;
+use crate::models::{users, uuid_users};
 
 /// Live adapters over one freshly-migrated `:memory:` database.
 #[allow(dead_code)]
 pub struct SqliteRig {
     /// Adapter over the integer-PK `users` table.
     pub users: SeaOrmAdapter<users::Entity>,
+    /// Adapter over the uuid-PK `uuid_users` table (hyphenated-`TEXT` id,
+    /// D-35).
+    pub uuid_users: SeaOrmAdapter<uuid_users::Entity>,
     /// Kept alive for the rig's lifetime: dropping the last pooled
     /// connection drops the private `:memory:` database with it.
     db: DatabaseConnection,
 }
 
 /// Builds a pool-of-1 connection and applies the full-module `emit()` DDL
-/// for the integer-PK `users` table (the `uuid_users` fixture lands with
-/// the full-suite task).
+/// for both fixture tables (`users` integer PK, `uuid_users` uuid PK).
 ///
 /// # Panics
 ///
@@ -52,17 +54,27 @@ pub async fn bootstrap_sqlite_memory() -> SqliteRig {
         .dialect(Dialect::Sqlite)
         .pk(PkKind::Integer)
         .flow(Flow::Create);
-    let files = emit(&int_ddl).expect("fixture DDL emits");
-    // D-18: plain-SQL DDL applied verbatim through sea-orm's SchemaManager;
-    // `execute_unprepared` runs the full multi-statement script.
-    SchemaManager::new(&db)
-        .get_connection()
-        .execute_unprepared(&files.up_sql)
-        .await
-        .expect("emitted DDL applies to :memory:");
+    let uuid_ddl = EmitOptions::new("uuid_users")
+        .with_all_modules()
+        .dialect(Dialect::Sqlite)
+        .pk(PkKind::Uuid)
+        .flow(Flow::Create);
+    let schema = SchemaManager::new(&db);
+    for opts in [int_ddl, uuid_ddl] {
+        let files = emit(&opts).expect("fixture DDL emits");
+        // D-18: plain-SQL DDL applied verbatim through sea-orm's
+        // SchemaManager; `execute_unprepared` runs the full
+        // multi-statement script.
+        schema
+            .get_connection()
+            .execute_unprepared(&files.up_sql)
+            .await
+            .expect("emitted DDL applies to :memory:");
+    }
 
     SqliteRig {
         users: SeaOrmAdapter::new(db.clone()),
+        uuid_users: SeaOrmAdapter::new(db.clone()),
         db,
     }
 }

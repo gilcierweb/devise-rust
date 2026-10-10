@@ -1,4 +1,4 @@
-//! SeaORM backend for devise-rust: the third [`OrmAdapter`] implementation
+//! `SeaORM` backend for devise-rust: the third [`OrmAdapter`] implementation
 //! (ORM-07, D-15), built on sea-orm 1.1.x.
 //!
 //! The public API every sea-orm consuming app writes (D-15/D-19):
@@ -6,7 +6,7 @@
 //! * a standard `DeriveEntityModel` entity per table (one module per table,
 //!   struct named `Model` as the derive requires), plus
 //! * a hand-written [`SeaOrmModel`] bridge impl (finder columns, pk
-//!   condition, ChangeSet tristate mapping) — see [`bridge`], and
+//!   condition, `ChangeSet` tristate mapping) — see [`bridge`], and
 //! * one [`SeaOrmAdapter`] per model, constructed from the application's
 //!   existing [`DatabaseConnection`]: the app owns the pool configuration
 //!   and lifecycle; the adapter never builds its own connection (D-19).
@@ -72,9 +72,9 @@ pub use crate::bridge::SeaOrmModel;
 ///   diff to a re-read (empty `UPDATE` is invalid SQL — Pitfall 6).
 /// * `update_columns` writes the full named map regardless of diff —
 ///   `ActiveRecord::Persistence#update_columns` parity: no validations, no
-///   callbacks, `updated_at` untouched unless named — and that is what
-///   carries an unchanged-value force-write (devise #5783, D-16: every
-///   named field is `Set`, sea-orm's `Unchanged` never appears).
+    ///   callbacks, `updated_at` untouched unless named — and that is what
+    ///   carries an unchanged-value force-write (devise #5783, D-16: every
+    ///   named field is `Set`; sea-orm's unchanged-detection never appears).
 /// * `increment_counter` renders one atomic `SET column = column + 1`
 ///   statement via [`counter::increment_counter`] and re-reads (D-11).
 /// * `create` inserts the bridge-built `ActiveModel` (PK `NotSet` on
@@ -180,10 +180,12 @@ where
     E::ActiveModel: ActiveModelBehavior + Send + 'static,
 {
     /// Shared partial-write path: empty maps short-circuit to a re-read
-    /// (missing → `NotFound`; an empty `UPDATE` is invalid SQL — Pitfall 6);
-    /// otherwise the bridge builds a Set-only `ActiveModel` (D-16) and
-    /// `Update::one` executes it and re-reads the fresh row (on miss sea-orm
-    /// raises `RecordNotUpdated`, mapped to `NotFound` — T-07-05).
+    /// (missing → `NotFound`; an empty `UPDATE` is invalid SQL — Pitfall 6;
+    /// assumption A5 confirmed: sea-orm's own `is_noop()` guard would also
+    /// re-select without erroring, so this adapter guard is belt and
+    /// braces); otherwise the bridge builds a Set-only `ActiveModel` (D-16)
+    /// and `Update::one` executes it and re-reads the fresh row (on miss
+    /// sea-orm raises `RecordNotUpdated`, mapped to `NotFound` — T-07-05).
     async fn write_map(
         &self,
         key: &DeviseKey,

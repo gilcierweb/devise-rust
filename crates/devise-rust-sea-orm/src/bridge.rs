@@ -20,10 +20,11 @@
 //! * the **`ChangeSet` tristate → `ActiveModel` state** mapping (D-16):
 //!   absent → `NotSet` (column omitted from the `UPDATE`), explicit
 //!   `Value::Null` → `Set(None)` (writes `NULL`, e.g. token clearing), a
-//!   value → `Set(value)` written **even when unchanged** (devise #5783
-//!   force-write). Sea-orm's native `Unchanged` detection is NOT consulted,
-//!   `into_active_model` round-trips are never built, and
-//!   `set_if_not_equals` never appears (Pitfall 5; T-07-04).
+//!   a value → `Set(value)` written **even when unchanged** (devise #5783
+//!   force-write). Sea-orm's native unchanged-detection is NOT consulted
+//!   (D-16), no write path builds its `ActiveModel` from a freshly re-read
+//!   row, and equality-conditioned setters never appear (Pitfall 5;
+//!   T-07-04).
 //! * the **counter column** allowlist mapping for
 //!   [`increment_counter`](crate::counter::increment_counter) (D-11).
 //!
@@ -120,9 +121,9 @@ pub trait SeaOrmModel: EntityTrait + Send + Sync + 'static {
 
     /// Builds the update base `ActiveModel` for `key`: primary key `Set`
     /// (drives the `UPDATE … WHERE id = ?`), every other field `NotSet` so
-    /// absent fields stay omitted (D-16). This is the anti-
-    /// `into_active_model` guarantee for update paths: no field ever enters
-    /// the statement in sea-orm's native `Unchanged` state.
+    /// absent fields stay omitted (D-16). Never derived by re-reading the
+    /// stored row: starting from a fetched model would seed sea-orm's native
+    /// unchanged-detection and drop the #5783 force-write.
     ///
     /// # Errors
     ///
