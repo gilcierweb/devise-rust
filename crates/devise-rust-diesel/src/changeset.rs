@@ -99,7 +99,13 @@ pub fn nullable_i32(column: &str, value: &Value) -> Result<Option<i32>, OrmError
 }
 
 /// SQLite datetime spellings accepted from string values.
-const DATETIME_FORMATS: &[&str] = &["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"];
+const DATETIME_FORMATS: &[&str] = &[
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
+    // Core emits RFC3339 with fractional seconds and an offset (`to_rfc3339`).
+    "%Y-%m-%dT%H:%M:%S%.fZ",
+    "%Y-%m-%dT%H:%M:%S%.f%:z",
+];
 
 /// Parses a datetime string without ever echoing the value into the error.
 fn parse_datetime(column: &str) -> OrmError {
