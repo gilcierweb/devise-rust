@@ -14,4 +14,25 @@ workspace = true
 
 [dependencies]
 devise-rust = { path = "../devise-rust" }
-# Phase 7 adds: actix-web, actix-session (see .planning/ROADMAP.md)
+# D-14/D-31 posture: actix-web pinned to the 4.12 line (4.13 requires rustc 1.88
+# — Pitfall 6 / RESEARCH.md); actix-session 0.11 pairs with it.
+actix-web = { version = "~4.12", default-features = false }
+actix-session = { version = "0.11", features = ["cookie-session"], default-features = false }
+futures-util = { version = "0.3", default-features = false }
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+rstest.workspace = true
+pretty_assertions.workspace = true
+actix-session = { version = "0.11", features = ["cookie-session"], default-features = false }
+actix-web = { version = "~4.12", default-features = false, features = ["macros"] }
+
+[[test]]
+name = "session_bridge"
+path = "tests/session_bridge.rs"
