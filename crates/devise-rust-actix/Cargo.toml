@@ -32,7 +32,18 @@ rstest.workspace = true
 pretty_assertions.workspace = true
 actix-session = { version = "0.11", features = ["cookie-session"], default-features = false }
 actix-web = { version = "~4.12", default-features = false, features = ["macros"] }
+actix-http = "3"
+regex = { workspace = true }
+devise-rust-diesel = { path = "../devise-rust-diesel", features = ["sqlite"] }
+devise-rust-migrations = { path = "../devise-rust-migrations" }
+diesel.workspace = true
+diesel-async = { version = "0.6.1", features = ["sqlite", "deadpool"] }
 
 [[test]]
 name = "session_bridge"
 path = "tests/session_bridge.rs"
+harness = true
+
+[[example]]
+name = "actix-demo"
+path = "examples/actix-demo/main.rs"

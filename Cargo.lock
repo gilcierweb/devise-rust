@@ -1115,13 +1115,19 @@ dependencies = [
 name = "devise-rust-actix"
 version = "0.1.0"
 dependencies = [
+ "actix-http",
  "actix-session",
  "actix-web",
  "async-trait",
  "chrono",
  "devise-rust",
+ "devise-rust-diesel",
+ "devise-rust-migrations",
+ "diesel",
+ "diesel-async",
  "futures-util",
  "pretty_assertions",
+ "regex",
  "rstest",
  "serde",
  "serde_json",

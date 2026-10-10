@@ -44,4 +44,4 @@ pub use remember::{
     RememberRead, apply_op, apply_ops, attrs_for_scope, clear_op, cookie_for_set,
     derive_remember_key, forget_op, read_cookie, removal_cookie, resolve_inbound,
 };
-pub use routes::{DeviseRouteConfig, devise_for, route_specs_for_mapping};
+pub use routes::{DeviseWebState, FullDeviseModel, devise_for_users, route_specs_for_mapping};

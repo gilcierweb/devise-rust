@@ -205,6 +205,25 @@ impl<M: AnyDeviseModel + Send + Sync + 'static> FromRequest for RequireAuth<M> {
         let resolved = resolved_auth(req);
         let mapping = resolved.as_ref().and_then(|r| r.mapping.clone());
         let config = resolved.as_ref().and_then(|r| r.config.clone());
+        // Devise `store_location!`: GET navigational non-XHR requests are
+        // remembered in the session so post-sign-in can return here
+        // (T-08-08: same-host-only parse; POST/absolute/relative-foreign
+        // targets are rejected by the core validator).
+        if let (Some(mapping), Some(config)) = (&mapping, &config) {
+            let navigational = request.is_navigational_format(config)
+                && matches!(request.method, HttpMethod::Get)
+                && !request.is_xhr();
+            if navigational {
+                if let Some(target) =
+                    devise_rust::request::AuthRequest::parse_stored_uri(&request.path)
+                {
+                    use actix_session::SessionExt as _;
+                    let session = req.get_session();
+                    let key = devise_rust::failure::stored_location_key(&mapping.name);
+                    drop(session.insert(&key, target));
+                }
+            }
+        }
         Box::pin(async move {
             let response = build_unauthenticated_send_safe(&request, mapping, config);
             Err(error::InternalError::from_response("", response).into())

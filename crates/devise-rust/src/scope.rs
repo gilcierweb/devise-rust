@@ -346,20 +346,36 @@ impl Mapping {
     fn push_password_routes(&self, specs: &mut Vec<RouteSpec>) {
         let password = self.scoped(&self.path_names.password);
         let name = self.named("password");
-        for (method, action, route_name) in [
-            ("GET", "new", format!("new_{name}")),
-            ("POST", "create", name.clone()),
-            ("GET", "edit", format!("edit_{name}")),
-            ("PATCH", "update", name.clone()),
-            ("PUT", "update", name.clone()),
+        for (path, method, action, route_name) in [
+            (
+                format!("{password}/new"),
+                "GET",
+                "new",
+                format!("new_{name}"),
+            ),
+            (password.clone(), "POST", "create", name.clone()),
+            (
+                format!("{password}/edit"),
+                "GET",
+                "edit",
+                format!("edit_{name}"),
+            ),
+            (password.clone(), "PATCH", "update", name.clone()),
+            (password, "PUT", "update", name.clone()),
         ] {
-            specs.push(RouteSpec::new(password.clone(), method, action, route_name));
+            specs.push(RouteSpec::new(path, method, action, route_name));
         }
     }
 
     fn push_confirmation_routes(&self, specs: &mut Vec<RouteSpec>) {
         let confirmation = self.scoped(&self.path_names.confirmation);
         let name = self.named("confirmation");
+        specs.push(RouteSpec::new(
+            format!("{confirmation}/new"),
+            "GET",
+            "new",
+            format!("new_{name}"),
+        ));
         specs.push(RouteSpec::new(
             confirmation.clone(),
             "GET",
@@ -373,6 +389,12 @@ impl Mapping {
         // Unlocks routes (only when unlock_strategy includes :email)
         let unlock = self.scoped(&self.path_names.unlock);
         let name = self.named("unlock");
+        specs.push(RouteSpec::new(
+            format!("{unlock}/new"),
+            "GET",
+            "new",
+            format!("new_{name}"),
+        ));
         specs.push(RouteSpec::new(unlock.clone(), "GET", "show", name.clone()));
         specs.push(RouteSpec::new(unlock, "POST", "create", name));
     }
