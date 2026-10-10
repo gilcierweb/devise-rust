@@ -203,11 +203,29 @@ pub trait DatabaseAuthenticatable: Authenticatable {
         let allowed = current
             .as_deref()
             .is_some_and(|pw| self.valid_password(pw, config));
+        // Devise mass-assignment routes `password`/`password_confirmation`
+        // through the `password=` setter (which hashes) — in BOTH the success
+        // and the failure branch (the failed record re-renders with the new
+        // attributes in memory but is never persisted). `assign_attributes`
+        // deliberately ignores password keys (per its contract), so the pair
+        // goes through `set_password` here, mirroring `new_with_session`.
+        let new_password = params
+            .remove("password")
+            .and_then(|v| v.as_str().map(str::to_string));
+        let new_confirmation = params
+            .remove("password_confirmation")
+            .and_then(|v| v.as_str().map(str::to_string));
+        if new_password.is_some() {
+            self.set_password(new_password, config);
+        }
+        self.set_password_confirmation(new_confirmation);
         self.assign_attributes(params);
         let mut errors = ValidationErrors::new();
         if !allowed {
             errors.add("current_password", ":invalid");
         }
+        // Virtuals always cleared after the round-trip (Devise
+        // `clean_up_passwords` runs on both branches).
         self.clean_up_passwords();
         if errors.is_empty() {
             Ok(())
@@ -751,7 +769,7 @@ pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
         let Some(mut record) = Self::with_reset_password_token(&original, adapter, config).await?
         else {
             let mut errors = ValidationErrors::new();
-            errors.add("reset_password_token", ":not_found");
+            errors.add("reset_password_token", ":invalid");
             return Ok(ResourceWithErrors::new(Self::default(), errors));
         };
 
@@ -2564,7 +2582,7 @@ mod tests {
                 .errors
                 .get("reset_password_token")
                 .map(Vec::as_slice),
-            Some(&[":not_found".to_string()][..])
+            Some(&[":invalid".to_string()][..])
         );
         assert!(DatabaseAuthenticatable::valid_password(
             &TestUser::testing("secret123", &config),
