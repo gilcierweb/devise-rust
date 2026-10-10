@@ -52,7 +52,9 @@ use std::marker::PhantomData;
 
 use async_trait::async_trait;
 use devise_rust::adapter::{ChangeSet, Conditions, DeviseKey, OrmAdapter, OrmError, Value};
-use sea_orm::{ActiveModelBehavior, ActiveModelTrait, DatabaseConnection, IntoActiveModel, QueryFilter};
+use sea_orm::{
+    ActiveModelBehavior, ActiveModelTrait, DatabaseConnection, IntoActiveModel, QueryFilter,
+};
 
 use crate::error::map_sea_orm_error;
 
@@ -72,9 +74,9 @@ pub use crate::bridge::SeaOrmModel;
 ///   diff to a re-read (empty `UPDATE` is invalid SQL — Pitfall 6).
 /// * `update_columns` writes the full named map regardless of diff —
 ///   `ActiveRecord::Persistence#update_columns` parity: no validations, no
-    ///   callbacks, `updated_at` untouched unless named — and that is what
-    ///   carries an unchanged-value force-write (devise #5783, D-16: every
-    ///   named field is `Set`; sea-orm's unchanged-detection never appears).
+///   callbacks, `updated_at` untouched unless named — and that is what
+///   carries an unchanged-value force-write (devise #5783, D-16: every
+///   named field is `Set`; sea-orm's unchanged-detection never appears).
 /// * `increment_counter` renders one atomic `SET column = column + 1`
 ///   statement via [`counter::increment_counter`] and re-reads (D-11).
 /// * `create` inserts the bridge-built `ActiveModel` (PK `NotSet` on

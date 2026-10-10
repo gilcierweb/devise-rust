@@ -67,7 +67,10 @@ where
 /// [`OrmError::InvalidKey`] when the key shape does not fit the model's
 /// primary key (the bridge names `table.id`); backend failures propagate as
 /// their [`map_sea_orm_error`] mapping.
-pub async fn get<E>(db: &sea_orm::DatabaseConnection, key: &DeviseKey) -> Result<Option<E::Model>, OrmError>
+pub async fn get<E>(
+    db: &sea_orm::DatabaseConnection,
+    key: &DeviseKey,
+) -> Result<Option<E::Model>, OrmError>
 where
     E: SeaOrmModel,
 {
