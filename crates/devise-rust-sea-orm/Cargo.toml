@@ -27,6 +27,8 @@ sqlx-sqlite = ["sea-orm/sqlx-sqlite"]
 # Experimental (D-33): the mysql arm compiles behind this feature but has no
 # CI execution and no execution verification - the crate docs say so.
 sqlx-mysql = ["sea-orm/sqlx-mysql"]
+# End-to-end Postgres testcontainers leg for the shared contract suite (07-02).
+e2e-pg-sea = ["sqlx-postgres"]
 
 [dependencies]
 devise-rust = { path = "../devise-rust", version = "0.1" }
@@ -63,10 +65,19 @@ devise-rust-migrations = { path = "../devise-rust-migrations" }
 # Shared contract suite (D-24): this crate's integration tests are thin
 # wrappers that run the shared cases against the sqlite rig (D-26).
 devise-rust-adapter-tests = { path = "../devise-rust-adapter-tests" }
+# testcontainers for the pg rig (D-25/D-32): pinned to 0.25.0 / modules 0.13.0
+# per STATE.md decisions; never in default/MSRV builds.
+testcontainers = { version = "=0.25.0", default-features = false }
+testcontainers-modules = { version = "0.13.0", default-features = false, features = ["postgres"] }
 
 [[test]]
 name = "adapter"
 path = "tests/adapter.rs"
 required-features = ["sqlx-sqlite"]
+
+[[test]]
+name = "adapter_pg"
+path = "tests/adapter_pg.rs"
+required-features = ["e2e-pg-sea"]
 
 # The adapter_pg target + `e2e-pg-sea` feature land with 07-02 (pg rig).

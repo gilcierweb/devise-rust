@@ -40,8 +40,8 @@ impl ContractFactory for SqliteUsersFactory {
     }
 }
 
-/// Shared-suite leg over the uuid-PK `uuid_users` table (hyphenated `TEXT`
-/// id on sqlite, D-35): same fresh-rig-per-case shape.
+/// Shared-suite leg over the uuid-PK `uuid_users` table (native UUID on pg,
+/// hyphenated `TEXT` on sqlite — D-35): same fresh-rig-per-case shape.
 struct SqliteUuidUsersFactory;
 
 impl ContractFactory for SqliteUuidUsersFactory {
@@ -53,9 +53,9 @@ impl ContractFactory for SqliteUuidUsersFactory {
     }
 
     fn key_of_created(&self, row: &uuid_users::Model) -> DeviseKey {
-        DeviseKey::from_uuid(
-            uuid::Uuid::parse_str(&row.id).expect("uuid fixture ids are hyphenated uuids"),
-        )
+        // On sqlite the UUID is stored as TEXT, but sea-orm with-uuid feature
+        // returns it as Uuid; convert to DeviseKey::Uuid.
+        DeviseKey::from_uuid(row.id)
     }
 
     fn missing_key(&self) -> DeviseKey {
@@ -209,8 +209,7 @@ async fn sqlite_write_bridge_rejects_unknown_and_id_columns() {
         .create(NewUuidUser::sample("bridge-edge-uuid@example.test", now))
         .await
         .expect("uuid row stores");
-    let uuid_key =
-        DeviseKey::from_uuid(uuid::Uuid::parse_str(&uuid_created.id).expect("hyphenated uuid"));
+    let uuid_key = DeviseKey::from_uuid(uuid_created.id);
     let uuid_unknown = rig
         .uuid_users
         .update_columns(

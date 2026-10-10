@@ -23,6 +23,7 @@ use devise_rust_sea_orm::bridge::{
     extract_required_datetime, extract_required_i32, extract_required_string,
 };
 use sea_orm::sea_query::SimpleExpr;
+use uuid::Uuid;
 
 /// Integer-PK fixture table (D-26 i64 leg).
 pub mod users {
@@ -386,19 +387,20 @@ impl ContractModel for Model {
 }
 
 /// Uuid-PK fixture table (D-26 uuid leg, D-35): identical columns, but the
-/// primary key is a hyphenated uuid stored as `TEXT` (sqlite has no native
-/// UUID type; the bridge owns the spelling; native `UUID` belongs to the pg
-/// fixture in 07-02).
+/// primary key uses native UUID on pg (via sea-orm's `with-uuid` feature) and
+/// hyphenated TEXT on sqlite (sqlite has no native UUID type). The bridge
+/// handles both: on sqlite the UUID is stored as hyphenated TEXT; on pg it
+/// uses the native UUID column type via `gen_random_uuid()`.
 pub mod uuid_users {
     use sea_orm::entity::prelude::*;
 
-    /// Full-module fixture row with a `TEXT` uuid primary key.
+    /// Full-module fixture row with a UUID primary key (native on pg, TEXT on sqlite).
     #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
     #[sea_orm(table_name = "uuid_users")]
     pub struct Model {
-        /// Hyphenated uuid primary key (`TEXT`, caller-assigned).
+        /// UUID primary key (native on pg, hyphenated TEXT on sqlite).
         #[sea_orm(primary_key, auto_increment = false)]
-        pub id: String,
+        pub id: Uuid,
         /// Authentication key.
         pub email: String,
         /// Bcrypt digest.
@@ -447,12 +449,12 @@ pub mod uuid_users {
 }
 
 /// Insert shape for [`uuid_users::Model`]: the caller assigns the
-/// hyphenated uuid id (the uuid-leg counterpart of the database-assigned
+/// UUID id (the uuid-leg counterpart of the database-assigned
 /// integer id — same ownership shape as the diesel/sqlx fixtures).
 #[derive(Debug, Clone, Default)]
 pub struct NewUuidUser {
-    /// Hyphenated uuid primary key.
-    pub id: String,
+    /// UUID primary key.
+    pub id: Uuid,
     /// Authentication key.
     pub email: String,
     /// Bcrypt digest.
@@ -494,11 +496,11 @@ pub struct NewUuidUser {
 }
 
 impl NewUuidUser {
-    /// Full sample row under a fresh hyphenated uuid id.
+    /// Full sample row under a fresh UUID id.
     #[must_use]
     pub fn sample(email: &str, now: NaiveDateTime) -> Self {
         Self {
-            id: uuid::Uuid::new_v4().hyphenated().to_string(),
+            id: uuid::Uuid::new_v4(),
             email: email.to_owned(),
             encrypted_password: "bcrypt-digest".to_owned(),
             reset_password_token: Some(format!("enc-reset-{email}")),
@@ -546,20 +548,20 @@ impl SeaOrmModel for uuid_users::Entity {
         }
     }
 
-    /// D-35: a uuid key binds as its hyphenated `TEXT` spelling; an integer
+    /// D-35: a uuid key binds as its native UUID; an integer
     /// key against this table refuses with `InvalidKey` naming the column —
     /// never a silent miss (Pitfall 10).
     fn pk_condition(key: &DeviseKey) -> Result<SimpleExpr, OrmError> {
         use sea_orm::ColumnTrait as _;
         match key {
-            DeviseKey::Uuid(id) => Ok(uuid_users::Column::Id.eq(id.hyphenated().to_string())),
+            DeviseKey::Uuid(id) => Ok(uuid_users::Column::Id.eq(*id)),
             DeviseKey::Integer(_) => Err(OrmError::InvalidKey(
                 "uuid_users.id is a uuid primary key".to_owned(),
             )),
         }
     }
 
-    /// The caller-assigned hyphenated id arrives `Set` (uuid legs assign
+    /// The caller-assigned UUID id arrives `Set` (uuid legs assign
     /// their own keys; D-20's `NotSet` rule covers database-assigned ids).
     fn insert_model(new: NewUuidUser) -> uuid_users::ActiveModel {
         use sea_orm::ActiveValue::Set;
@@ -591,7 +593,7 @@ impl SeaOrmModel for uuid_users::Entity {
         use sea_orm::ActiveValue::Set;
         match key {
             DeviseKey::Uuid(id) => Ok(uuid_users::ActiveModel {
-                id: Set(id.hyphenated().to_string()),
+                id: Set(*id),
                 ..uuid_users::ActiveModel::default()
             }),
             DeviseKey::Integer(_) => Err(OrmError::InvalidKey(

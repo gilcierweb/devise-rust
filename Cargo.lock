@@ -892,6 +892,8 @@ dependencies = [
  "devise-rust-migrations",
  "sea-orm",
  "sea-orm-migration",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
  "uuid",
 ]
