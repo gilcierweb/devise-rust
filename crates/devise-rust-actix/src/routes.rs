@@ -305,7 +305,7 @@ fn errors_json(errors: &ValidationErrors) -> JsonValue {
             .or_insert_with(|| JsonValue::Array(Vec::new()))
             .as_array_mut()
         {
-            list.push(JsonValue::String(message))
+            list.push(JsonValue::String(message));
         }
     }
     JsonValue::Object(map)
