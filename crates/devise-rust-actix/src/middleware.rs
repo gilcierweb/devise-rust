@@ -39,11 +39,19 @@ use actix_web::{
     dev::{Service, ServiceRequest, ServiceResponse, Transform},
 };
 use devise_rust::{
+    adapter::DeviseKey,
     config::DeviseConfig,
+    failure::AnyDeviseModel,
+    hooks::HookRegistry,
+    model::ModelFinder,
     request::{AuthRequest, HttpMethod, RequestFlags},
-    scope::ScopeRegistry,
-    session::SessionStore,
+    scope::{Mapping, ScopeRegistry},
+    session::{SessionStore, keys},
 };
+use serde_json::Value;
+use std::str::FromStr;
+
+use actix_session::SessionExt;
 
 /// Shared configuration for the middleware.
 #[derive(Clone)]
@@ -54,7 +62,38 @@ pub struct DeviseMiddlewareConfig {
     pub scope_registry: Arc<ScopeRegistry>,
     /// Devise configuration.
     pub config: Arc<DeviseConfig>,
+    /// Per-scope model finders used to resolve session users (08-02).
+    pub finders: HashMap<String, Arc<dyn ModelFinder>>,
+    /// Hook registry (reserved for hook dispatch in later plans).
+    pub hooks: Arc<HookRegistry>,
 }
+
+/// Per-request resolved authentication state staged in request extensions.
+///
+/// The middleware fills this **before** the inner service is polled:
+/// `AuthRequest` construction and the session-payload snapshot are
+/// synchronous, record resolution happens while the handler future is
+/// created but unpolled. Extractors read the staged values and never touch
+/// `actix_session::Session` (D-04 / ACTIX-02 prohibition).
+#[derive(Clone, Default)]
+pub struct ResolvedAuth {
+    /// Longest-prefix scope resolved from the request path (`find_by_path`).
+    pub scope: Option<String>,
+    /// Mapping for the resolved scope, if any.
+    pub mapping: Option<Mapping>,
+    /// Records resolved from session payloads, keyed by scope.
+    pub users: HashMap<String, Arc<dyn AnyDeviseModel>>,
+    /// Session payloads `[key, salt]` per scope (for `<scope>_session`).
+    pub payloads: HashMap<String, Value>,
+    /// Devise configuration shared with the failure renderer path.
+    pub config: Option<Arc<DeviseConfig>>,
+}
+
+/// Handle staged in request extensions: `Arc<Mutex<_>>` so the middleware
+/// future stays `Send` (the guard is taken and released synchronously,
+/// never held across an `await`). Extractors lock briefly and clone the
+/// snapshot; the `Send` contract of handler futures is preserved.
+pub type ResolvedAuthHandle = Arc<std::sync::Mutex<ResolvedAuth>>;
 
 /// `DeviseMiddleware` — outer [`Transform`] producing the per-request service.
 #[derive(Clone)]
@@ -75,15 +114,30 @@ impl DeviseMiddleware {
                 session_store,
                 scope_registry,
                 config,
+                finders: HashMap::new(),
+                hooks: Arc::new(HookRegistry::new()),
             },
         }
+    }
+
+    /// Register a per-scope model finder (used to resolve session users).
+    #[must_use]
+    pub fn with_finder(mut self, scope: &str, finder: Arc<dyn ModelFinder>) -> Self {
+        self.config.finders.insert(scope.to_string(), finder);
+        self
+    }
+
+    /// Override the hook registry used for future hook dispatch.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Arc<HookRegistry>) -> Self {
+        self.config.hooks = hooks;
+        self
     }
 }
 
 impl<S, B> Transform<S, ServiceRequest> for DeviseMiddleware
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
-    S::Future: Send + 'static,
     B: MessageBody + 'static,
 {
     type Response = ServiceResponse<B>;
@@ -107,12 +161,11 @@ pub struct DeviseMiddlewareService<S> {
 impl<S, B> Service<ServiceRequest> for DeviseMiddlewareService<S>
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
-    S::Future: Send + 'static,
     B: MessageBody + 'static,
 {
     type Response = ServiceResponse<B>;
     type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
 
     fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.service.poll_ready(cx)
@@ -131,12 +184,87 @@ where
         // synchronously; the remainder of the pipeline owns plain Rust values.
         let auth_request = build_auth_request(&req, &config.config, scope.as_deref());
 
-        // Attach to request extensions for downstream handlers/extractors.
+        // Session payload snapshot (synchronous, D-04): the `Session` handle
+        // is read and dropped BEFORE any `.await`. Resolution of boxed
+        // records happens inside the service future (below), where no
+        // `Session` handle is alive.
+        let session = req.get_session();
+        let mut payloads = HashMap::new();
+        for finder_scope in config.finders.keys() {
+            let session_key = keys::scope_session_key(finder_scope);
+            if let Some(value) = session.get::<Value>(&session_key).ok().flatten() {
+                payloads.insert(finder_scope.clone(), value);
+            }
+        }
+        drop(session);
+
+        // Attach the AuthRequest and the shared resolved-auth handle. The
+        // handle is filled inside the future below BEFORE the inner service
+        // future is polled (actix services do not start work until poll),
+        // so handlers and extractors observe the resolved state.
+        let handle: ResolvedAuthHandle = Arc::new(std::sync::Mutex::new(ResolvedAuth {
+            scope: scope.clone(),
+            mapping: scope
+                .as_deref()
+                .and_then(|s| config.scope_registry.get(s).cloned()),
+            users: HashMap::new(),
+            payloads: payloads.clone(),
+            config: Some(config.config.clone()),
+        }));
         req.extensions_mut().insert(auth_request);
+        req.extensions_mut().insert(handle.clone());
 
         let fut = self.service.call(req);
-        Box::pin(async move { fut.await })
+        Box::pin(async move {
+            // Record resolution: adapter `.await`s happen here with no
+            // `Session` handle alive (owned-extract, D-04).
+            let users = resolve_users(&config, &payloads).await;
+            if let Ok(mut guard) = handle.lock() {
+                guard.users = users;
+            }
+            fut.await
+        })
     }
+}
+
+/// Resolve session users for every scope that has a payload and a
+/// registered finder, validating the stored salt (warden fetch semantics).
+///
+/// Salt mismatches fail closed to "no user"; the session-key deletion side
+/// effect remains the bridge's job on its next synchronous fetch.
+async fn resolve_users(
+    config: &DeviseMiddlewareConfig,
+    payloads: &HashMap<String, Value>,
+) -> HashMap<String, Arc<dyn AnyDeviseModel>> {
+    let mut users = HashMap::new();
+    for (scope, value) in payloads {
+        let Some(finder) = config.finders.get(scope) else {
+            continue;
+        };
+        let Some(arr) = value.as_array() else {
+            continue;
+        };
+        let (Some(key_str), Some(stored_salt)) = (
+            arr.first().and_then(Value::as_str),
+            arr.get(1).and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let Ok(key) = DeviseKey::from_str(key_str) else {
+            continue;
+        };
+        let Ok(Some(record)) = finder.get_boxed(&key).await else {
+            continue;
+        };
+        let Some(current_salt) = record.authenticatable_salt() else {
+            continue;
+        };
+        if !devise_rust::crypto::secure_compare(&current_salt, stored_salt) {
+            continue;
+        }
+        users.insert(scope.clone(), Arc::from(record));
+    }
+    users
 }
 
 /// Build an owned [`AuthRequest`] snapshot of an actix request.
