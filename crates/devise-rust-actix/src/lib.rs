@@ -31,7 +31,12 @@ pub mod test_helpers;
 
 pub use bridge::ActixSessionStore;
 pub use callbacks::{derive_actix_key, rotate_csrf_token};
-pub use extractors::{Auth, RequireAuth};
+pub use extractors::{
+    Auth, AuthGroup, RequireAuth, admin_session, admin_signed_in, authenticate_admin,
+    authenticate_group, authenticate_scope, authenticate_user, current_admin, current_scope_record,
+    current_user, group_signed_in, require_no_authentication, scope_session, scope_signed_in,
+    user_session, user_signed_in,
+};
 pub use failure::ActixFailureRenderer;
-pub use middleware::{DeviseMiddleware, DeviseMiddlewareConfig};
+pub use middleware::{DeviseMiddleware, DeviseMiddlewareConfig, ResolvedAuth, ResolvedAuthHandle};
 pub use routes::{DeviseRouteConfig, devise_for, route_specs_for_mapping};

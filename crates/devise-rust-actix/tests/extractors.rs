@@ -20,7 +20,10 @@ use devise_rust::model::AdapterBridge;
 use devise_rust::scope::{Mapping, Module, PathNames, ScopeRegistry, SignOutVia};
 use devise_rust_actix::{
     ActixSessionStore, DeviseMiddleware,
-    extractors::{Auth, RequireAuth},
+    extractors::{
+        Auth, AuthGroup, RequireAuth, admin_signed_in, authenticate_group, current_admin,
+        current_user, group_signed_in, user_session, user_signed_in,
+    },
 };
 
 /// User fixture for the `user` scope.
@@ -135,7 +138,6 @@ impl TestAppState {
         user
     }
 
-    #[allow(dead_code)] // used by Task 2 multi-scope tests
     async fn seed_admin(&self, id: i64, email: &str) -> AdminUser {
         let admin = AdminUser {
             id,
@@ -184,6 +186,46 @@ async fn bridge_sign_in(session: Session, state: web::Data<Arc<TestAppState>>) -
     HttpResponse::Ok().finish()
 }
 
+/// Sign an admin in via the session bridge (Task 2 multi-scope slice).
+async fn bridge_sign_in_admin(
+    session: Session,
+    state: web::Data<Arc<TestAppState>>,
+) -> HttpResponse {
+    let admin = state
+        .admin_adapter
+        .get(&DeviseKey::from_i64(1))
+        .await
+        .expect("lookup")
+        .expect("admin present");
+    let (key, salt) = admin.session_pair();
+    devise_rust_actix::bridge::insert_session_and_renew_sync(&session, "admin", &key, &salt)
+        .expect("insert");
+    HttpResponse::Ok().finish()
+}
+
+/// Sign the `user` scope out while leaving other scopes untouched (D-10
+/// multi-scope independence).
+async fn bridge_sign_out_user(session: Session) -> HttpResponse {
+    devise_rust_actix::bridge::sign_out_and_renew(&session, "user").expect("sign out");
+    HttpResponse::Ok().finish()
+}
+
+/// Multi-scope status route: reads `user` + `admin` plus the group helper
+/// results in one handler (D-10).
+async fn multi_scope_status(req: HttpRequest) -> HttpResponse {
+    let group = AuthGroup::new("any", &["user", "admin"]);
+    let group_scopes = authenticate_group(&req, &group).unwrap_or_default();
+    HttpResponse::Ok().json(serde_json::json!({
+        "user_signed_in": user_signed_in(&req),
+        "admin_signed_in": admin_signed_in(&req),
+        "current_user": current_user::<AuthUser>(&req).map(|u| u.email),
+        "current_admin": current_admin::<AdminUser>(&req).map(|a| a.email),
+        "user_session": user_session(&req).is_some(),
+        "group_signed_in": group_signed_in(&req, &group),
+        "group_scopes": group_scopes,
+    }))
+}
+
 /// Build the full test app inside the caller's async block (the service
 /// type is intentionally left opaque to `actix_web::test`).
 macro_rules! test_app {
@@ -218,7 +260,16 @@ macro_rules! test_app {
                 .route("/users/private", web::get().to(protected_user))
                 .route("/users/soft", web::get().to(soft_user))
                 .route("/users/peer", web::get().to(peer_probe))
-                .route("/devise-test/sign-in", web::get().to(bridge_sign_in)),
+                .route("/users/status", web::get().to(multi_scope_status))
+                .route("/devise-test/sign-in", web::get().to(bridge_sign_in))
+                .route(
+                    "/devise-test/admin-sign-in",
+                    web::get().to(bridge_sign_in_admin),
+                )
+                .route(
+                    "/devise-test/sign-out-user",
+                    web::get().to(bridge_sign_out_user),
+                ),
         )
         .await
     }};
@@ -318,4 +369,69 @@ async fn signed_in_user_reads_record_via_require_auth() {
     let peer: Option<String> = test::read_body_json(resp).await;
     // ConnectionInfo::peer_addr() yields the socket IP (port stripped).
     assert_eq!(peer.as_deref(), Some("192.0.2.44"));
+}
+
+/// D-10: `user` and `admin` authenticate simultaneously and independently;
+/// signing out `user` leaves `admin` signed in; the group helper succeeds
+/// when either scope is present.
+#[actix_web::test]
+async fn multi_scope_independence_and_group() {
+    let state = Arc::new(TestAppState::new());
+    state.seed_user(1, "user@example.com").await;
+    state.seed_admin(1, "admin@example.com").await;
+    let app = test_app!(state.clone());
+
+    // Sign in BOTH scopes on the same session cookie jar.
+    let req = test::TestRequest::get()
+        .uri("/devise-test/sign-in")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let cookies = set_cookie_pairs(&resp);
+    let req = test::TestRequest::get()
+        .uri("/devise-test/admin-sign-in")
+        .insert_header((header::COOKIE, cookies.join("; ")))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let cookies = set_cookie_pairs(&resp);
+    assert!(!cookies.is_empty());
+
+    let body: serde_json::Value = {
+        let req = test::TestRequest::get()
+            .uri("/users/status")
+            .insert_header((header::COOKIE, cookies.join("; ")))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        test::read_body_json(resp).await
+    };
+    assert_eq!(body["user_signed_in"], true);
+    assert_eq!(body["admin_signed_in"], true);
+    assert_eq!(body["current_user"], "user@example.com");
+    assert_eq!(body["current_admin"], "admin@example.com");
+    assert_eq!(body["user_session"], true);
+    assert_eq!(body["group_signed_in"], true);
+    assert_eq!(body["group_scopes"], serde_json::json!(["user", "admin"]));
+
+    // Sign out the user scope only: admin stays signed in (SESS-07 parity).
+    let req = test::TestRequest::get()
+        .uri("/devise-test/sign-out-user")
+        .insert_header((header::COOKIE, cookies.join("; ")))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let cookies = set_cookie_pairs(&resp);
+
+    let body: serde_json::Value = {
+        let req = test::TestRequest::get()
+            .uri("/users/status")
+            .insert_header((header::COOKIE, cookies.join("; ")))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        test::read_body_json(resp).await
+    };
+    assert_eq!(body["user_signed_in"], false);
+    assert_eq!(body["admin_signed_in"], true);
+    assert_eq!(body["current_user"], serde_json::Value::Null);
+    assert_eq!(body["current_admin"], "admin@example.com");
+    // Group still succeeds with admin alone.
+    assert_eq!(body["group_signed_in"], true);
+    assert_eq!(body["group_scopes"], serde_json::json!(["admin"]));
 }
