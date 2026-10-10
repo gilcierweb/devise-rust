@@ -435,3 +435,279 @@ async fn multi_scope_independence_and_group() {
     assert_eq!(body["group_signed_in"], true);
     assert_eq!(body["group_scopes"], serde_json::json!(["admin"]));
 }
+
+// ---------------------------------------------------------------------------
+// Task 3: remember-cookie SignedJar transport + bypass test helpers
+// ---------------------------------------------------------------------------
+
+use devise_rust::rememberable::{RememberCookieOp, encode_cookie_value};
+use devise_rust::time::{Clock, SystemClock};
+use devise_rust_actix::remember as actix_remember;
+
+/// Build the remember `Set` op exactly as the core hook would push it:
+/// hardened attrs from `for_scope` over an encoded core codec triple.
+fn remember_set_op(config: &DeviseConfig) -> RememberCookieOp {
+    let clock = SystemClock;
+    let attrs = actix_remember::attrs_for_scope("user", config, &clock);
+    let value = encode_cookie_value("1", "raw-token", &clock.now().timestamp().to_string());
+    RememberCookieOp::Set {
+        scope: "user".to_string(),
+        key: attrs.key.clone(),
+        value,
+        attrs,
+    }
+}
+
+#[actix_web::test]
+async fn remember_set_cookie_carries_hardened_attrs_and_codec() {
+    let config = extractor_config();
+    let key = actix_remember::derive_remember_key(&config).expect("derive");
+    let op = remember_set_op(&config);
+
+    // Sign into a jar and render the delta (what Set-Cookie would carry).
+    let mut jar = actix_web::cookie::CookieJar::new();
+    {
+        let mut signed = jar.signed_mut(&key);
+        actix_remember::apply_op(&mut signed, &op);
+    }
+    let rendered: Vec<String> = jar.delta().map(ToString::to_string).collect();
+    assert_eq!(rendered.len(), 1, "one cookie delta");
+    let header = &rendered[0];
+
+    // D-16 hardened attributes on the wire.
+    assert!(header.starts_with("remember_user_token="), "name: {header}");
+    assert!(header.contains("HttpOnly"), "{header}");
+    assert!(header.contains("Secure"), "{header}");
+    assert!(header.contains("SameSite=Lax"), "{header}");
+    assert!(header.contains("Expires="), "{header}");
+
+    // Expires equals now + remember_for (fixed window, D-13).
+    let clock = devise_rust::time::SystemClock;
+    let attrs =
+        devise_rust::rememberable::RememberableCookieAttrs::for_scope("user", &config, &clock);
+    let expected = attrs
+        .expires
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    assert!(
+        header.contains(&expected) || {
+            // Cookie values are signed+url-encoded; expires is rendered via
+            // the cookie crate from seconds, so compare within one second.
+            let earlier = (attrs.expires - chrono::TimeDelta::seconds(1))
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string();
+            header.contains(&earlier)
+        },
+        "expires ~= now + remember_for in {header}"
+    );
+
+    // Round-trip: a fresh jar over the same key verifies the signature and
+    // exposes the core codec triple.
+    let mut jar = actix_web::cookie::CookieJar::new();
+    let signed_value = {
+        let mut signed = jar.signed_mut(&key);
+        actix_remember::apply_op(&mut signed, &op);
+        let Some(cookie) = jar.delta().next() else {
+            panic!("delta cookie");
+        };
+        cookie.value().to_string()
+    };
+    let mut read_jar = actix_web::cookie::CookieJar::new();
+    read_jar.add_original(actix_web::cookie::Cookie::new(
+        "remember_user_token".to_string(),
+        signed_value,
+    ));
+    let read_signed = read_jar.signed(&key);
+    match actix_remember::read_cookie(&read_signed, "remember_user_token") {
+        actix_remember::RememberRead::Valid {
+            key,
+            value,
+            generated_at,
+        } => {
+            assert_eq!(key, "1");
+            assert_eq!(value, "raw-token");
+            assert!(generated_at.parse::<i64>().is_ok(), "integer epoch");
+        }
+        other => panic!("expected Valid, got {other:?}"),
+    }
+}
+
+#[actix_web::test]
+async fn stale_signed_cookie_yields_clear_and_pass_through() {
+    let config = extractor_config();
+    let key = actix_remember::derive_remember_key(&config).expect("derive");
+
+    // Properly SIGNED garbage value: signature verifies, codec rejects.
+    let mut jar = actix_web::cookie::CookieJar::new();
+    let signed_value = {
+        let mut signed = jar.signed_mut(&key);
+        signed.add(actix_web::cookie::Cookie::new(
+            "remember_user_token".to_string(),
+            "not-a-triple".to_string(),
+        ));
+        jar.delta().next().expect("delta").value().to_string()
+    };
+    let mut read_jar = actix_web::cookie::CookieJar::new();
+    read_jar.add_original(actix_web::cookie::Cookie::new(
+        "remember_user_token".to_string(),
+        signed_value,
+    ));
+    let read_signed = read_jar.signed(&key);
+
+    assert_eq!(
+        actix_remember::read_cookie(&read_signed, "remember_user_token"),
+        actix_remember::RememberRead::Stale
+    );
+
+    // Stale decodes to a Clear op (drop-clear + pass-through, never Failure).
+    let clear = actix_remember::resolve_inbound(&read_signed, "user", &config)
+        .expect_err("stale inbound resolves to a clear op");
+    let RememberCookieOp::Clear {
+        key: clear_key,
+        scope: clear_scope,
+    } = &*clear
+    else {
+        panic!("clear op");
+    };
+    assert_eq!(clear_key, "remember_user_token");
+    assert_eq!(clear_scope, "user");
+
+    // Applying the clear renders a tombstone cookie.
+    let mut out_jar = actix_web::cookie::CookieJar::new();
+    {
+        let mut signed = out_jar.signed_mut(&key);
+        actix_remember::apply_op(&mut signed, clear.as_ref());
+    }
+    let tombstone = out_jar.delta().next().expect("tombstone").to_string();
+    assert!(tombstone.starts_with("remember_user_token="), "{tombstone}");
+    // cookie 0.16 `make_removal` renders Max-Age=0 + immediate Expires.
+    assert!(tombstone.contains("Max-Age=0"), "tombstone: {tombstone}");
+}
+
+#[actix_web::test]
+async fn secure_opt_out_renders_no_secure_attribute() {
+    let mut config = extractor_config();
+    config
+        .rememberable_options
+        .insert("secure".to_string(), "false".to_string());
+    let op = remember_set_op(&config);
+    let RememberCookieOp::Set { attrs, value, .. } = &op else {
+        panic!("set op");
+    };
+    let cookie = actix_remember::cookie_for_set(value, attrs);
+    let rendered = cookie.to_string();
+    assert!(!rendered.contains("Secure"), "{rendered}");
+    assert!(rendered.contains("HttpOnly"), "{rendered}");
+    assert!(rendered.contains("SameSite=Lax"), "{rendered}");
+
+    // Key override through rememberable_options.
+    let mut keyed = extractor_config();
+    keyed
+        .rememberable_options
+        .insert("key".to_string(), "custom_remember".to_string());
+    let clock = SystemClock;
+    let attrs = actix_remember::attrs_for_scope("user", &keyed, &clock);
+    assert_eq!(attrs.key, "custom_remember");
+}
+
+/// D-17: `test_helpers::sign_in` (bypass + renew) replays into the
+/// `RequireAuth` route without a password post; `sign_out_with_forget`
+/// clears the scope AND emits the remember tombstone.
+#[actix_web::test]
+async fn bypass_helpers_reach_protected_route_via_cookie_replay() {
+    let state = Arc::new(TestAppState::new());
+    state.seed_user(1, "bypass@example.com").await;
+
+    let config = state.config.clone();
+    let app = test::init_service(
+        App::new()
+            .wrap(
+                SessionMiddleware::builder(
+                    CookieSessionStore::default(),
+                    devise_rust_actix::callbacks::derive_actix_key(&config.secret_key)
+                        .expect("key"),
+                )
+                .cookie_secure(false)
+                .build(),
+            )
+            .app_data(web::Data::new(state.clone()))
+            .route(
+                "/devise-test/bypass-sign-in",
+                web::get().to(
+                    |session: Session, state: web::Data<Arc<TestAppState>>| async move {
+                        let user = state
+                            .user_adapter
+                            .get(&DeviseKey::from_i64(1))
+                            .await
+                            .expect("lookup")
+                            .expect("user present");
+                        // IntegrationHelpers parity: bypass_sign_in — the
+                        // helper never hashes a password.
+                        devise_rust_actix::test_helpers::bypass_sign_in(&session, "user", &user)
+                            .await
+                            .expect("bypass");
+                        HttpResponse::Ok().finish()
+                    },
+                ),
+            )
+            .route(
+                "/devise-test/bypass-sign-out",
+                web::get().to(|session: Session| async move {
+                    let config = extractor_config();
+                    let op = devise_rust_actix::test_helpers::sign_out_with_forget(
+                        &session, "user", &config,
+                    )
+                    .await
+                    .expect("sign out");
+                    assert_eq!(op.scope(), "user");
+                    assert_eq!(op.key(), "remember_user_token");
+                    HttpResponse::Ok().finish()
+                }),
+            ),
+    )
+    .await;
+
+    let req = test::TestRequest::get()
+        .uri("/devise-test/bypass-sign-in")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_success());
+    let cookies = devise_rust_actix::test_helpers::set_cookie_pairs(&resp);
+    assert!(!cookies.is_empty(), "bypass sign-in rotates session cookie");
+
+    // Replay into the FULL middleware stack: RequireAuth must see the user.
+    let full = test_app!(state.clone());
+    let req = test::TestRequest::get()
+        .uri("/users/private")
+        .insert_header((
+            header::COOKIE,
+            devise_rust_actix::test_helpers::cookie_header(&cookies),
+        ))
+        .to_request();
+    let resp = test::call_service(&full, req).await;
+    assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+    let user: AuthUser = test::read_body_json(resp).await;
+    assert_eq!(user.email, "bypass@example.com");
+
+    // Sign out via the helper: the protected route 302s afterwards.
+    let req = test::TestRequest::get()
+        .uri("/devise-test/bypass-sign-out")
+        .insert_header((
+            header::COOKIE,
+            devise_rust_actix::test_helpers::cookie_header(&cookies),
+        ))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let cookies = devise_rust_actix::test_helpers::set_cookie_pairs(&resp);
+
+    let req = test::TestRequest::get()
+        .uri("/users/private")
+        .insert_header((
+            header::COOKIE,
+            devise_rust_actix::test_helpers::cookie_header(&cookies),
+        ))
+        .insert_header((header::ACCEPT, "text/html"))
+        .to_request();
+    let resp = test::call_service(&full, req).await;
+    assert_eq!(resp.status(), actix_web::http::StatusCode::FOUND);
+}

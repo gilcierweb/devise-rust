@@ -26,6 +26,7 @@ pub mod callbacks;
 pub mod extractors;
 pub mod failure;
 pub mod middleware;
+pub mod remember;
 pub mod routes;
 pub mod test_helpers;
 
@@ -39,4 +40,8 @@ pub use extractors::{
 };
 pub use failure::ActixFailureRenderer;
 pub use middleware::{DeviseMiddleware, DeviseMiddlewareConfig, ResolvedAuth, ResolvedAuthHandle};
+pub use remember::{
+    RememberRead, apply_op, apply_ops, attrs_for_scope, clear_op, cookie_for_set,
+    derive_remember_key, forget_op, read_cookie, removal_cookie, resolve_inbound,
+};
 pub use routes::{DeviseRouteConfig, devise_for, route_specs_for_mapping};

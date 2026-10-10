@@ -54,6 +54,69 @@ pub async fn sign_out(
     Ok(())
 }
 
+/// IntegrationHelpers-parity sign-out: bridge sign-out plus the core
+/// `forget` remember-cookie op so a test can drain it through the
+/// `SignedJar` tombstone (T-08-07: logout never leaves a live remember
+/// login).
+///
+/// Returns the [`RememberCookieOp::Clear`] to apply to the response jar.
+///
+/// # Errors
+///
+/// Infallible: see [`sign_out`].
+#[allow(clippy::unused_async)]
+pub async fn sign_out_with_forget(
+    session: &actix_session::Session,
+    scope: &str,
+    config: &DeviseConfig,
+) -> Result<devise_rust::rememberable::RememberCookieOp, devise_rust::error::DeviseError> {
+    crate::bridge::sign_out_and_renew(session, scope)?;
+    Ok(crate::remember::forget_op(scope, config))
+}
+
+/// `bypass_sign_in` parity (Devise `IntegrationHelpers#sign_in`): store the
+/// session payload WITHOUT re-running callbacks but WITH the D-03
+/// renew-before-insert. The model is never re-hashed — the session pair
+/// comes from the record directly.
+///
+/// Returns the session key the payload was inserted under.
+///
+/// # Errors
+///
+/// Returns `DeviseError::Internal` when the session insert fails.
+#[allow(clippy::unused_async)]
+pub async fn bypass_sign_in<M>(
+    session: &actix_session::Session,
+    scope: &str,
+    user: &M,
+) -> Result<String, devise_rust::error::DeviseError>
+where
+    M: devise_rust::failure::AnyDeviseModel + Send + Sync,
+{
+    let (key, salt) = user.session_pair();
+    crate::bridge::bypass_sign_in_and_renew_sync(session, scope, &key, &salt)?;
+    Ok(devise_rust::session::keys::scope_session_key(scope))
+}
+
+/// Capture the `name=value` pairs of every `Set-Cookie` header on a test
+/// response — the replay jar for later `TestRequest::insert_header(COOKIE,
+/// ...)` calls (D-17).
+#[must_use]
+pub fn set_cookie_pairs<B>(resp: &actix_web::dev::ServiceResponse<B>) -> Vec<String> {
+    resp.headers()
+        .get_all(actix_web::http::header::SET_COOKIE)
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| v.split(';').next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Render cookie pairs as a `Cookie` request header value for replay.
+#[must_use]
+pub fn cookie_header(pairs: &[String]) -> String {
+    pairs.join("; ")
+}
+
 /// Sign out multiple scopes via bypass (D-03 renew-before-clear-each).
 ///
 /// # Errors

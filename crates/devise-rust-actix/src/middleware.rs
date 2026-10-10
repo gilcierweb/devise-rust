@@ -313,7 +313,7 @@ fn build_auth_request(
     };
 
     // D-11: read peer_addr from the socket connection only, never
-    // X-Forwarded-For.
+    // any proxy-supplied header.
     let peer_addr = req.connection_info().peer_addr().map(str::to_string);
 
     AuthRequest {
