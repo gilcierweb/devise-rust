@@ -1,0 +1,69 @@
+[package]
+name = "devise-rust-sea-orm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SeaORM adapter for devise-rust"
+repository.workspace = true
+homepage.workspace = true
+# Only named test targets: `tests/models.rs` and `tests/common/mod.rs` are
+# shared support modules, never targets on their own (diesel/sqlx precedent).
+autotests = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Per-dialect features forward to sea-orm's `sqlx-*` driver features (D-23):
+# each feature opts the application into one sqlx driver plus this crate's
+# adapter arm for it — same opt-in cost model as diesel/sqlx (D-14).
+# Compiled; execution lands in 07-02's testcontainers leg.
+sqlx-postgres = ["sea-orm/sqlx-postgres"]
+# Async sqlite driver: runs the shared contract suite in unit CI.
+sqlx-sqlite = ["sea-orm/sqlx-sqlite"]
+# Experimental (D-33): the mysql arm compiles behind this feature but has no
+# CI execution and no execution verification - the crate docs say so.
+sqlx-mysql = ["sea-orm/sqlx-mysql"]
+
+[dependencies]
+devise-rust = { path = "../devise-rust", version = "0.1" }
+# Pinned to the 1.1 line per D-31/STACK: 1.1.20 is the last 1.x patch
+# (rust-version 1.81, inside the 1.85 MSRV pin); sea-orm 2.0.x requires
+# Rust 1.94 (hard out). Runtime + codecs are unconditional
+# (runtime-tokio-rustls, with-chrono, with-uuid, macros per D-15/D-21
+# `DeriveEntityModel`); per-dialect drivers arrive through this crate's
+# `sqlx-*` features above (D-23) so an app compiles only the driver it uses.
+sea-orm = { version = "1.1", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "with-chrono",
+    "with-uuid",
+    "macros",
+] }
+# D-18: `SchemaManager::execute_unprepared` applies the migrations-crate
+# plain-SQL DDL verbatim; the generator ships no sea-orm-native migrations.
+sea-orm-migration = "1.1"
+async-trait.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+# DDL bootstrap for the sqlite rig: the fixture schema is the DDL that
+# `devise-rust-migrations::emit()` generates, applied verbatim through
+# `SchemaManager` (D-18).
+devise-rust-migrations = { path = "../devise-rust-migrations" }
+# Shared contract suite (D-24): this crate's integration tests are thin
+# wrappers that run the shared cases against the sqlite rig (D-26).
+devise-rust-adapter-tests = { path = "../devise-rust-adapter-tests" }
+
+[[test]]
+name = "adapter"
+path = "tests/adapter.rs"
+required-features = ["sqlx-sqlite"]
+
+# The adapter_pg target + `e2e-pg-sea` feature land with 07-02 (pg rig).
