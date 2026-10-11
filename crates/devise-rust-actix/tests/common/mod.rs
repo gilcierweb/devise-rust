@@ -150,6 +150,12 @@ pub struct FixtureUser {
     pub failed_attempts: u32,
     pub unlock_token: Option<String>,
     pub locked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Omniauthable identity pair (D-11): the provider name + uid the
+    /// default linking policy reads and writes.
+    pub provider: Option<String>,
+    pub uid: Option<String>,
+    /// Display name asserted by an OAuth provider profile.
+    pub name: Option<String>,
     #[serde(skip)]
     pub raw_reset_token: Option<String>,
     #[serde(skip)]
@@ -504,6 +510,44 @@ impl devise_rust::mailer::HasEmail for FixtureUser {
     }
 }
 
+/// The omniauthable seam over the fixture (09-04 flow matrix): delegates
+/// to the core default find-link-create policy behind the verified
+/// email gate (D-08/D-09/D-10).
+#[async_trait::async_trait]
+impl devise_rust::omniauthable::Omniauthable for FixtureUser {
+    type New = FixtureUser;
+
+    async fn from_omniauth<A>(
+        profile: devise_rust::omniauthable::ProviderProfile,
+        adapter: &A,
+        clock: &dyn Clock,
+    ) -> devise_rust::error::ResourceWithErrors<Self>
+    where
+        Self: Sized,
+        A: devise_rust::adapter::OrmAdapter<Self, New = Self::New> + Send + Sync,
+    {
+        devise_rust::omniauthable::default_from_omniauth(adapter, &profile, clock).await
+    }
+
+    fn new_from_profile(
+        profile: &devise_rust::omniauthable::ProviderProfile,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Self::New {
+        // A real bcrypt hash keeps the warden salt-in-session fetch valid
+        // (omniauth-created rows carry no usable password — like Devise —
+        // but the salt prefix must exist for the signed-in probe refetch).
+        let mut user = FixtureUser::new_with_password(
+            &profile.email.clone().unwrap_or_default(),
+            "omniauth-no-password-login",
+            &test_config(),
+        );
+        user.provider = Some(profile.provider.clone());
+        user.uid = Some(profile.uid.clone());
+        user.name.clone_from(&profile.name);
+        user
+    }
+}
+
 /// Test configuration: fast `stretches`, fixed 32-byte secret.
 pub fn test_config() -> DeviseConfig {
     DeviseConfig {
@@ -625,6 +669,95 @@ pub async fn build_app(
             )))
             // Probe route OUTSIDE the devise scope (actix scopes claim their
             // prefix) but still prefix-matching the registry's find_by_path.
+            .route("/users_dashboard", web::get().to(private_probe))
+            .route("/users_dashboard", web::post().to(private_probe)),
+    )
+    .await;
+    (state, service)
+}
+
+// ============================================================================
+// Omniauth flow fixtures (09-04): the omniauthable mapping variant, the
+// provider-allowlist config, and the omniauth-aware wired service.
+// ============================================================================
+
+/// Omniauthable mapping variant: the full module matrix plus
+/// `Module::Omniauthable` (the route-table amendment's consumer).
+pub fn omniauth_mapping() -> Mapping {
+    let mut mapping = default_mapping();
+    mapping
+        .modules
+        .push(devise_rust::scope::Module::Omniauthable);
+    mapping
+}
+
+/// Test config with the request-time provider allowlist populated.
+pub fn omniauth_test_config(providers: &[&str]) -> DeviseConfig {
+    DeviseConfig {
+        omniauth_providers: providers.iter().map(ToString::to_string).collect(),
+        ..test_config()
+    }
+}
+
+/// Wired omniauth test service: the omniauth scope (mounted FIRST —
+/// actix matches top-level services in registration order and the
+/// omniauth base is the longer prefix), the full devise scope, and the
+/// dashboard probe for post-sign-in cookie-replay assertions.
+pub async fn build_omniauth_service(
+    mapping: Mapping,
+    config: DeviseConfig,
+    providers: std::collections::HashMap<String, devise_rust::omniauthable::OAuthProviderConfig>,
+) -> (
+    TestState,
+    impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse,
+        Error = actix_web::Error,
+    >,
+) {
+    let all_scopes = vec![mapping.name.clone()];
+    let state = TestState {
+        mapping,
+        config: Arc::new(config),
+        adapter: Arc::new(IdAssigningAdapter::new()),
+        mailer: Arc::new(TestMailer::default()),
+        clock: Arc::new(SystemClock),
+        all_scopes,
+        marker: std::marker::PhantomData,
+    };
+
+    let key =
+        devise_rust_actix::derive_actix_key(&state.config.secret_key).expect("derive actix key");
+    let store = ActixSessionStore::new(key.clone());
+    let scope_name = state.mapping.name.clone();
+    let finder: Arc<dyn devise_rust::model::ModelFinder> =
+        Arc::new(AdapterBridge::new(state.adapter.as_ref().clone()));
+    let middleware = DeviseMiddleware::new(
+        Arc::new(store),
+        registry_with(state.mapping.clone()),
+        state.config.clone(),
+    )
+    .with_finder(&scope_name, finder);
+
+    let omniauth_state = devise_rust_actix::OmniauthWebState::new(state.clone(), providers);
+    let data_state = state.clone();
+    let service = actix_web::test::init_service(
+        App::new()
+            .wrap(middleware)
+            .wrap(
+                SessionMiddleware::builder(CookieSessionStore::default(), key)
+                    .cookie_secure(false)
+                    .build(),
+            )
+            // The omniauth scope FIRST (longest-prefix match wins in
+            // registration order).
+            .service(
+                devise_rust_actix::devise_omniauth_scope(web::Data::new(omniauth_state))
+                    .expect("omniauth scope"),
+            )
+            .service(devise_rust_actix::routes::devise_for_users(web::Data::new(
+                data_state.clone(),
+            )))
             .route("/users_dashboard", web::get().to(private_probe))
             .route("/users_dashboard", web::post().to(private_probe)),
     )

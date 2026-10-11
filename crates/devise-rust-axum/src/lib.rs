@@ -37,6 +37,9 @@
 //! - [`omniauth`] — the authorize + callback pair rendering the 09-03
 //!   core omniauth policy over the shared route spec data (POST-only
 //!   authorize, GET-or-POST callback, PKCE-state always-on).
+//! - [`stub_provider`] — (feature `test-support` only) the generic
+//!   `OAuth2` stub provider for the omniauth flow tests (D-06), shared
+//!   with the actix crate's suite; never compiled into non-test builds.
 //! - [`test_helpers`] — `sign_in` / `sign_out` bypass helpers with
 //!   `Set-Cookie` capture and replay, mirroring Devise's
 //!   `IntegrationHelpers` (test-only surface, shipped like the actix
@@ -80,6 +83,12 @@ pub mod layer;
 pub mod omniauth;
 pub mod remember;
 pub mod routes;
+/// Generic `OAuth2` stub provider — test support only (D-06). Gated
+/// behind the `test-support` cargo feature: never compiled into
+/// non-test builds; consumed by this crate's omniauth flow tests and
+/// the actix crate's via its dev-dependency.
+#[cfg(feature = "test-support")]
+pub mod stub_provider;
 pub mod test_helpers;
 
 pub use bridge::{

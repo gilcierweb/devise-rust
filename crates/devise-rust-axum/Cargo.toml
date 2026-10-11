@@ -12,6 +12,16 @@ homepage.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Generic OAuth2 stub provider (D-06) — test-support ONLY. This crate's
+# own omniauth_flows integration tests and the actix crate's (via its
+# dev-dependency on this crate) enable it; it is never default and no
+# non-test code path references the module. `dep:` deps reuse packages
+# already resolved in the workspace graph (oauth2 pulls sha2 for PKCE;
+# core pulls both for HMAC) — no new registry package enters the build
+# (T-09-SC).
+test-support = ["dep:sha2", "dep:base64"]
+
 [dependencies]
 devise-rust = { path = "../devise-rust" }
 # Phase 9 pins (09-RESEARCH.md Standard Stack, package-audit OK):
@@ -32,6 +42,10 @@ axum-extra = { version = "0.12", features = ["cookie", "cookie-signed"] }
 # `key-expansion`, gating `Key::derive_from` (A3) — neither tower-sessions
 # nor axum-extra forwards that feature.
 cookie = { version = "0.18", features = ["key-expansion"] }
+# Optional, test-support feature only (D-06 stub provider PKCE S256
+# verification): both are workspace pins already in the dependency graph.
+sha2 = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true
@@ -44,6 +58,10 @@ tokio = { workspace = true, features = ["sync"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Self-dependency: enables the `test-support` feature for THIS crate's
+# own integration tests (dev-dependency features unify into the lib
+# build under `cargo test`; the lib gate build never sees them).
+devise-rust-axum = { path = ".", features = ["test-support"] }
 # axum-demo example persistence (D-18 analogue): diesel over an in-memory
 # sqlite pool — zero Docker; the MemoryAdapter oracle stays the unit-speed
 # leg and the testcontainers Postgres path stays documented-only.

@@ -16,9 +16,9 @@
 //! `omniauth_providers` request-time allowlist. The route table is the
 //! shared core spec data —
 //! [`devise_omniauth_scope`] iterates
-//! [`Mapping::omniauth_route_specs_for`](devise_rust::scope::Mapping::omniauth_route_specs_for),
-//! translating only the path capture syntax (`{provider}` -> `:provider`)
-//! for actix's router.
+//! [`Mapping::omniauth_route_specs_for`](devise_rust::scope::Mapping::omniauth_route_specs_for)
+//! — actix-router 0.5 consumes the spec's `{provider}` curly-brace
+//! captures natively, so the shared paths render verbatim.
 //!
 //! ## Mounting
 //!
@@ -300,7 +300,8 @@ async fn sign_in_bookkeeping<M, A, L>(
 /// Register the mapping's omniauth route pair (POST-only authorize plus
 /// GET-or-POST callback) as an actix [`Scope`] mounted at the resolved
 /// omniauth base — the same shared core spec data the axum crate
-/// renders, translated to actix path syntax (`:provider`).
+/// renders — actix-router 0.5 consumes the `{provider}` captures
+/// natively, so the spec paths render verbatim.
 ///
 /// The mapping must be omniauthable (`Module::Omniauthable`); the model
 /// must implement the [`Omniauthable`] seam. Registration validates
@@ -336,21 +337,26 @@ where
     // Registration-time Config error: Devise's dynamic-segment ban.
     devise.mapping.validate_omniauth_paths()?;
     let base = devise.mapping.omniauth_base(&devise.config);
-    // The route table IS the shared core spec data; the `{provider}` ->
-    // `:provider` translation is the only framework transform.
+    // The route table IS the shared core spec data. actix-router 0.5
+    // consumes the same `{provider}` curly-brace captures as the spec,
+    // so the paths render verbatim — only the leading slash is trimmed
+    // (actix matches dynamic-segment resources inside scopes only in
+    // that form, verified against actix-router 0.5's resource parser).
     let specs = devise.mapping.omniauth_route_specs_for(&devise.config);
     let mut by_path: BTreeMap<String, Vec<&RouteSpec>> = BTreeMap::new();
     for spec in &specs {
         let rel = spec
             .path
             .strip_prefix(&base)
-            .map_or_else(|| spec.path.clone(), str::to_string);
+            .map_or_else(|| spec.path.clone(), str::to_string)
+            .trim_start_matches('/')
+            .to_string();
         by_path.entry(rel).or_default().push(spec);
     }
 
     let mut scope = web::scope(&base);
     for (rel, specs) in by_path {
-        let mut resource = web::resource(rel.replace("{provider}", ":provider"));
+        let mut resource = web::resource(rel);
         for spec in specs {
             resource = match spec.action.as_str() {
                 "passthru" => resource.route(web::post().to(omniauth_authorize::<M, A, L>)),

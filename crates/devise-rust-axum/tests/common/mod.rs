@@ -153,6 +153,12 @@ pub struct FixtureUser {
     pub failed_attempts: u32,
     pub unlock_token: Option<String>,
     pub locked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Omniauthable identity pair (D-11): the provider name + uid the
+    /// default linking policy reads and writes.
+    pub provider: Option<String>,
+    pub uid: Option<String>,
+    /// Display name asserted by an OAuth provider profile.
+    pub name: Option<String>,
     #[serde(skip)]
     pub raw_reset_token: Option<String>,
     #[serde(skip)]
@@ -506,6 +512,44 @@ impl devise_rust::mailer::HasEmail for FixtureUser {
     }
 }
 
+/// The omniauthable seam over the fixture (09-04 flow matrix): delegates
+/// to the core default find-link-create policy behind the verified
+/// email gate (D-08/D-09/D-10).
+#[async_trait::async_trait]
+impl devise_rust::omniauthable::Omniauthable for FixtureUser {
+    type New = FixtureUser;
+
+    async fn from_omniauth<A>(
+        profile: devise_rust::omniauthable::ProviderProfile,
+        adapter: &A,
+        clock: &dyn Clock,
+    ) -> devise_rust::error::ResourceWithErrors<Self>
+    where
+        Self: Sized,
+        A: devise_rust::adapter::OrmAdapter<Self, New = Self::New> + Send + Sync,
+    {
+        devise_rust::omniauthable::default_from_omniauth(adapter, &profile, clock).await
+    }
+
+    fn new_from_profile(
+        profile: &devise_rust::omniauthable::ProviderProfile,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Self::New {
+        // A real bcrypt hash keeps the warden salt-in-session fetch valid
+        // (omniauth-created rows carry no usable password — like Devise —
+        // but the salt prefix must exist for the signed-in probe refetch).
+        let mut user = FixtureUser::new_with_password(
+            &profile.email.clone().unwrap_or_default(),
+            "omniauth-no-password-login",
+            &test_config(),
+        );
+        user.provider = Some(profile.provider.clone());
+        user.uid = Some(profile.uid.clone());
+        user.name.clone_from(&profile.name);
+        user
+    }
+}
+
 /// Test configuration: fast `stretches`, fixed 32-byte secret.
 pub fn test_config() -> DeviseConfig {
     DeviseConfig {
@@ -696,6 +740,77 @@ pub fn build_app(state: TestState) -> (TestState, Router) {
                 let config = probe_config.clone();
                 async move { bypass_sign_out_probe(config, session).await }
             }),
+        )
+        .layer(devise_layer)
+        .layer(session_layer);
+    (state, app)
+}
+
+// ============================================================================
+// Omniauth flow fixtures (09-04): the omniauthable mapping variant, the
+// provider-allowlist config, and the omniauth-aware wired app.
+// ============================================================================
+
+/// Omniauthable mapping variant: the full module matrix plus
+/// `Module::Omniauthable` (the route-table amendment's consumer).
+pub fn omniauth_mapping() -> Mapping {
+    let mut mapping = default_mapping();
+    mapping.modules.push(Module::Omniauthable);
+    mapping
+}
+
+/// Test config with the request-time provider allowlist populated.
+pub fn omniauth_test_config(providers: &[&str]) -> DeviseConfig {
+    DeviseConfig {
+        omniauth_providers: providers.iter().map(ToString::to_string).collect(),
+        ..test_config()
+    }
+}
+
+/// Wired omniauth test app: the full devise router plus the omniauth
+/// router (from the shared spec data) under the same session layers as
+/// [`build_app`], with the dashboard probe mounted for post-sign-in
+/// jar-replay assertions.
+///
+/// The app carries an explicit `omniauth_origin` so the redirect URIs
+/// derive from a stable origin — the flow tests set the same `Host`
+/// header on every oneshot request (the jar replay across the
+/// authorize POST -> callback GET IS the Lax cookie assertion).
+pub fn build_omniauth_app(
+    mapping: Mapping,
+    config: DeviseConfig,
+    providers: std::collections::HashMap<String, devise_rust::omniauthable::OAuthProviderConfig>,
+) -> (TestState, Router) {
+    let state = DeviseWebState::new(
+        mapping,
+        Arc::new(config),
+        Arc::new(IdAssigningAdapter::new()),
+        Arc::new(TestMailer::default()),
+        Arc::new(SystemClock),
+    )
+    .expect("test state builds (secret is 32+ bytes)");
+
+    let mut hooks = HookRegistry::new();
+    devise_rust::hooks::register_devise_hooks(&mut hooks, &state.mapping);
+
+    let mapping = state.mapping.clone();
+    let scope_name = mapping.name.clone();
+    let finder: Arc<dyn ModelFinder> = Arc::new(AdapterBridge::new(state.adapter.as_ref().clone()));
+    let devise_layer = DeviseLayer::new(
+        registry_with(std::slice::from_ref(&mapping)),
+        state.config.clone(),
+    )
+    .with_hooks(Arc::new(hooks))
+    .with_finder(&scope_name, finder);
+    let session_layer = session_manager_layer(&state.config).expect("session layer builds");
+
+    let omniauth_state = devise_rust_axum::OmniauthWebState::new(state.clone(), providers);
+    let app = Router::new()
+        .merge(devise_for_router(state.clone()))
+        .merge(devise_rust_axum::omniauth_router(omniauth_state).expect("omniauth router"))
+        .route(
+            "/users_dashboard",
+            axum::routing::get(private_probe).post(private_probe),
         )
         .layer(devise_layer)
         .layer(session_layer);
