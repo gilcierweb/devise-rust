@@ -5,9 +5,9 @@
 //! steps: each model implements [`SqlxModel`] by hand to expose its static
 //! table/column names, its primary-key shape, and a backend-neutral
 //! [`Bind`] conversion for write values; the per-database `Dialect` seam in
-//! [`crate::query`] then turns each [`Bind`] into a real sqlx bind. The glue
+//! `crate::query` then turns each [`Bind`] into a real sqlx bind. The glue
 //! never takes a connection — execution happens only at
-//! [`SqlxAdapter`](crate::SqlxAdapter) op boundaries.
+//! `SqlxAdapter` op boundaries.
 //!
 //! ## Finder columns (D-02)
 //!
@@ -16,7 +16,7 @@
 //! `reset_password_token`, `confirmation_token`, `unlock_token`, and
 //! `unconfirmed_email`. Any other column name — and any non-string value
 //! against these text columns — is rejected by the adapter as
-//! [`OrmError::Query`](devise_rust::adapter::OrmError::Query) naming the
+//! [`OrmError::Query`] naming the
 //! column and never the value, *before any SQL exists*. Identical behavior
 //! to the diesel backend.
 //!
@@ -82,7 +82,7 @@ pub enum KeyShape {
 /// Backend-neutral typed bind payload.
 ///
 /// The per-database `Encode`/`Type` knowledge lives in the `Dialect` seam
-/// ([`crate::query`]); the glue only decides WHICH type a column binds as.
+/// (`crate::query`); the glue only decides WHICH type a column binds as.
 /// Nullable variants carry `Option` directly so an insert of a cleared
 /// column binds a TYPED null (Postgres requires typed parameters even for
 /// `NULL`); the write path never uses them — `Value::Null` writes the SQL

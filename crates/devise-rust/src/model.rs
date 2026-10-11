@@ -7,7 +7,7 @@
 //! The [`ModelFinder`] bridge lets the strategy chain (`strategy.rs`) and
 //! `AuthProxy` (`proxy.rs`) work with heterogeneous per-scope models through
 //! one object-safe trait, while concrete adapters keep their typed
-//! [`OrmAdapter`](crate::adapter::OrmAdapter) contract.
+//! [`OrmAdapter`] contract.
 
 use crate::adapter::{Conditions, DeviseKey, OrmAdapter, Value};
 use crate::config::DeviseConfig;
@@ -66,7 +66,7 @@ pub fn normalize_auth_conditions(conditions: &Conditions, config: &DeviseConfig)
 /// Password-checking facet for `DatabaseAuthenticatable` models.
 ///
 /// Strategies resolve it through
-/// [`AnyDeviseModel::as_password_verifiable`](crate::failure::AnyDeviseModel::as_password_verifiable),
+/// [`AnyDeviseModel::as_password_verifiable`],
 /// so the strategy chain never needs the concrete model type.
 pub trait PasswordVerifiable: AnyDeviseModel {
     /// Check a plaintext password against the stored hash.

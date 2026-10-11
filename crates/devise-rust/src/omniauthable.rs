@@ -11,7 +11,7 @@
 //! * PKCE (S256) and a random CSRF `state` are generated for EVERY authorize
 //!   attempt - there is no opt-out parameter anywhere on this path (D-07).
 //! * The `state` comparison runs through
-//!   [`secure_compare`](crate::crypto::secure_compare) only; the oauth2
+//!   [`secure_compare`] only; the oauth2
 //!   `CsrfToken` deliberately has no `PartialEq`, so a timing oracle cannot
 //!   compile in (T-09-09).
 //! * Provider endpoint URLs come from app configuration
@@ -358,7 +358,7 @@ pub fn http_client() -> Result<reqwest::Client, DeviseError> {
 
 /// Compare the callback's returned `state` with the session-stashed state.
 ///
-/// The only comparison is [`secure_compare`](crate::crypto::secure_compare)
+/// The only comparison is [`secure_compare`]
 /// (constant time); absence on either side fails closed - a callback that
 /// arrives without a stashed state (session cookie withheld, direct hit) or
 /// without a returned `state` never passes (T-09-09).
@@ -434,7 +434,7 @@ pub fn verify_state(stashed_state: Option<&str>, returned_state: Option<&str>) -
 pub trait Omniauthable: Authenticatable {
     /// The insert shape [`default_from_omniauth`] persists on the create
     /// path - the same `New` type the app's
-    /// [`OrmAdapter`](crate::adapter::OrmAdapter) consumes.
+    /// [`OrmAdapter`] consumes.
     type New: Send + Sync + 'static;
 
     /// Devise's `from_omniauth` seam (REQUIRED - no default body, D-08).

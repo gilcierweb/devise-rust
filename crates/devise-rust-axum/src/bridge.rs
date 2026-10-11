@@ -1,5 +1,5 @@
 //! Tower-sessions bridge — `TowerSessionStore` implementing the core
-//! [`SessionStore`](devise_rust::session::SessionStore) trait over a cloned
+//! [`SessionStore`] trait over a cloned
 //! `tower_sessions::Session`.
 //!
 //! Unlike the actix crate, `tower_sessions::Session` is `Clone + Send +
@@ -31,7 +31,7 @@
 //!
 //! Session content mirrors Devise exactly: JSON `[key, salt]` under
 //! `warden.user.{scope}.session` via
-//! [`keys::scope_session_key`](devise_rust::session::keys::scope_session_key).
+//! [`keys::scope_session_key`].
 //! Salt mismatch on fetch deletes the key and yields `None` (warden fetch
 //! semantics); the fetch lives in core `AuthProxy`, exercised through
 //! this store.

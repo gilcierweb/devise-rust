@@ -1,9 +1,9 @@
 //! Diesel-to-core error edge mapper (Pitfall 5).
 //!
-//! Every diesel failure crossing into [`OrmError`](devise_rust::adapter::OrmError)
+//! Every diesel failure crossing into [`OrmError`]
 //! passes through [`map_diesel_error`] (query path) or [`map_pool_error`]
 //! (pool-acquisition path). The mapping discriminates the variants that
-//! Devise semantics key on — notably [`OrmError::UniqueViolation`](devise_rust::adapter::OrmError::UniqueViolation),
+//! Devise semantics key on — notably [`OrmError::UniqueViolation`],
 //! which backs the token-generator uniqueness loop — and degrades everything
 //! else to a category-level `Query`/`Connection` message.
 //!
@@ -21,7 +21,7 @@ use diesel::result::{DatabaseErrorKind, Error as DieselError};
 
 /// Maps a diesel query error into the core [`OrmError`] taxonomy.
 ///
-/// * `DatabaseError(UniqueViolation, info)` → [`OrmError::UniqueViolation`](devise_rust::adapter::OrmError::UniqueViolation)
+/// * `DatabaseError(UniqueViolation, info)` → [`OrmError::UniqueViolation`]
 ///   carrying the constraint/index name when the driver reports one.
 /// * `Error::NotFound` (e.g. from `get_result`) → [`OrmError::NotFound`].
 /// * Everything else → [`OrmError::Query`] with diesel's `Display` text.

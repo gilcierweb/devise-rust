@@ -1,7 +1,7 @@
 //! `devise-rust-diesel` — Diesel ORM backend for devise-rust.
 //!
 //! This crate is the first concrete [`OrmAdapter`](devise_rust::adapter::OrmAdapter)
-//! backend (ORM-04): a single generic [`DieselOrmAdapter`] over diesel 2.2.12
+//! backend (ORM-04): a single generic `DieselOrmAdapter` over diesel 2.2.12
 //! + diesel-async 0.6.1 with deadpool pooling, bound to models through the
 //!
 //! explicit [`DieselModel`] glue trait.
@@ -21,15 +21,14 @@
 //!
 //! ## Modules
 //!
-//! * [`glue`](crate::glue) — [`DieselModel`] (D-01/D-02), implemented by hand
+//! * [`glue`] — [`DieselModel`] (D-01/D-02), implemented by hand
 //!   per model; never takes a connection.
-//! * [`adapter`](crate::adapter) — [`DieselOrmAdapter`] (D-06) implementing
+//! * `adapter` — `DieselOrmAdapter` (D-06) implementing
 //!   the amended `OrmAdapter` surface.
 //! * [`changeset`] — `ChangeSet` → `AsChangeset` tristate bridge (D-04/D-05).
 //! * [`error`] — diesel error → `OrmError` mapper (Pitfall 5).
-//! * [`pool`] — deadpool builders, including the `:memory:` helper (Pitfall 3).
+//! * `pool` — deadpool builders, including the `:memory:` helper (Pitfall 3).
 //!
-//! [`DieselOrmAdapter`]: crate::adapter::DieselOrmAdapter
 //! [`DieselModel`]: crate::glue::DieselModel
 
 pub mod changeset;

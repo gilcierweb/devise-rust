@@ -25,7 +25,7 @@ mod serde_time_delta {
     }
 }
 
-/// Serde module for Option<TimeDelta> (as seconds)
+/// Serde module for `Option<TimeDelta>` (as seconds)
 mod serde_time_delta_option {
     use chrono::TimeDelta;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -66,13 +66,13 @@ pub struct DeviseConfig {
     pub stretches: u32,
 
     // Auth keys
-    /// Keys used for authentication (default: [:email])
+    /// Keys used for authentication (default: `[:email]`)
     pub authentication_keys: Vec<String>,
     /// Additional keys required for authentication (default: [])
     pub request_keys: Vec<String>,
-    /// Keys that are case-insensitive (default: [:email])
+    /// Keys that are case-insensitive (default: `[:email]`)
     pub case_insensitive_keys: Vec<String>,
-    /// Keys that should have whitespace stripped (default: [:email])
+    /// Keys that should have whitespace stripped (default: `[:email]`)
     pub strip_whitespace_keys: Vec<String>,
     /// Enable HTTP authentication (default: false)
     pub http_authenticatable: bool,
@@ -109,7 +109,7 @@ pub struct DeviseConfig {
     /// Confirmation token validity (default: nil = no expiry)
     #[serde(with = "serde_time_delta_option")]
     pub confirm_within: Option<TimeDelta>,
-    /// Keys used for confirmation (default: [:email])
+    /// Keys used for confirmation (default: `[:email]`)
     pub confirmation_keys: Vec<String>,
     /// Require reconfirmation on email change (default: true)
     pub reconfirmable: bool,
@@ -119,7 +119,7 @@ pub struct DeviseConfig {
     pub lock_strategy: String,
     /// Unlock strategy: "time", "email", "both", "none" (default: "both")
     pub unlock_strategy: String,
-    /// Keys for unlock (default: [:email])
+    /// Keys for unlock (default: `[:email]`)
     pub unlock_keys: Vec<String>,
     /// Maximum failed attempts before lock (default: 20)
     pub maximum_attempts: u32,
@@ -130,7 +130,7 @@ pub struct DeviseConfig {
     pub last_attempt_warning: bool,
 
     // Recoverable
-    /// Keys for password reset (default: [:email])
+    /// Keys for password reset (default: `[:email]`)
     pub reset_password_keys: Vec<String>,
     /// Reset token validity (default: 6.hours)
     #[serde(with = "serde_time_delta")]
@@ -150,7 +150,7 @@ pub struct DeviseConfig {
     pub sign_out_all_scopes: bool,
     /// Sign out via method (default: "delete")
     pub sign_out_via: String,
-    /// Skip session storage for these strategies (default: [:`http_auth`])
+    /// Skip session storage for these strategies (default: `[:http_auth]`)
     pub skip_session_storage: Vec<String>,
 
     // Framework

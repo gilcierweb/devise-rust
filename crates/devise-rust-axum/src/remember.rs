@@ -10,7 +10,7 @@
 //! the same cookie lineage `tower-sessions` and `axum-extra` already use,
 //! so a value signed here verifies in their jars with no version skew —
 //! and dresses it in the D-16 hardened attributes from
-//! [`RememberableCookieAttrs`](devise_rust::rememberable::RememberableCookieAttrs).
+//! [`RememberableCookieAttrs`].
 //!
 //! Every decode miss is a **stale cookie**: produce a `Clear` op and pass
 //! through — never a `Failure` (Pitfall 12).

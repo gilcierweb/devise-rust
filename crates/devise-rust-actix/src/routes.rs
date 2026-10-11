@@ -1,5 +1,5 @@
 //! Route registration — `devise_for_users` config fn translating core
-//! [`RouteSpec`](devise_rust::scope::RouteSpec) data into an actix-web
+//! [`RouteSpec`] data into an actix-web
 //! [`Scope`] plus the five controller groups (sessions, registrations,
 //! passwords, confirmations, unlocks) per D-14.
 //!

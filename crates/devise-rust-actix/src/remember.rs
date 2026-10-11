@@ -10,7 +10,7 @@
 //! with the single shared secret surface (`Key::derive_from` on
 //! `DeviseConfig.secret_key_base`, D-02) and dressed in the D-16 hardened
 //! attributes from
-//! [`RememberableCookieAttrs`](devise_rust::rememberable::RememberableCookieAttrs).
+//! [`RememberableCookieAttrs`].
 //!
 //! Every decode miss is a **stale cookie**: produce a `Clear` op and pass
 //! through — never a `Failure` (Pitfall 12).

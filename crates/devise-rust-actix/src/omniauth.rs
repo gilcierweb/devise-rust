@@ -4,13 +4,13 @@
 //!
 //! Thin renderers, twin of the axum crate's `omniauth` module: every
 //! policy decision lives in core —
-//! [`authorize_start`](devise_rust::omniauthable::authorize_start)
+//! [`authorize_start`]
 //! (always-on PKCE S256 + CSRF state, D-07),
-//! [`verify_state`](devise_rust::omniauthable::verify_state)
+//! [`verify_state`]
 //! (`secure_compare` only, fail-closed, T-09-09),
-//! [`http_client`](devise_rust::omniauthable::http_client)
+//! [`http_client`]
 //! (redirects-disabled exchange transport, T-09-10/T-09-12), the
-//! [`Omniauthable::from_omniauth`](devise_rust::omniauthable::Omniauthable::from_omniauth)
+//! [`Omniauthable::from_omniauth`]
 //! seam over the D-09/D-10 verified-gated linking policy, the vendored
 //! `devise.omniauth_callbacks` flash templates, and the
 //! `omniauth_providers` request-time allowlist. The route table is the

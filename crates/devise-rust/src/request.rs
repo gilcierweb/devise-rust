@@ -212,9 +212,9 @@ impl AuthRequest {
         Some((controller, action))
     }
 
-    /// Get the scope-specific params hash (params[scope])
+    /// Get the scope-specific params hash (`params[scope]`)
     ///
-    /// Devise strategies extract credentials from `params[scope]` (e.g., params[:user]).
+    /// Devise strategies extract credentials from `params[scope]` (e.g., `params[:user]`).
     #[must_use]
     pub fn scope_params(&self, _scope: &str) -> Option<&HashMap<String, String>> {
         // This is a simplified version - real implementation would parse nested params
@@ -241,7 +241,7 @@ impl AuthRequest {
         Some(input.to_string())
     }
 
-    /// Get params for a specific scope (e.g., params[:user][:email])
+    /// Get params for a specific scope (e.g., `params[:user][:email]`)
     ///
     /// Handles both flat and nested param structures.
     #[must_use]

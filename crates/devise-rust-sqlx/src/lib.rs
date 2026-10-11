@@ -1,7 +1,7 @@
 //! `devise-rust-sqlx` — sqlx ORM backend for devise-rust.
 //!
 //! This crate is the second concrete [`OrmAdapter`](devise_rust::adapter::OrmAdapter)
-//! backend (ORM-06): a single generic [`SqlxAdapter`] over sqlx **0.8.6**
+//! backend (ORM-06): a single generic `SqlxAdapter` over sqlx **0.8.6**
 //! using runtime `query_as` + `QueryBuilder` only — the `query!` macro
 //! family stays OFF so no downstream app inherits a compile-time
 //! `DATABASE_URL`/`.sqlx` requirement. Models bind through the hand-written
@@ -26,15 +26,15 @@
 //!
 //! ## Modules
 //!
-//! * [`glue`](crate::glue) — [`SqlxModel`] (D-01/D-02) plus the tristate
+//! * [`glue`] — [`SqlxModel`] (D-01/D-02) plus the tristate
 //!   write extractors; implemented by hand per model.
-//! * [`query`](crate::query) — `QueryBuilder` reads/writes over the
+//! * `query` — `QueryBuilder` reads/writes over the
 //!   per-database `Dialect` bind seam (D-03/D-34).
-//! * [`create`](crate::create) — per-database insert id echo (D-05).
-//! * [`counter`](crate::counter) — atomic `SET column = column + 1` (D-11).
-//! * [`error`](crate::error) — sqlx error → `OrmError` mapper with
+//! * `create` — per-database insert id echo (D-05).
+//! * `counter` — atomic `SET column = column + 1` (D-11).
+//! * [`error`] — sqlx error → `OrmError` mapper with
 //!   unique-violation discrimination (Pitfall 4).
-//! * [`pool`](crate::pool) — application-pool convenience builders,
+//! * `pool` — application-pool convenience builders,
 //!   including the `max_connections(1)` `:memory:` helper (Pitfall 1).
 
 #[cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql"))]

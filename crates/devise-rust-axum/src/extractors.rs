@@ -4,16 +4,16 @@
 //! Extractors read ONLY the extensions staged by
 //! [`DeviseLayer`](crate::layer::DeviseLayer):
 //!
-//! - [`AuthProxyHandle`](crate::layer::AuthProxyHandle) — the per-request
+//! - [`AuthProxyHandle`] — the per-request
 //!   `AuthProxy` over the tower-sessions bridge;
-//! - [`AuthRequest`](devise_rust::request::AuthRequest) — the owned
+//! - [`AuthRequest`] — the owned
 //!   request snapshot;
 //! - `Mapping` + `Arc<DeviseConfig>` — resolved scope and configuration.
 //!
 //! `Auth<M>` is the lazy `current_user` shape: it authenticates on demand
 //! (session fetch, then strategies) and never rejects. `RequireAuth<M>`
 //! is the `authenticate_<scope>!` shape: it fails closed, rendering the
-//! core `Failure` through [`AxumFailureRenderer`](crate::failure::AxumFailureRenderer)
+//! core `Failure` through [`AxumFailureRenderer`]
 //! — 302 + flash for navigational formats, 401 for API.
 //!
 //! Extractors never touch `tower_sessions::Session`: all session I/O
@@ -380,7 +380,7 @@ pub async fn authenticate_admin<'a>(
 
 /// `devise_group` equivalent: a named bundle of scopes tried in order.
 ///
-/// An alias of core [`Group`](devise_rust::helpers::Group) — the axum
+/// An alias of core [`Group`] — the axum
 /// crate never re-implements group semantics; the name matches the actix
 /// crate's so one doc page serves both frameworks (D-02).
 pub type AuthGroup = Group;

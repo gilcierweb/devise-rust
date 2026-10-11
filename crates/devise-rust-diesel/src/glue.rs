@@ -9,17 +9,17 @@
 //!
 //! The trait follows the diesel Composing-Applications rule: glue returns
 //! expressions and queries, and never takes a connection — execution happens
-//! only at [`DieselOrmAdapter`](crate::adapter::DieselOrmAdapter) op
+//! only at `DieselOrmAdapter` op
 //! boundaries.
 //!
 //! ## Finder columns (D-02)
 //!
-//! [`finder_predicate`](DieselModel::finder_predicate) covers ONLY the columns
+//! `finder_predicate` covers ONLY the columns
 //! Devise actually queries: authentication keys (`email` by default),
 //! `reset_password_token`, `confirmation_token`, `unlock_token`, and
 //! `unconfirmed_email`. Any other column name — and any `Null`/non-string
 //! value against these text columns — yields `None`, which the adapter turns
-//! into [`OrmError::Query`](devise_rust::adapter::OrmError::Query) naming the
+//! into [`OrmError::Query`] naming the
 //! column and never the value, *before any SQL text exists*.
 //!
 //! ## Examples
@@ -184,7 +184,7 @@ pub trait DieselPredicates<DB>: DieselModel {
     /// Curated finder predicate (D-02): `Some` boxed `eq` expression for the
     /// five queryable columns, `None` for anything else — including
     /// `Null`/non-string values against these text columns. The adapter
-    /// rejects `None` as [`OrmError::Query`](devise_rust::adapter::OrmError::Query)
+    /// rejects `None` as [`OrmError::Query`]
     /// naming the column, before any SQL text exists.
     fn finder_predicate(column: &str, value: &Value) -> Option<BoxPred<Self::Table, DB>>;
 }

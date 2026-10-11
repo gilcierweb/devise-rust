@@ -61,7 +61,7 @@ pub mod keys {
         STORED_LOCATION_KEY.replace("{scope}", scope)
     }
 
-    /// Build remember token key (overridable via `rememberable_options`[:key])
+    /// Build remember token key (overridable via `rememberable_options[:key]`)
     #[must_use]
     pub fn remember_token_key(scope: &str) -> String {
         REMEMBER_TOKEN_KEY.replace("{scope}", scope)

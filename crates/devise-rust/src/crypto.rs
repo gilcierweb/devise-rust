@@ -10,11 +10,52 @@ use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Bcrypt password hashing with pepper support
+/// Bcrypt password Encryptor with pepper support.
+///
+/// Mirrors `Devise::Encryptor` (`devise/lib/devise/encryptor.rb`):
+/// `digest` hashes the pepper-appended password with bcrypt at the
+/// `stretches` cost, exactly like `Devise::Encryptor.digest`, and
+/// `compare` verifies a candidate password the way
+/// `Devise::Encryptor.compare` does: re-hash with the same pepper and
+/// match against the stored digest.
+///
+/// == Options
+///
+/// * `pepper` - secret appended to the password before hashing
+///   (default `None`, matching Devise's `Devise.pepper`)
+/// * `stretches` - bcrypt cost factor (default 12, matching Devise's
+///   `Devise.stretches`)
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::config::DeviseConfig;
+/// use devise_rust::crypto::encryptor;
+///
+/// let config = DeviseConfig::default();
+/// let hashed = encryptor::digest("password", &config);
+/// assert!(encryptor::compare("password", &hashed, &config));
+/// assert!(!encryptor::compare("wrong", &hashed, &config));
+/// ```
 pub mod encryptor {
     use super::{DeviseConfig, hash, verify};
 
-    /// Hash a password with bcrypt using `config.stretches` and `config.pepper`
+    /// Hash a password with bcrypt using `config.stretches` and `config.pepper`.
+    ///
+    /// Mirrors `Devise::Encryptor.digest`: the pepper is appended to the
+    /// password before hashing and the bcrypt cost is `stretches`, clamped
+    /// to bcrypt's maximum of 31.
+    ///
+    /// == Examples
+    ///
+    /// ```
+    /// use devise_rust::config::DeviseConfig;
+    /// use devise_rust::crypto::encryptor;
+    ///
+    /// let config = DeviseConfig::default();
+    /// let hashed = encryptor::digest("password", &config);
+    /// assert!(hashed.starts_with("$2"));
+    /// ```
     ///
     /// # Panics
     ///
@@ -29,7 +70,24 @@ pub mod encryptor {
         hash(password_with_pepper, cost).expect("bcrypt hash should not fail with valid cost")
     }
 
-    /// Verify a password against a bcrypt hash using constant-time comparison
+    /// Verify a password against a bcrypt hash.
+    ///
+    /// Mirrors `Devise::Encryptor.compare`: the candidate password is
+    /// re-hashed with the same pepper and checked against the stored
+    /// digest. A malformed stored digest or a failed verification returns
+    /// `false` instead of raising, so strategies can treat both alike.
+    ///
+    /// == Examples
+    ///
+    /// ```
+    /// use devise_rust::config::DeviseConfig;
+    /// use devise_rust::crypto::encryptor;
+    ///
+    /// let config = DeviseConfig::default();
+    /// let hashed = encryptor::digest("password", &config);
+    /// assert!(encryptor::compare("password", &hashed, &config));
+    /// assert!(!encryptor::compare("wrong", &hashed, &config));
+    /// ```
     #[must_use]
     pub fn compare(password: &str, hashed: &str, config: &DeviseConfig) -> bool {
         let mut password_with_pepper = password.to_string();

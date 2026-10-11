@@ -1,5 +1,5 @@
 //! Actix session bridge — `ActixSessionStore` implementing the core
-//! [`SessionStore`](devise_rust::session::SessionStore) trait over
+//! [`SessionStore`] trait over
 //! `actix_session::Session` using the **owned-extract** pattern (D-04).
 //!
 //! `actix_session::Session` is `!Send + !Sync`, so the bridge cannot hold a
@@ -19,7 +19,7 @@
 //!
 //! Session content mirrors Devise exactly: JSON `[key, salt]` under
 //! `warden.user.{scope}.session` via
-//! [`keys::scope_session_key`](devise_rust::session::keys::scope_session_key).
+//! [`keys::scope_session_key`].
 //! Salt mismatch on fetch deletes the key and returns `None`
 //! (warden fetch semantics, D-08).
 
@@ -119,7 +119,7 @@ impl ActixSessionStore {
 
 /// The bridge's `SessionStore` impl is a **placeholder-targeted struct impl**.
 /// All real I/O flows through the synchronous helpers in this module
-/// (see [`insert_session_and_renew`], [`fetch_session_with_salt`], etc.) which
+/// (see [`insert_session_and_renew_sync`], [`fetch_session_with_salt`], etc.) which
 /// take an explicit `&Session` parameter. The trait exists so that the
 /// bridge can satisfy the core `AuthProxy` constructor's `SessionStore`
 /// boundary without holding `Session` directly.

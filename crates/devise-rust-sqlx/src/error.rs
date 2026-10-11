@@ -1,10 +1,10 @@
 //! sqlx-to-core error edge mapper (Pitfall 4).
 //!
 //! Every sqlx failure crossing into
-//! [`OrmError`](devise_rust::adapter::OrmError) passes through
+//! [`OrmError`] passes through
 //! [`map_sqlx_error`] (query path) or [`map_pool_error`] (pool-acquisition
 //! path). The mapping discriminates the variants Devise semantics key on —
-//! notably [`OrmError::UniqueViolation`](devise_rust::adapter::OrmError::UniqueViolation),
+//! notably [`OrmError::UniqueViolation`],
 //! which backs the token-generator uniqueness retry loop — and degrades
 //! everything else to a category-level `Query`/`Connection` message.
 //!
@@ -24,10 +24,9 @@
 //! the SQLSTATE/extended-code table (`23505` postgres, `1555`/`2067` sqlite)
 //! is the fallback for drivers that misreport the kind; MySQL reports
 //! driver error numbers instead of SQLSTATE, so its arm (behind the
-//! experimental `mysql` feature) downcasts to [`MySqlDatabaseError`] and
+//! experimental `mysql` feature) downcasts to `MySqlDatabaseError` and
 //! matches the duplicate-key number family.
 //!
-//! [`MySqlDatabaseError`]: sqlx::mysql::MySqlDatabaseError
 
 use devise_rust::adapter::OrmError;
 use sqlx::error::DatabaseError;

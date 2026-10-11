@@ -59,7 +59,7 @@ pub async fn sign_out(
 /// `SignedJar` tombstone (T-08-07: logout never leaves a live remember
 /// login).
 ///
-/// Returns the [`RememberCookieOp::Clear`] to apply to the response jar.
+/// Returns the [`RememberCookieOp::Clear`](devise_rust::rememberable::RememberCookieOp::Clear) to apply to the response jar.
 ///
 /// # Errors
 ///
@@ -131,7 +131,7 @@ pub async fn sign_out_all_scopes(
     Ok(())
 }
 
-/// Construct an [`AuthRequest`] for use in test-side proxy calls.
+/// Construct an [`AuthRequest`](devise_rust::request::AuthRequest) for use in test-side proxy calls.
 #[must_use]
 pub fn sign_in_request(
     scope: &str,

@@ -1,5 +1,5 @@
 //! Route registration — the `devise_for`-equivalent router fn (D-03)
-//! translating core [`RouteSpec`](devise_rust::scope::RouteSpec) data
+//! translating core [`RouteSpec`] data
 //! into an axum `Router`, plus the five controller groups (sessions,
 //! registrations, passwords, confirmations, unlocks) per D-14, and the
 //! 09-01 tracer session routes.

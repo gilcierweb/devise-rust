@@ -37,7 +37,7 @@
 //! - [`omniauth`] — the authorize + callback pair rendering the 09-03
 //!   core omniauth policy over the shared route spec data (POST-only
 //!   authorize, GET-or-POST callback, PKCE-state always-on).
-//! - [`stub_provider`] — (feature `test-support` only) the generic
+//! - `stub_provider` — (feature `test-support` only) the generic
 //!   `OAuth2` stub provider for the omniauth flow tests (D-06), shared
 //!   with the actix crate's suite; never compiled into non-test builds.
 //! - [`test_helpers`] — `sign_in` / `sign_out` bypass helpers with

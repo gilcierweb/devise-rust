@@ -15,9 +15,9 @@
 //!
 //! `RequireAuth` and the `authenticate_*` helpers never invent response
 //! envelopes: they call core
-//! [`build_failure`](devise_rust::failure::build_failure) (`FailureReason::Unauthenticated`)
+//! [`build_failure`] (`FailureReason::Unauthenticated`)
 //! and render through the 08-01
-//! [`ActixFailureRenderer`](crate::failure::ActixFailureRenderer) — 302 +
+//! [`ActixFailureRenderer`] — 302 +
 //! flash + `stored_location` for navigational formats, 401 otherwise.
 //!
 //! ## Options

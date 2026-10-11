@@ -10,6 +10,8 @@
 
 devise-rust preserves Devise's public API wherever Rust allows: the same 10 modules (`database_authenticatable`, `registerable`, `recoverable`, `rememberable`, `validatable`, `trackable`, `confirmable`, `lockable`, `timeoutable`, `omniauthable` over the `authenticatable` base), the same method names (`valid_password`, `lock_access`, `reset_password_by_token`, `confirm_by_token`, ...), the same DB column names (`encrypted_password`, `reset_password_token`, ...), the same config option names (`stretches`, `pepper`, `remember_for`, `reset_password_within`, ...), the same I18n message keys, and the same route/action surface - adapted to idiomatic, DRY, high-quality Rust.
 
+Documentation: start with [docs/getting-started-actix.md](docs/getting-started-actix.md) (shared core setup plus the actix-web track); the axum track and the rest of the guide corpus live under [docs/](docs/).
+
 ---
 
 ## Architecture Overview

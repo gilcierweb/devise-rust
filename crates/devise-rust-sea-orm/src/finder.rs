@@ -5,7 +5,7 @@
 //! condition (AND semantics — the planner-picked composition; intersecting
 //! per-condition result sets like diesel is unnecessary because sea-orm
 //! predicates compose) and finished with
-//! [`one()`](sea_orm::QueryTrait::one), the LIMIT-1 shape. `one()` returns
+//! `one()`, the LIMIT-1 shape. `one()` returns
 //! `Ok(None)` on a miss — a miss is never an error (Pitfall 7; T-07-05).
 //!
 //! The [`SeaOrmModel`] bridge maps each curated column name to the entity's
