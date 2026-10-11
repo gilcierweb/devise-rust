@@ -34,6 +34,10 @@
 //!   ([`devise_for_router`]) translating core `RouteSpec` data into an
 //!   axum `Router`, plus all five controller groups (D-03/D-14), plus the
 //!   09-01 tracer session routes.
+//! - [`test_helpers`] — `sign_in` / `sign_out` bypass helpers with
+//!   `Set-Cookie` capture and replay, mirroring Devise's
+//!   `IntegrationHelpers` (test-only surface, shipped like the actix
+//!   crate's).
 //!
 //! ## Options
 //!
@@ -72,6 +76,7 @@ pub mod failure;
 pub mod layer;
 pub mod remember;
 pub mod routes;
+pub mod test_helpers;
 
 pub use bridge::{
     TowerSessionStore, account_update_and_renew, bypass_sign_in_and_renew,

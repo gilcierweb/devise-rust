@@ -44,8 +44,19 @@ tokio = { workspace = true, features = ["sync"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# axum-demo example persistence (D-18 analogue): diesel over an in-memory
+# sqlite pool — zero Docker; the MemoryAdapter oracle stays the unit-speed
+# leg and the testcontainers Postgres path stays documented-only.
+devise-rust-diesel = { path = "../devise-rust-diesel", features = ["sqlite"] }
+devise-rust-migrations = { path = "../devise-rust-migrations" }
+diesel.workspace = true
+diesel-async = { version = "0.6.1", features = ["sqlite", "deadpool"] }
 
 [[test]]
 name = "session_bridge"
 path = "tests/session_bridge.rs"
 harness = true
+
+[[example]]
+name = "axum-demo"
+path = "examples/axum-demo/main.rs"

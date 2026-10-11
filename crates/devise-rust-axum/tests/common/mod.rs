@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use devise_rust::adapter::{DeviseKey, OrmAdapter, memory::MemoryAdapter};
@@ -28,6 +29,7 @@ use devise_rust::time::Clock;
 use devise_rust_axum::{DeviseLayer, DeviseWebState, devise_for_router, session_manager_layer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use tower_sessions::Session;
 
 pub use devise_rust::adapter::OrmAdapter as OrmAdapterTrait;
 pub use devise_rust::time::SystemClock;
@@ -587,6 +589,50 @@ async fn private_probe(user: devise_rust_axum::RequireAuth<FixtureUser>) -> impl
     )
 }
 
+/// Bypass call-site probe (`test_helpers::bypass_sign_in`): signs the
+/// email's record into the REQUEST'S OWN session without any password
+/// post — Devise `IntegrationHelpers#sign_in` parity. The response
+/// `Set-Cookie` carries the rotated id for jar replay into protected
+/// routes (the actix suite drives the same shape from extractors.rs).
+async fn bypass_sign_in_probe(
+    adapter: Arc<IdAssigningAdapter>,
+    session: Session,
+    email: String,
+) -> StatusCode {
+    let mut conditions = devise_rust::adapter::Conditions::new();
+    conditions.insert("email", devise_rust::adapter::Value::String(email));
+    let Some(user) = OrmAdapter::find_first(adapter.as_ref(), &conditions)
+        .await
+        .expect("lookup")
+    else {
+        return StatusCode::NOT_FOUND;
+    };
+    devise_rust_axum::test_helpers::bypass_sign_in(&session, "user", &user)
+        .await
+        .expect("bypass");
+    StatusCode::OK
+}
+
+/// Bypass sign-out call-site probe (`test_helpers::sign_out_with_forget`):
+/// clears the `user` scope with the remember-cookie delete intent; the
+/// drained op's scope + key ride the JSON body for assertion
+/// (T-09-07: logout never leaves a live remember login).
+async fn bypass_sign_out_probe(
+    config: Arc<DeviseConfig>,
+    session: Session,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+    let op = devise_rust_axum::test_helpers::sign_out_with_forget(&session, "user", &config)
+        .await
+        .expect("sign out");
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "scope": op.scope(),
+            "key": op.key(),
+        })),
+    )
+}
+
 /// Wired axum test app: `SessionManagerLayer` outermost, then `DeviseLayer`
 /// (with the fixture finder + the core Devise hooks registered), then the
 /// `devise_for_router` mount. Returns the state alongside the router so
@@ -595,6 +641,12 @@ async fn private_probe(user: devise_rust_axum::RequireAuth<FixtureUser>) -> impl
 /// The probe route lives OUTSIDE the devise router (axum routes claim their
 /// exact path) but still prefix-matches the registry's `find_by_path`, so
 /// the layer resolves the `user` scope for it.
+///
+/// The two `/devise-test/bypass-*` probes mount the `IntegrationHelpers`
+/// call sites under the SAME session store as the devise routes (the
+/// store lives inside the session layer, so the probes must share the
+/// app's layers — the actix suite could build a standalone mini-app
+/// because actix sessions are cookie-carried).
 pub fn build_app(state: TestState) -> (TestState, Router) {
     let mut hooks = HookRegistry::new();
     devise_rust::hooks::register_devise_hooks(&mut hooks, &state.mapping);
@@ -610,11 +662,40 @@ pub fn build_app(state: TestState) -> (TestState, Router) {
     .with_finder(&scope_name, finder);
     let session_layer = session_manager_layer(&state.config).expect("session layer builds");
 
+    // The bypass probes capture the shared Arcs (the devise router already
+    // consumed the typed state into `Router<()>`).
+    let probe_adapter = state.adapter.clone();
+    let probe_config = state.config.clone();
+
     let app = Router::new()
         .merge(devise_for_router(state.clone()))
         .route(
             "/users_dashboard",
             axum::routing::get(private_probe).post(private_probe),
+        )
+        .route(
+            "/devise-test/bypass-sign-in",
+            axum::routing::get(
+                move |session: Session,
+                      Query(query): Query<std::collections::HashMap<String, String>>| {
+                    let adapter = probe_adapter.clone();
+                    async move {
+                        bypass_sign_in_probe(
+                            adapter,
+                            session,
+                            query.get("email").cloned().unwrap_or_default(),
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/devise-test/bypass-sign-out",
+            axum::routing::get(move |session: Session| {
+                let config = probe_config.clone();
+                async move { bypass_sign_out_probe(config, session).await }
+            }),
         )
         .layer(devise_layer)
         .layer(session_layer);
