@@ -1,11 +1,12 @@
-//! Bridge callbacks — session-signing key derivation (CSRF rotation joins
-//! in 09-02 wiring).
+//! Bridge callbacks — session-signing key derivation and CSRF rotation.
 //!
 //! These are the small helpers at the intersection of framework session
 //! crypto and Devise configuration, kept separate from [`crate::bridge`]
 //! so the bridge itself stays purely session I/O.
 
+use devise_rust::config::DeviseConfig;
 use devise_rust::error::DeviseError;
+use tower_sessions::Session;
 use tower_sessions::cookie::Key;
 
 /// Minimum master-key length `Key::derive_from` accepts (HKDF input).
@@ -47,4 +48,33 @@ pub fn derive_session_key(secret_key: &str) -> Result<Key, DeviseError> {
         )));
     }
     Ok(Key::derive_from(secret_key.as_bytes()))
+}
+
+/// Session key holding the app-owned CSRF token for a scope.
+///
+/// Mirrors the actix naming (`warden.user.{scope}` + `_csrf_token`) so one
+/// doc page serves both frameworks.
+#[must_use]
+pub fn csrf_token_key(scope: &str) -> String {
+    format!(
+        "{}_csrf_token",
+        devise_rust::session::keys::scope_session_key(scope).trim_end_matches(".session")
+    )
+}
+
+/// Rotate the app-owned CSRF token in the session when
+/// `clean_up_csrf_token_on_authentication` is true (D-07).
+///
+/// The app owns the token and its verification; this callback owns only
+/// the rotation trigger, with NO framework-CSRF dependency. Silent no-op
+/// when the flag is off, so callers may invoke it unconditionally on
+/// privilege transitions (sign-in, sign-out, account update).
+pub async fn rotate_csrf_token(session: &Session, scope: &str, config: &DeviseConfig) {
+    if !config.clean_up_csrf_token_on_authentication {
+        return;
+    }
+    let token = devise_rust::crypto::friendly_token(32);
+    let _ = session
+        .insert_value(&csrf_token_key(scope), serde_json::json!(token))
+        .await;
 }

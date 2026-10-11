@@ -44,6 +44,13 @@
 //! `cycle_id` (data is retained) and server-side store round-trips, and
 //! it is removed as soon as it empties so a fully signed-out session
 //! still qualifies for cookie removal.
+//!
+//! ## Epoch ticks
+//!
+//! [`read_last_request_at`] / [`tick_last_request_at`] carry the
+//! `last_request_at` Integer-epoch semantics (D-06): strict integer
+//! parsing only — float strings and other malformed shapes read back as
+//! `None` so timeout checks fail closed to expired.
 
 #![allow(clippy::missing_errors_doc)] // session/serializer codes documented upstream
 
@@ -182,6 +189,24 @@ fn cycle_error(e: tower_sessions::session::Error) -> DeviseError {
     DeviseError::Internal(format!("session cycle_id failed: {e}"))
 }
 
+/// Insert the warden `[key, salt]` payload for a scope (shared by every
+/// insert-shaped transition; the cycle call sites stay literal in each
+/// public helper so the D-04 paths grep cleanly).
+async fn insert_warden_payload(
+    session: &Session,
+    scope: &str,
+    key: &DeviseKey,
+    salt: &str,
+) -> Result<(), DeviseError> {
+    let session_key = keys::scope_session_key(scope);
+    let session_value = serde_json::json!([key.to_string(), salt]);
+    session
+        .insert_value(&session_key, session_value)
+        .await
+        .map_err(|e| DeviseError::Internal(format!("session insert failed: {e}")))?;
+    Ok(())
+}
+
 /// Insert the warden session payload `[key, salt]` for a scope on the
 /// SIGN-IN path, cycling the session id first (D-04 renew-before-insert).
 ///
@@ -201,13 +226,49 @@ pub async fn insert_session_and_renew(
 ) -> Result<(), DeviseError> {
     // D-04 sign-in cycle call site: fires BEFORE the payload insert.
     session.cycle_id().await.map_err(cycle_error)?;
-    let session_key = keys::scope_session_key(scope);
-    let session_value = serde_json::json!([key.to_string(), salt]);
-    session
-        .insert_value(&session_key, session_value)
-        .await
-        .map_err(|e| DeviseError::Internal(format!("session insert failed: {e}")))?;
-    Ok(())
+    insert_warden_payload(session, scope, key, salt).await
+}
+
+/// Insert the warden session payload on the BYPASS-SIGN-IN path (password
+/// change re-sign-in without callbacks), cycling the session id first.
+///
+/// Closes the core gap where `AuthProxy::bypass_sign_in` writes the
+/// session without any renewal (proxy.rs bypass path).
+///
+/// # Errors
+///
+/// Returns [`DeviseError::Internal`] when the cycle or the insert fails —
+/// the transition fails instead of persisting the payload under the old id.
+pub async fn bypass_sign_in_and_renew(
+    session: &Session,
+    scope: &str,
+    key: &DeviseKey,
+    salt: &str,
+) -> Result<(), DeviseError> {
+    // D-04 bypass cycle call site: fires BEFORE the payload insert.
+    session.cycle_id().await.map_err(cycle_error)?;
+    insert_warden_payload(session, scope, key, salt).await
+}
+
+/// Insert the warden session payload on the ACCOUNT-UPDATE path
+/// (`update_with_password` → re-sign-in), cycling the session id first.
+///
+/// Same shape as the bypass path — the account update IS a privilege
+/// transition and must never keep the pre-update id.
+///
+/// # Errors
+///
+/// Returns [`DeviseError::Internal`] when the cycle or the insert fails —
+/// the transition fails instead of persisting the payload under the old id.
+pub async fn account_update_and_renew(
+    session: &Session,
+    scope: &str,
+    key: &DeviseKey,
+    salt: &str,
+) -> Result<(), DeviseError> {
+    // D-04 account-update cycle call site: fires BEFORE the payload insert.
+    session.cycle_id().await.map_err(cycle_error)?;
+    insert_warden_payload(session, scope, key, salt).await
 }
 
 /// Remove the warden session payload for a scope on the SIGN-OUT path,
@@ -223,6 +284,62 @@ pub async fn sign_out_and_renew(session: &Session, scope: &str) -> Result<(), De
     let session_key = keys::scope_session_key(scope);
     let _ = session.remove_value(&session_key).await;
     Ok(())
+}
+
+/// Remove the warden session payload for every scope on the
+/// SIGN-OUT-ALL-SCOPES path, cycling the session id first (D-04).
+///
+/// Closes the core gap where `AuthProxy::sign_out_all_scopes` removes
+/// without renewal (proxy.rs sign-out-all path).
+///
+/// # Errors
+///
+/// Returns [`DeviseError::Internal`] when the cycle fails — the transition
+/// fails instead of leaving the pre-sign-out id in place.
+pub async fn sign_out_all_scopes_and_renew(
+    session: &Session,
+    scopes: &[String],
+) -> Result<(), DeviseError> {
+    // D-04 sign-out-all cycle call site: fires BEFORE the removals.
+    session.cycle_id().await.map_err(cycle_error)?;
+    for scope in scopes {
+        let session_key = keys::scope_session_key(scope);
+        let _ = session.remove_value(&session_key).await;
+    }
+    Ok(())
+}
+
+/// Read the integer-epoch `last_request_at` tick for a scope (D-06).
+///
+/// Strict integer epochs only (core
+/// [`parse_last_request_at`](devise_rust::timeoutable::parse_last_request_at)):
+/// float strings and every other malformed shape return `None`, so callers
+/// fail closed to expired — never rescued toward valid.
+pub async fn read_last_request_at(
+    session: &Session,
+    scope: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = session
+        .get_value(&devise_rust::timeoutable::last_request_at_key(scope))
+        .await
+        .ok()
+        .flatten()?;
+    devise_rust::timeoutable::parse_last_request_at(&raw)
+}
+
+/// Write the integer-epoch `last_request_at` tick for a scope (D-06).
+pub async fn tick_last_request_at(
+    session: &Session,
+    scope: &str,
+    clock: &dyn devise_rust::time::Clock,
+) {
+    let epoch = clock.now().timestamp();
+    let _ = session
+        .insert_value(
+            &devise_rust::timeoutable::last_request_at_key(scope),
+            serde_json::Value::Number(serde_json::Number::from(epoch)),
+        )
+        .await;
 }
 
 /// Read the bridge's key index out of the session record.

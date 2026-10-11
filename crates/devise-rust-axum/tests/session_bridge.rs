@@ -16,25 +16,34 @@
 #![allow(clippy::missing_panics_doc)]
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::{ConnectInfo, Extension};
 use axum::http::{Method, Request, StatusCode, header};
 use axum::routing::get;
+use chrono::DateTime;
 use devise_rust::adapter::{DeviseKey, OrmAdapter, memory::MemoryAdapter};
 use devise_rust::config::DeviseConfig;
 use devise_rust::crypto;
 use devise_rust::error::DeviseError;
 use devise_rust::failure::AnyDeviseModel;
+use devise_rust::hooks::HookRegistry;
 use devise_rust::model::{AdapterBridge, ModelFinder, PasswordVerifiable};
+use devise_rust::proxy::AuthProxy;
+use devise_rust::request::{AuthRequest, HttpMethod};
 use devise_rust::scope::{Mapping, Module, PathNames, ScopeRegistry, SignOutVia};
+use devise_rust::session::SessionStore as _;
+use devise_rust::session::keys;
+use devise_rust::time::FixedClock;
 use devise_rust_axum::{
     DeviseLayer, DeviseRouterState, RequireAuth, session_manager_layer, sessions_router,
 };
 use http_body_util::BodyExt;
 use tower::ServiceExt;
-use tower_sessions::Session;
+use tower_sessions::{MemoryStore, Session};
 
 /// Minimal fixture user backed by the in-memory adapter (the test oracle).
 ///
@@ -108,6 +117,14 @@ async fn dashboard(user: RequireAuth<TracerUser>) -> String {
         .map_or_else(|| "anonymous".to_string(), |user| user.email.clone())
 }
 
+/// Peer probe: exposes the layer-built `AuthRequest.peer_addr` so tests
+/// can assert the socket-only contract (D-20) and `None` tolerance.
+async fn peer_probe(
+    axum::extract::Extension(request): axum::extract::Extension<AuthRequest>,
+) -> String {
+    request.peer_addr.unwrap_or_else(|| "none".to_string())
+}
+
 async fn tracer_app() -> Router {
     let config = Arc::new(test_config());
     let mut registry = ScopeRegistry::new();
@@ -142,6 +159,7 @@ async fn tracer_app() -> Router {
     Router::new()
         .merge(sessions_router(state))
         .route("/users/dashboard", get(dashboard))
+        .route("/users/peer-probe", get(peer_probe))
         .layer(devise_layer)
         .layer(session_layer)
 }
@@ -330,4 +348,433 @@ fn tracer_session_handle_is_send_sync() {
     let session = Session::new(None, Arc::new(store), None);
     assert_send_sync(session.clone());
     assert_send_sync(devise_rust_axum::TowerSessionStore::new(session));
+}
+
+// ============================================================================
+// Task 2 battery — full bridge contract, per-path renewal, CSRF rotation,
+// epoch ticks, peer sourcing (all over the real MemoryStore).
+// ============================================================================
+
+/// A session over a fresh `MemoryStore`.
+fn fresh_session() -> Session {
+    Session::new(None, Arc::new(MemoryStore::default()), None)
+}
+
+fn fixture_pair() -> (DeviseKey, String) {
+    (
+        DeviseKey::from_i64(7),
+        "$2a$04$salt-pepper-1234567890abcd".to_string(),
+    )
+}
+
+/// A proxy over the bridge store with the seeded `user` finder — the real
+/// core fetch path (salt validation lives in `AuthProxy`). Returns the
+/// seeded user so tests derive the matching `[key, salt]` pair.
+async fn bridge_proxy(session: &Session) -> (AuthProxy, TracerUser) {
+    let config = Arc::new(test_config());
+    let mut registry = ScopeRegistry::new();
+    registry.register(user_mapping());
+    let adapter = MemoryAdapter::<TracerUser>::new();
+    let digest = crypto::encryptor::digest("password123", &config);
+    let user = TracerUser {
+        id: 1,
+        email: "tracer@example.com".to_string(),
+        encrypted_password: digest,
+    };
+    adapter.create(user.clone()).await.expect("seed user");
+    let finder: Arc<dyn ModelFinder> = Arc::new(AdapterBridge::new(adapter));
+    let mut proxy = AuthProxy::new(
+        Arc::new(devise_rust_axum::TowerSessionStore::new(session.clone())),
+        Arc::new(registry),
+        Arc::new(HookRegistry::new()),
+        config,
+    );
+    proxy.register_finder("user", finder);
+    (proxy, user)
+}
+
+fn fetch_probe_request() -> AuthRequest {
+    AuthRequest::new(HttpMethod::Get, "/users/dashboard")
+}
+
+/// Round-trip: the `[key, salt]` payload stored under
+/// `warden.user.user.session` fetches back as the same user through the
+/// core proxy (T-09-02).
+#[tokio::test]
+async fn bridge_roundtrips_warden_payload_through_core_proxy() {
+    let session = fresh_session();
+    let (mut proxy, user) = bridge_proxy(&session).await;
+    let (key, salt) = user.session_pair();
+
+    let session_key = keys::scope_session_key("user");
+    let store = devise_rust_axum::TowerSessionStore::new(session.clone());
+    store
+        .insert_value(&session_key, serde_json::json!([key.to_string(), salt]))
+        .await;
+
+    let request = fetch_probe_request();
+    let fetched = proxy.authenticate("user", &request).await;
+    assert!(fetched.is_some(), "session fetch resolves the user");
+    assert_eq!(
+        proxy.user::<TracerUser>("user").map(|user| user.id),
+        Some(1)
+    );
+}
+
+/// Salt mismatch deletes the session key and yields no user (warden fetch
+/// semantics; T-09-02).
+#[tokio::test]
+async fn bridge_salt_mismatch_deletes_session_key() {
+    let session = fresh_session();
+    let (mut proxy, _) = bridge_proxy(&session).await;
+
+    // Payload carries a salt that cannot match the live record's digest.
+    let session_key = keys::scope_session_key("user");
+    let store = devise_rust_axum::TowerSessionStore::new(session.clone());
+    store
+        .insert_value(
+            &session_key,
+            serde_json::json!(["1", "stale-salt-that-no-longer-matches"]),
+        )
+        .await;
+
+    let request = fetch_probe_request();
+    assert!(proxy.authenticate("user", &request).await.is_none());
+
+    // The mismatch deleted the key: the poisoning payload is gone.
+    assert!(
+        store.get_value(&session_key).await.is_none(),
+        "salt mismatch must delete the session key"
+    );
+}
+
+/// SIGN-IN path: cycle fires before the insert; the id differs across the
+/// transition and the payload survives (T-09-01, Pitfall 2 convergence).
+#[tokio::test]
+async fn renewal_sign_in_cycles_id_with_payload_present() {
+    let session = fresh_session();
+    let (key, salt) = fixture_pair();
+    let session_key = keys::scope_session_key("user");
+
+    devise_rust_axum::bridge::insert_session_and_renew(&session, "user", &key, &salt)
+        .await
+        .expect("first sign-in transition");
+    session.save().await.expect("save assigns the id");
+    let id_before = session.id().expect("id assigned after save");
+    assert!(
+        session
+            .get_value(&session_key)
+            .await
+            .expect("read")
+            .is_some(),
+        "payload present after sign-in"
+    );
+
+    // A second sign-in transition on the same session: cycle BEFORE insert.
+    devise_rust_axum::bridge::insert_session_and_renew(&session, "user", &key, &salt)
+        .await
+        .expect("second sign-in transition");
+    session.save().await.expect("save assigns the new id");
+    let id_after = session.id().expect("id reassigned after cycle");
+    assert_ne!(id_before, id_after, "session id differs across sign-in");
+    let payload = session.get_value(&session_key).await.expect("read");
+    assert_eq!(
+        payload,
+        Some(serde_json::json!([key.to_string(), salt])),
+        "payload survived the rotation"
+    );
+}
+
+/// SIGN-OUT path: cycle fires before the removal; the id differs and the
+/// payload is gone (T-09-01).
+#[tokio::test]
+async fn renewal_sign_out_cycles_id_and_clears_payload() {
+    let session = fresh_session();
+    let (key, salt) = fixture_pair();
+    let session_key = keys::scope_session_key("user");
+
+    devise_rust_axum::bridge::insert_session_and_renew(&session, "user", &key, &salt)
+        .await
+        .expect("sign-in seed");
+    session.save().await.expect("save assigns the id");
+    let id_before = session.id().expect("id assigned after save");
+
+    devise_rust_axum::bridge::sign_out_and_renew(&session, "user")
+        .await
+        .expect("sign-out transition");
+    session.save().await.expect("save assigns the new id");
+    let id_after = session.id().expect("id reassigned after cycle");
+    assert_ne!(id_before, id_after, "session id differs across sign-out");
+    assert!(
+        session
+            .get_value(&session_key)
+            .await
+            .expect("read")
+            .is_none(),
+        "payload cleared on sign-out"
+    );
+}
+
+/// SIGN-OUT-ALL-SCOPES path: one cycle, every scope key removed (T-09-01).
+#[tokio::test]
+async fn renewal_sign_out_all_scopes_cycles_id_and_clears_every_scope() {
+    let session = fresh_session();
+    let (key, salt) = fixture_pair();
+    let user_key = keys::scope_session_key("user");
+    let admin_key = keys::scope_session_key("admin");
+
+    let store = devise_rust_axum::TowerSessionStore::new(session.clone());
+    store
+        .insert_value(&user_key, serde_json::json!([key.to_string(), &salt]))
+        .await;
+    store
+        .insert_value(&admin_key, serde_json::json!([key.to_string(), &salt]))
+        .await;
+    session.save().await.expect("save assigns the id");
+    let id_before = session.id().expect("id assigned after save");
+
+    let scopes = vec!["user".to_string(), "admin".to_string()];
+    devise_rust_axum::bridge::sign_out_all_scopes_and_renew(&session, &scopes)
+        .await
+        .expect("sign-out-all transition");
+    session.save().await.expect("save assigns the new id");
+    let id_after = session.id().expect("id reassigned after cycle");
+    assert_ne!(
+        id_before, id_after,
+        "session id differs across sign-out-all"
+    );
+    assert!(session.get_value(&user_key).await.expect("read").is_none());
+    assert!(session.get_value(&admin_key).await.expect("read").is_none());
+}
+
+/// BYPASS-SIGN-IN path: cycle before insert, closing the core
+/// `bypass_sign_in` renewal gap (T-09-01 / proxy.rs gap).
+#[tokio::test]
+async fn renewal_bypass_sign_in_cycles_id_with_payload_present() {
+    let session = fresh_session();
+    let (key, salt) = fixture_pair();
+    let session_key = keys::scope_session_key("user");
+
+    devise_rust_axum::bridge::insert_session_and_renew(&session, "user", &key, &salt)
+        .await
+        .expect("sign-in seed");
+    session.save().await.expect("save assigns the id");
+    let id_before = session.id().expect("id assigned after save");
+
+    devise_rust_axum::bridge::bypass_sign_in_and_renew(&session, "user", &key, &salt)
+        .await
+        .expect("bypass transition");
+    session.save().await.expect("save assigns the new id");
+    let id_after = session.id().expect("id reassigned after cycle");
+    assert_ne!(id_before, id_after, "session id differs across bypass");
+    let payload = session.get_value(&session_key).await.expect("read");
+    assert_eq!(
+        payload,
+        Some(serde_json::json!([key.to_string(), salt])),
+        "payload survived the bypass rotation"
+    );
+}
+
+/// ACCOUNT-UPDATE path: the password-change re-sign-in cycles too
+/// (T-09-01; `update_with_password` -> re-sign-in in Devise).
+#[tokio::test]
+async fn renewal_account_update_cycles_id_with_payload_present() {
+    let session = fresh_session();
+    let (key, salt) = fixture_pair();
+    let session_key = keys::scope_session_key("user");
+
+    devise_rust_axum::bridge::insert_session_and_renew(&session, "user", &key, &salt)
+        .await
+        .expect("sign-in seed");
+    session.save().await.expect("save assigns the id");
+    let id_before = session.id().expect("id assigned after save");
+
+    devise_rust_axum::bridge::account_update_and_renew(&session, "user", &key, &salt)
+        .await
+        .expect("account-update transition");
+    session.save().await.expect("save assigns the new id");
+    let id_after = session.id().expect("id reassigned after cycle");
+    assert_ne!(
+        id_before, id_after,
+        "session id differs across account update"
+    );
+    let payload = session.get_value(&session_key).await.expect("read");
+    assert_eq!(
+        payload,
+        Some(serde_json::json!([key.to_string(), salt])),
+        "payload survived the account-update rotation"
+    );
+}
+
+/// A store whose `delete` always fails, proving a failed cycle fails the
+/// transition instead of persisting under the old id.
+#[derive(Debug)]
+struct FailingDeleteStore {
+    inner: MemoryStore,
+}
+
+#[async_trait::async_trait]
+impl tower_sessions::session_store::SessionStore for FailingDeleteStore {
+    async fn create(
+        &self,
+        session_record: &mut tower_sessions::session::Record,
+    ) -> tower_sessions::session_store::Result<()> {
+        self.inner.create(session_record).await
+    }
+
+    async fn save(
+        &self,
+        session_record: &tower_sessions::session::Record,
+    ) -> tower_sessions::session_store::Result<()> {
+        self.inner.save(session_record).await
+    }
+
+    async fn load(
+        &self,
+        session_id: &tower_sessions::session::Id,
+    ) -> tower_sessions::session_store::Result<Option<tower_sessions::session::Record>> {
+        self.inner.load(session_id).await
+    }
+
+    async fn delete(
+        &self,
+        _session_id: &tower_sessions::session::Id,
+    ) -> tower_sessions::session_store::Result<()> {
+        Err(tower_sessions::session_store::Error::Backend(
+            "delete unavailable".to_string(),
+        ))
+    }
+}
+
+/// The D-04 error contract: a failed cycle fails the transition — the
+/// payload is never inserted.
+#[tokio::test]
+async fn failed_cycle_fails_the_transition() {
+    let store = Arc::new(FailingDeleteStore {
+        inner: MemoryStore::default(),
+    });
+    let session = Session::new(None, store, None);
+    let (key, salt) = fixture_pair();
+
+    let result =
+        devise_rust_axum::bridge::insert_session_and_renew(&session, "user", &key, &salt).await;
+    assert!(
+        matches!(result, Err(DeviseError::Internal(_))),
+        "a failed cycle must fail the transition, got {result:?}"
+    );
+    assert!(
+        session
+            .get_value(&keys::scope_session_key("user"))
+            .await
+            .expect("read")
+            .is_none(),
+        "no payload may be persisted when the cycle fails"
+    );
+}
+
+/// Epoch tick helpers: strict integer epochs; malformed (float) values read
+/// back as `None` so timeout checks fail closed to expired (D-06).
+#[tokio::test]
+async fn epoch_tick_helpers_are_strict_integer_epochs() {
+    let session = fresh_session();
+    let clock = FixedClock::new(DateTime::from_timestamp(1_700_000_000, 0).expect("epoch"));
+    let tick_key = devise_rust::timeoutable::last_request_at_key("user");
+
+    devise_rust_axum::bridge::tick_last_request_at(&session, "user", &clock).await;
+    let at = devise_rust_axum::bridge::read_last_request_at(&session, "user")
+        .await
+        .expect("integer epoch parses");
+    assert_eq!(at.timestamp(), 1_700_000_000);
+
+    // Float strings never parse (fail closed to expired).
+    session
+        .insert_value(&tick_key, serde_json::json!("1700000000.5"))
+        .await
+        .expect("insert");
+    assert!(
+        devise_rust_axum::bridge::read_last_request_at(&session, "user")
+            .await
+            .is_none(),
+        "float strings must fail closed"
+    );
+
+    // Free-form dates never parse either.
+    session
+        .insert_value(&tick_key, serde_json::json!("yesterday"))
+        .await
+        .expect("insert");
+    assert!(
+        devise_rust_axum::bridge::read_last_request_at(&session, "user")
+            .await
+            .is_none(),
+        "malformed values must fail closed"
+    );
+
+    // Absent key reads as None (first request, Devise nil).
+    assert!(
+        devise_rust_axum::bridge::read_last_request_at(&session, "admin")
+            .await
+            .is_none()
+    );
+}
+
+/// CSRF rotation (D-07): rotates while the config flag is on, no-ops when
+/// off; the token is app-owned and lives in the session.
+#[tokio::test]
+async fn csrf_rotation_honors_config_flag() {
+    let session = fresh_session();
+    let csrf_key = devise_rust_axum::csrf_token_key("user");
+    let config_on = test_config();
+
+    devise_rust_axum::rotate_csrf_token(&session, "user", &config_on).await;
+    let first = session
+        .get_value(&csrf_key)
+        .await
+        .expect("read")
+        .expect("token present after rotation");
+    devise_rust_axum::rotate_csrf_token(&session, "user", &config_on).await;
+    let second = session
+        .get_value(&csrf_key)
+        .await
+        .expect("read")
+        .expect("token present after second rotation");
+    assert_ne!(first, second, "rotation replaces the token");
+
+    let config_off = DeviseConfig {
+        clean_up_csrf_token_on_authentication: false,
+        ..test_config()
+    };
+    let before = session.get_value(&csrf_key).await.expect("read");
+    devise_rust_axum::rotate_csrf_token(&session, "user", &config_off).await;
+    let after = session.get_value(&csrf_key).await.expect("read");
+    assert_eq!(before, after, "flag off means no-op");
+}
+
+/// Peer sourcing (D-20): `None` (no connect info wired) is tolerated.
+#[tokio::test]
+async fn peer_addr_none_is_tolerated() {
+    let app = tracer_app().await;
+    let response = app
+        .oneshot(request(Method::GET, "/users/peer-probe", "", None))
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response).await, "none");
+}
+
+/// With `ConnectInfo` staged outermost (the runtime
+/// `into_make_service_with_connect_info` shape), the probe reads the
+/// socket peer and ignores attacker-controlled forwarding headers (D-20).
+#[tokio::test]
+async fn peer_addr_comes_from_the_socket_not_forwarded_headers() {
+    let addr: SocketAddr = "203.0.113.9:40000".parse().expect("socket addr");
+    let app = tracer_app().await.layer(Extension(ConnectInfo(addr)));
+    let mut probe = request(Method::GET, "/users/peer-probe", "", None);
+    probe.headers_mut().insert(
+        header::HeaderName::from_static("x-forwarded-for"),
+        header::HeaderValue::from_static("1.2.3.4, 5.6.7.8"),
+    );
+    let response = app.oneshot(probe).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response).await, "203.0.113.9");
 }

@@ -40,6 +40,7 @@ use devise_rust::scope::Mapping;
 use tower_sessions::Session;
 
 use crate::bridge;
+use crate::callbacks::rotate_csrf_token;
 use crate::failure::AxumFailureRenderer;
 use crate::layer::AuthProxyHandle;
 
@@ -141,6 +142,8 @@ async fn sessions_create(
     {
         return internal_error();
     }
+    // D-07: rotate the app-owned CSRF token on the transition.
+    rotate_csrf_token(&session, &scope, &st.config).await;
 
     if is_navigational_format(&auth_request, &st.config) {
         flash_redirect(&target, "signed_in")
@@ -169,6 +172,8 @@ async fn sessions_destroy(
     if bridge::sign_out_and_renew(&session, &scope).await.is_err() {
         return internal_error();
     }
+    // D-07: rotate the app-owned CSRF token on the transition.
+    rotate_csrf_token(&session, &scope, &st.config).await;
 
     if is_navigational_format(&auth_request, &st.config) {
         flash_redirect("/", "signed_out")

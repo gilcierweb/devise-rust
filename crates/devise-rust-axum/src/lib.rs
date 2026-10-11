@@ -67,8 +67,12 @@ pub mod failure;
 pub mod layer;
 pub mod routes;
 
-pub use bridge::TowerSessionStore;
-pub use callbacks::derive_session_key;
+pub use bridge::{
+    TowerSessionStore, account_update_and_renew, bypass_sign_in_and_renew,
+    insert_session_and_renew, read_last_request_at, sign_out_all_scopes_and_renew,
+    sign_out_and_renew, tick_last_request_at,
+};
+pub use callbacks::{csrf_token_key, derive_session_key, rotate_csrf_token};
 pub use extractors::{Auth, AuthRejection, RequireAuth};
 pub use failure::AxumFailureRenderer;
 pub use layer::{AuthProxyHandle, DeviseLayer, session_manager_layer};
