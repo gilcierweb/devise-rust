@@ -1,4 +1,6 @@
 //! Configuration module - `DeviseConfig` with all Devise options and per-scope overrides
+//!
+//! Mirrors the `Devise.setup` configuration surface (`devise/lib/devise.rb`): option names and defaults match Devise 5.0.4, and per-scope overrides cascade the way `Devise::Models.config` does.
 
 use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
@@ -9,6 +11,7 @@ mod serde_time_delta {
     use chrono::TimeDelta;
     use serde::{Deserialize, Deserializer, Serializer};
 
+    /// Serde bridge for duration options like `remember_for` and `timeout_in`; no direct Devise counterpart to mirror (Rails loads durations natively in `Devise.setup`).
     pub fn serialize<S>(td: &TimeDelta, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -16,6 +19,7 @@ mod serde_time_delta {
         serializer.serialize_i64(td.num_seconds())
     }
 
+    /// Serde bridge for duration options; mirrors the option-loading surface of `Devise.setup` by storing whole seconds.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<TimeDelta, D::Error>
     where
         D: Deserializer<'de>,
@@ -31,6 +35,7 @@ mod serde_time_delta_option {
     use serde::{Deserialize, Deserializer, Serializer};
 
     // serde's `with` attribute requires `&Option<T>` - the lint suggestion is incompatible
+    /// Serde bridge for optional duration options like `confirm_within`; mirrors Devise's nil-means-unlimited convention.
     #[allow(clippy::ref_option)]
     pub fn serialize<S>(td: &Option<TimeDelta>, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -42,6 +47,7 @@ mod serde_time_delta_option {
         }
     }
 
+    /// Serde bridge for optional durations; mirrors Devise's nil round-trip for nil-means-unlimited options like `confirm_within`.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<TimeDelta>, D::Error>
     where
         D: Deserializer<'de>,
@@ -54,6 +60,27 @@ mod serde_time_delta_option {
 /// Global Devise configuration with all options matching Devise 5.0.4
 // The Devise surface has many independent boolean flags by design (parity requirement);
 // grouping them into bitflags/enums would deviate from Devise's documented option names.
+/// Mirrors the `Devise.setup` configuration surface (`devise/lib/devise.rb`): every option name and default matches Devise 5.0.4, and per-scope overrides cascade the way `Devise::Models.config` does.
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::config::DeviseConfig;
+///
+/// let config = DeviseConfig {
+///     secret_key: "base64-encoded-32-byte-secret".to_string(), // REQUIRED
+///     mailer_sender: Some("no-reply@example.com".to_string()), // REQUIRED for mail
+///     pepper: None,                    // Devise default: nil
+///     stretches: 12,                   // Devise default: 12 (bcrypt cost)
+///     ..DeviseConfig::default()        // every other option keeps its Devise default
+/// };
+///
+/// assert_eq!(config.stretches, 12);
+/// assert_eq!(config.remember_for, chrono::TimeDelta::weeks(2));
+/// assert_eq!(config.timeout_in, chrono::TimeDelta::minutes(30));
+/// assert_eq!(config.reset_password_within, chrono::TimeDelta::hours(6));
+/// assert!(!config.paranoid);
+/// ```
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviseConfig {
@@ -252,6 +279,8 @@ impl Default for DeviseConfig {
 }
 
 /// Per-scope configuration override - all fields optional, cascade over global
+///
+/// Mirrors `Devise::Models.config(mod, *accessors)` (`devise/lib/devise/models.rb`): the per-scope override that cascades over the global `Devise.*` default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeviseConfigOverride {
     pub secret_key: Option<String>,
@@ -346,6 +375,28 @@ macro_rules! apply_override {
 
 impl DeviseConfigOverride {
     /// Resolve override against global config, returning a complete `DeviseConfig`
+    ///
+    /// Mirrors the devise model config cascade: a model override wins, else the global `Devise.setup` default holds.
+    ///
+    /// == Examples
+    ///
+    /// ```
+    /// use devise_rust::config::{DeviseConfig, DeviseConfigOverride};
+    ///
+    /// let global = DeviseConfig {
+    ///     secret_key: "global-secret".to_string(),
+    ///     ..DeviseConfig::default()
+    /// };
+    /// let admin = DeviseConfigOverride {
+    ///     stretches: Some(14),
+    ///     timeout_in: Some(chrono::TimeDelta::minutes(5)),
+    ///     ..DeviseConfigOverride::default()
+    /// };
+    ///
+    /// let resolved = admin.resolve(&global);
+    /// assert_eq!(resolved.stretches, 14);                             // override wins
+    /// assert_eq!(resolved.remember_for, chrono::TimeDelta::weeks(2)); // global default holds
+    /// ```
     #[must_use]
     pub fn resolve(&self, global: &DeviseConfig) -> DeviseConfig {
         let mut resolved = global.clone();

@@ -1,5 +1,7 @@
 //! `AuthRequest` snapshot - bridges carry this structured snapshot instead of raw HTTP
 //!
+//! Mirrors the Rack request surface devise's strategies and failure app read: method, path, headers, params, and the warden env flags.
+//!
 //! Normalizes untrusted HTTP input (headers, params, cookies, path) before crossing
 //! into core. Core trusts snapshot fields; bridges MUST sanitize before building.
 
@@ -7,6 +9,8 @@ use crate::config::DeviseConfig;
 use std::collections::HashMap;
 
 /// HTTP method for request classification
+///
+/// Mirrors the HTTP verb dispatch of devise's router: the `sign_out_via` matching vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum HttpMethod {
     Get,
@@ -24,6 +28,8 @@ impl HttpMethod {
     /// Returns `None` for unknown methods. Kept as an inherent method
     /// returning `Option` (instead of `std::str::FromStr`) to preserve the
     /// existing bridge/test call sites that match on `Option`.
+    ///
+    /// Parses the verb, mirroring the router dispatch devise's route generation relies on; unknown verbs fail closed to a non-matching value.
     #[allow(clippy::should_implement_trait)]
     #[must_use]
     pub fn from_str(s: &str) -> Option<Self> {
@@ -40,6 +46,8 @@ impl HttpMethod {
     }
 
     /// Check if this is a safe/idempotent method
+    ///
+    /// GET and HEAD safety, mirroring devise's method checks in the failure and timeout hooks.
     #[must_use]
     pub fn is_safe(&self) -> bool {
         matches!(
@@ -69,6 +77,8 @@ impl std::fmt::Display for HttpMethod {
 /// `skip_timeoutable`, `skip_trackable`, `allow_params_authentication`).
 /// Kept as plain bools for readability and struct-literal construction in
 /// bridges/tests; a state machine would be over-engineering here.
+///
+/// Mirrors the env flags devise sets: `devise.skip_trackable`, `devise.skip_timeoutable`, and the XHR marker.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct RequestFlags {
@@ -90,6 +100,8 @@ pub struct RequestFlags {
 /// - `ParameterFilter` normalization (case-insensitive keys, whitespace stripping)
 /// - Devise config gating (`http_authenticatable`, `params_authenticatable`, etc.)
 /// - Stored location parsing (`parse_uri` semantics)
+///
+/// The framework-neutral request snapshot strategies read; the typed mirror of devise's Rack env, params, and headers access.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuthRequest {
     /// HTTP method
@@ -118,6 +130,8 @@ pub struct AuthRequest {
 
 impl AuthRequest {
     /// Create a new `AuthRequest` with minimal required fields
+    ///
+    /// Assembles the snapshot from method, path, headers, and params; mirrors the Rack env devise's strategies read.
     #[must_use]
     pub fn new(method: HttpMethod, path: impl Into<String>) -> Self {
         Self {
@@ -143,6 +157,8 @@ impl AuthRequest {
     ///     .peer_addr("127.0.0.1".to_string());
     /// assert_eq!(request.peer_addr.as_deref(), Some("127.0.0.1"));
     /// ```
+    ///
+    /// Mirrors `request.remote_ip`: the socket peer address only; proxy headers are never trusted here (D-20).
     #[must_use]
     pub fn peer_addr(mut self, addr: String) -> Self {
         self.peer_addr = Some(addr);
@@ -171,6 +187,8 @@ impl AuthRequest {
     }
 
     /// Check if request is XHR (AJAX)
+    ///
+    /// Mirrors the XHR check behind `Devise.http_authenticatable_on_xhr`.
     #[must_use]
     pub fn is_xhr(&self) -> bool {
         self.headers
@@ -179,6 +197,8 @@ impl AuthRequest {
     }
 
     /// Check if request has HTTP Basic Authorization header
+    ///
+    /// Detects the Authorization header, mirroring the env check in `Devise::Strategies::Authenticatable`.
     #[must_use]
     pub fn has_http_basic(&self) -> bool {
         self.headers
@@ -189,6 +209,8 @@ impl AuthRequest {
     /// Extract HTTP Basic credentials (username, password)
     ///
     /// Returns None if header is missing, malformed, or not Basic.
+    ///
+    /// Parses HTTP Basic credentials, mirroring warden's basic-auth decoding.
     #[must_use]
     pub fn http_basic_credentials(&self) -> Option<(String, String)> {
         let auth = self.headers.get("authorization")?;
@@ -205,6 +227,8 @@ impl AuthRequest {
     /// Get recall target (controller, action) from params
     ///
     /// Used for `Failure::Recall` - custom sign-in forms that need original params.
+    ///
+    /// Mirrors the failure app's `recall` target resolution from the request.
     #[must_use]
     pub fn recall_target(&self) -> Option<(String, String)> {
         let controller = self.params.get("recall_controller")?.clone();
@@ -215,6 +239,8 @@ impl AuthRequest {
     /// Get the scope-specific params hash (`params[scope]`)
     ///
     /// Devise strategies extract credentials from `params[scope]` (e.g., `params[:user]`).
+    ///
+    /// Mirrors `params[scope]`: the scope credential hash devise's params strategy extracts.
     #[must_use]
     pub fn scope_params(&self, _scope: &str) -> Option<&HashMap<String, String>> {
         // This is a simplified version - real implementation would parse nested params
@@ -225,6 +251,8 @@ impl AuthRequest {
     /// Parse stored location URI - Devise's `parse_uri` semantics
     ///
     /// Strips scheme+authority, keeps path+query+fragment. Invalid → None.
+    ///
+    /// Mirrors devise's `stored_location` read with the open-redirect guard: same-host validation of the stored location.
     #[must_use]
     pub fn parse_stored_uri(input: &str) -> Option<String> {
         // Simple implementation: reject absolute URLs, accept relative paths
@@ -244,6 +272,8 @@ impl AuthRequest {
     /// Get params for a specific scope (e.g., `params[:user][:email]`)
     ///
     /// Handles both flat and nested param structures.
+    ///
+    /// Reads one param from the scope hash; the `params[scope][key]` mirror.
     #[must_use]
     pub fn get_scope_param(&self, scope: &str, key: &str) -> Option<&String> {
         // Try nested: params["scope"]["key"]
@@ -259,6 +289,8 @@ impl AuthRequest {
 ///
 /// Takes standard `HashMap` maps; generalizing over hashers would add
 /// generic noise for zero benefit since bridges always pass `RandomState`.
+///
+/// Builds the snapshot from parts; mirrors the Rack request assembly for tests over the framework adapters.
 #[allow(clippy::implicit_hasher)]
 #[must_use]
 pub fn build_auth_request(
@@ -278,6 +310,8 @@ pub fn build_auth_request(
 /// `peer_addr` is the framework-supplied socket peer (`request.remote_ip`
 /// equivalent). Bridges pass `Some` here and MUST never substitute an
 /// `X-Forwarded-For` or other proxy header value (D-20).
+///
+/// Builds the snapshot with an explicit socket peer; mirrors `request.remote_ip` for tests replaying recorded requests.
 #[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 #[must_use]
 pub fn build_auth_request_with_peer(
@@ -305,6 +339,8 @@ pub fn build_auth_request_with_peer(
 /// Builder methods for `AuthRequest`
 impl AuthRequest {
     /// Add headers to the request
+    ///
+    /// Header map accessor; mirrors the Rack header hash devise's strategies read.
     #[must_use]
     pub fn headers(mut self, headers: impl IntoIterator<Item = (String, String)>) -> Self {
         self.headers.extend(headers);
@@ -312,6 +348,8 @@ impl AuthRequest {
     }
 
     /// Add params to the request
+    ///
+    /// Params map accessor; mirrors the Rack params hash devise's strategies read.
     #[must_use]
     pub fn params(mut self, params: impl IntoIterator<Item = (String, String)>) -> Self {
         self.params.extend(params);

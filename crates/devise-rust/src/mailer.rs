@@ -38,20 +38,32 @@ use std::sync::Mutex;
 
 /// Embedded Devise mailer templates (`devise/app/views/devise/mailer/*.html.erb`
 /// converted ERB `<%= %>` -> Tera `{{ }}`). Embedded at compile time (MAIL-02).
+///
+/// The five notification bodies mirroring `devise/app/views/devise/mailer/*` with Devise's copy keys.
 pub mod templates {
     /// `confirmation_instructions` - welcome + confirmation link.
+    ///
+    /// Mirrors the `confirmation_instructions` mailer view and its I18n subject key.
     pub const CONFIRMATION_INSTRUCTIONS: &str =
         include_str!("../templates/devise/mailer/confirmation_instructions.email.tera");
     /// `reset_password_instructions` - reset-password link.
+    ///
+    /// Mirrors the `reset_password_instructions` mailer view and its I18n subject key.
     pub const RESET_PASSWORD_INSTRUCTIONS: &str =
         include_str!("../templates/devise/mailer/reset_password_instructions.email.tera");
     /// `unlock_instructions` - unlock link.
+    ///
+    /// Mirrors the `unlock_instructions` mailer view and its I18n subject key.
     pub const UNLOCK_INSTRUCTIONS: &str =
         include_str!("../templates/devise/mailer/unlock_instructions.email.tera");
     /// `email_changed` - change notification to the original address.
+    ///
+    /// Mirrors the `email_changed` mailer view and its I18n subject key.
     pub const EMAIL_CHANGED: &str =
         include_str!("../templates/devise/mailer/email_changed.email.tera");
     /// `password_change` - change notification.
+    ///
+    /// Mirrors the `password_change` mailer view and its I18n subject key.
     pub const PASSWORD_CHANGE: &str =
         include_str!("../templates/devise/mailer/password_change.email.tera");
 }
@@ -61,6 +73,8 @@ pub mod templates {
 /// `resource` carries the record's serializable fields so templates can use
 /// Devise's `@resource.<field>` expressions (e.g. `{{ resource.email }}`,
 /// `{% if resource.unconfirmed_email %}`).
+///
+/// The template payload mirroring devise's mailer locals: email, token, url, and the record.
 #[derive(Debug, Clone)]
 pub struct MailerContext {
     /// Delivery address (Devise `headers[:to]`). For `email_changed` this is
@@ -81,6 +95,8 @@ pub struct MailerContext {
 
 impl MailerContext {
     /// Build a context extracting the email from the record (MAIL-03).
+    ///
+    /// Builds the context from a record, mirroring devise's mailer recipient resolution through the model's email.
     pub fn from_record<M: HasEmail + ?Sized>(record: &M) -> Self {
         let email = record.email().to_string();
         Self {
@@ -92,6 +108,8 @@ impl MailerContext {
     }
 
     /// Attach the raw token emailed to the user (never the digest).
+    ///
+    /// Attaches the raw token, mirroring the `@token` local devise's templates interpolate.
     #[must_use]
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
@@ -99,6 +117,8 @@ impl MailerContext {
     }
 
     /// Attach the action URL (`confirmation_url`/`edit_password_url`/`unlock_url`).
+    ///
+    /// Attaches the URL, mirroring the `@url` local devise's templates interpolate.
     #[must_use]
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
@@ -106,6 +126,8 @@ impl MailerContext {
     }
 
     /// Attach the record's serializable fields (`@resource` in templates).
+    ///
+    /// Attaches the record, mirroring the `@resource` local devise's templates interpolate.
     #[must_use]
     pub fn with_resource(mut self, resource: serde_json::Value) -> Self {
         self.resource = resource;
@@ -123,6 +145,8 @@ impl MailerContext {
 }
 
 /// Supplies the delivery email for [`MailerContext::from_record`].
+///
+/// The recipient facet; mirrors devise reading `model.email` for every notification.
 pub trait HasEmail {
     /// The record's primary email address (Devise `email` column).
     fn email(&self) -> &str;
@@ -133,6 +157,8 @@ pub trait HasEmail {
 ///
 /// Each action takes the record, the raw token when the action carries one,
 /// and the extracted [`MailerContext`], returning the rendered body.
+///
+/// Mirrors `Devise::Mailer`: the five notification deliveries with devise's subjects and templates.
 pub trait Mailer<M>: Send + Sync {
     /// `confirmation_instructions` - welcome mail with confirmation link.
     ///
@@ -191,6 +217,8 @@ pub trait Mailer<M>: Send + Sync {
 }
 
 /// One email captured by [`TestMailer`] for assertions (MAIL-03).
+///
+/// Recorded delivery shape; mirrors `ActionMailer::MessageDelivery` as observed by devise's tests.
 #[derive(Debug, Clone)]
 pub struct SentMail {
     /// Recipient (`headers[:to]`).
@@ -207,6 +235,8 @@ pub struct SentMail {
 
 /// Test mailer: renders the real embedded templates and captures deliveries
 /// to an in-memory vector for assertions (MAIL-03).
+///
+/// Recording mailer for tests; mirrors `ActionMailer::Base.deliveries` array inspection in devise's test suite.
 #[derive(Debug, Default)]
 pub struct TestMailer {
     sent: Mutex<Vec<SentMail>>,
@@ -218,6 +248,8 @@ impl TestMailer {
     ///
     /// # Panics
     /// Panics if the internal mutex is poisoned.
+    ///
+    /// Reads the recorded deliveries; mirrors devise's test-suite deliveries inspection.
     #[must_use]
     pub fn sent_mails(&self) -> Vec<SentMail> {
         self.sent.lock().expect("TestMailer mutex poisoned").clone()
@@ -225,6 +257,8 @@ impl TestMailer {
 
     /// Set the sender (`Devise.mailer_sender` - per-scope variants resolve
     /// through the config cascade before reaching the mailer).
+    ///
+    /// Sets the sender on the recording mailer, mirroring `Devise.mailer_sender`.
     #[must_use]
     pub fn with_sender(mut self, mailer_sender: Option<String>) -> Self {
         self.mailer_sender = mailer_sender;

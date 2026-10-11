@@ -23,6 +23,8 @@ use std::marker::PhantomData;
 /// Single home for the downcase/trim rules that `ParameterFilter::filter`
 /// applies to `serde_json::Value` trees; this is its flat `Conditions`
 /// counterpart, shared by finders and strategies.
+///
+/// Mirrors the per-value half of `Devise::ParameterFilter#filter` (`devise/lib/devise/parameter_filter.rb`): downcase and strip of a single credential value.
 #[must_use]
 pub fn normalize_credential_value(
     value: String,
@@ -44,6 +46,8 @@ pub fn normalize_credential_value(
 /// Applies [`normalize_credential_value`] to every string entry, returning
 /// a new map. Concrete models call this on their condition maps before
 /// validation and lookup.
+///
+/// Mirrors the conditions normalization devise applies inside `find_for_authentication` through the `ParameterFilter`.
 #[must_use]
 pub fn normalize_auth_conditions(conditions: &Conditions, config: &DeviseConfig) -> Conditions {
     let mut normalized = Conditions::new();
@@ -68,6 +72,8 @@ pub fn normalize_auth_conditions(conditions: &Conditions, config: &DeviseConfig)
 /// Strategies resolve it through
 /// [`AnyDeviseModel::as_password_verifiable`],
 /// so the strategy chain never needs the concrete model type.
+///
+/// Mirrors `valid_password?` from `Devise::Models::DatabaseAuthenticatable` as the object-safe facet the strategy chain resolves through `AnyDeviseModel`.
 pub trait PasswordVerifiable: AnyDeviseModel {
     /// Check a plaintext password against the stored hash.
     fn valid_password(&self, password: &str, config: &DeviseConfig) -> bool;
@@ -91,10 +97,13 @@ pub trait PasswordVerifiable: AnyDeviseModel {
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// user.set_password(Some("secret123".to_string()), &config);
 /// assert!(user.valid_password("secret123", &config));
 /// assert!(!user.valid_password("wrong", &config));
 /// ```
+///
+/// Mirrors `Devise::Models::DatabaseAuthenticatable` (`devise/lib/devise/models/database_authenticatable.rb`): password handling over `encrypted_password`, `update_with/without_password`, `destroy_with_password`, `authenticatable_salt`, and the email/password change notifications.
 #[async_trait]
 pub trait DatabaseAuthenticatable: Authenticatable {
     /// Stored `encrypted_password` column value (None before first set).
@@ -204,7 +213,7 @@ pub trait DatabaseAuthenticatable: Authenticatable {
             .as_deref()
             .is_some_and(|pw| self.valid_password(pw, config));
         // Devise mass-assignment routes `password`/`password_confirmation`
-        // through the `password=` setter (which hashes) — in BOTH the success
+        // through the `password=` setter (which hashes) in BOTH the success
         // and the failure branch (the failed record re-renders with the new
         // attributes in memory but is never persisted). `assign_attributes`
         // deliberately ignores password keys (per its contract), so the pair
@@ -389,6 +398,7 @@ pub trait DatabaseAuthenticatable: Authenticatable {
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// let user = TestUser::new_with_session(&params, &session, &config);
 /// // save via adapter; then:
 /// match user.post_sign_up_message() {
@@ -396,6 +406,8 @@ pub trait DatabaseAuthenticatable: Authenticatable {
 ///     Some(key) => { /* flash "signed_up_but_{key}", no session data */ }
 /// }
 /// ```
+///
+/// Mirrors `Devise::Models::Registerable` (`devise/lib/devise/models/registerable.rb`): `new_with_session` and the post-sign-up decisions.
 #[async_trait]
 pub trait Registerable: DatabaseAuthenticatable {
     /// `new_with_session(params, session)` (REGS-01): build a record from
@@ -512,9 +524,12 @@ pub enum SignUpOutcome<M> {
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// let raw = user.send_reset_password_instructions(&adapter, &mailer, &config, &clock).await?;
 /// let outcome = TestUser::reset_password_by_token(&attrs, &adapter, &config, &clock).await?;
 /// ```
+///
+/// Mirrors `Devise::Models::Recoverable` (`devise/lib/devise/models/recoverable.rb`): the reset token lifecycle with digest-only storage.
 #[async_trait]
 pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
     /// Stored `reset_password_token` column - always the HMAC digest, never raw.
@@ -847,9 +862,12 @@ pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// let errors = user.validate(&config);
 /// assert!(errors.is_empty());
 /// ```
+///
+/// Mirrors `Devise::Models::Validatable` (`devise/lib/devise/models/validatable.rb`): email and password validations against `email_regexp` and `password_length`.
 #[async_trait]
 pub trait Validatable: DatabaseAuthenticatable {
     /// The record's email for validation (None until set).
@@ -1127,6 +1145,8 @@ pub trait Authenticatable: AnyDeviseModel {
 /// assert!(!chain_active_for_authentication(false, true));
 /// assert!(!chain_active_for_authentication(true, false));
 /// ```
+///
+/// Mirrors the `super` chain of `active_for_authentication?` in devise's module stack: confirmable before lockable, per `devise/lib/devise/modules.rb`.
 #[must_use]
 pub fn chain_active_for_authentication(confirmable_active: bool, lockable_active: bool) -> bool {
     confirmable_active && lockable_active
@@ -1180,6 +1200,8 @@ pub trait ModelFinder: Send + Sync {
 }
 
 /// Bridges a typed `OrmAdapter<M>` into the erased [`ModelFinder`] contract.
+///
+/// Object-safe bridge over the typed `OrmAdapter`; mirrors devise's `to_adapter` dispatch, which is duck-typed in Ruby and typed in the port.
 pub struct AdapterBridge<A, M> {
     adapter: A,
     model: PhantomData<M>,
@@ -1187,6 +1209,8 @@ pub struct AdapterBridge<A, M> {
 
 impl<A, M> AdapterBridge<A, M> {
     /// Wrap a typed adapter for registration under a scope.
+    ///
+    /// Wraps one adapter in the object-safe bridge; mirrors devise's `to_adapter` dispatch used by strategies and the proxy.
     #[must_use]
     pub fn new(adapter: A) -> Self {
         Self {
@@ -1196,6 +1220,8 @@ impl<A, M> AdapterBridge<A, M> {
     }
 
     /// Access the inner typed adapter.
+    ///
+    /// Borrows the wrapped adapter for typed call sites; the downcast mirror of devise's duck-typed adapter calls.
     #[must_use]
     pub fn inner(&self) -> &A {
         &self.adapter

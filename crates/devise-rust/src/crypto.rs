@@ -1,4 +1,6 @@
 //! Crypto primitives - bcrypt Encryptor, HMAC-SHA256 `TokenGenerator`, `secure_compare`, `friendly_token`
+//!
+//! Mirrors `Devise::Encryptor`, `Devise::TokenGenerator`, `Devise.secure_compare`, and `Devise.friendly_token` (`devise/lib/devise/encryptor.rb`, `token_generator.rb`, `devise/lib/devise.rb`).
 
 use crate::config::DeviseConfig;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -99,6 +101,8 @@ pub mod encryptor {
 }
 
 /// HMAC-SHA256 token generation - stores only digest, emails carry raw token
+///
+/// Mirrors `Devise::TokenGenerator` (`devise/lib/devise/token_generator.rb`): HMAC-SHA256 keyed by "Devise {column}"; the database stores only digests, emails carry raw tokens.
 pub mod token_generator {
     use super::{HmacSha256, KeyInit, Mac};
 
@@ -116,6 +120,8 @@ pub mod token_generator {
     /// # Panics
     ///
     /// Panics if the HMAC key is rejected (should not happen - HMAC accepts any key length).
+    ///
+    /// Mirrors `Devise::TokenGenerator#digest`: the per-column HMAC of a raw token value.
     #[must_use]
     pub fn digest(secret_key: &str, column: &str, value: &str) -> String {
         let key = column_key(secret_key, column);
@@ -129,6 +135,8 @@ pub mod token_generator {
     /// The caller is responsible for uniqueness: Devise loops
     /// `generate` until the digest is unused in the DB. This function
     /// takes that check as a closure so adapters own the lookup.
+    ///
+    /// Mirrors `Devise::TokenGenerator#generate` including the uniqueness loop devise wraps around it; the adapter owns the lookup the same way devise's generator checks the database.
     #[must_use]
     pub fn generate_with(
         secret_key: &str,
@@ -148,6 +156,8 @@ pub mod token_generator {
     ///
     /// Suitable when the column has enough entropy that collisions are
     /// negligible (Devise default: 160-bit URL-safe tokens).
+    ///
+    /// Mirrors `Devise::TokenGenerator#generate` without the database uniqueness loop; callers with high-entropy token columns rely on the 160-bit space instead.
     #[must_use]
     pub fn generate(secret_key: &str, column: &str) -> (String, String) {
         let raw = super::friendly_token(20);
@@ -157,6 +167,8 @@ pub mod token_generator {
 }
 
 /// Constant-time string comparison using `subtle::ConstantTimeEq`
+///
+/// Mirrors `Devise.secure_compare` (`devise/lib/devise.rb`): constant-time and nil-safe string comparison.
 #[must_use]
 pub fn secure_compare(a: &str, b: &str) -> bool {
     let a_bytes = a.as_bytes();
@@ -176,6 +188,8 @@ pub fn secure_compare(a: &str, b: &str) -> bool {
 /// # Panics
 ///
 /// Panics if the OS random source fails (matches `getrandom` semantics).
+///
+/// Mirrors `Devise.friendly_token` (`devise/lib/devise.rb`): URL-safe base64 with the exact `lIO0` to `sxyz` translation.
 #[must_use]
 pub fn friendly_token(length: usize) -> String {
     let random_bytes = {

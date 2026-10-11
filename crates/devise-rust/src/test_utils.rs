@@ -1,9 +1,13 @@
 //! Test utilities - available with `test-utils` feature
+//!
+//! Test-only utilities; no devise counterpart to mirror (devise's test suite configures the gem globally, the port stubs config and adapter per test).
 
 use crate::adapter::memory::MemoryAdapter;
 use crate::config::DeviseConfig;
 
 /// Create a test `DeviseConfig` with sensible defaults for testing
+///
+/// Test-only configuration with fast stretches; no devise counterpart to mirror (devise's test suite configures the gem globally).
 #[must_use]
 pub fn test_config() -> DeviseConfig {
     DeviseConfig {
@@ -14,6 +18,8 @@ pub fn test_config() -> DeviseConfig {
 }
 
 /// Create an in-memory adapter for testing
+///
+/// In-memory adapter for tests; the `MemoryAdapter` oracle, with no devise counterpart to mirror.
 #[must_use]
 pub fn test_adapter<M: Send + Sync + Clone + 'static>() -> MemoryAdapter<M> {
     MemoryAdapter::new()

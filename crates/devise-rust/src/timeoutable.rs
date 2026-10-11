@@ -20,6 +20,7 @@
 //! == Examples
 //!
 //! ```ignore
+//! // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 //! assert!(user.timedout(Some(clock.now() - config.timeout_in - TimeDelta::minutes(1)), &config, &clock));
 //! assert!(!user.timedout(None, &config, &clock));
 //! ```
@@ -31,6 +32,8 @@ use crate::time::Clock;
 use chrono::{DateTime, TimeDelta, Utc};
 
 /// Session field holding the last-request epoch (Devise `last_request_at`).
+///
+/// Mirrors the session `last_request_at` slot devise's timeoutable hook reads and writes per request.
 pub const LAST_REQUEST_AT_FIELD: &str = "last_request_at";
 
 /// Required model fields for Timeoutable, mirroring Devise's
@@ -60,6 +63,8 @@ pub fn required_fields() -> Vec<&'static str> {
 ///
 /// assert_eq!(last_request_at_key("user"), "warden.user.user.last_request_at");
 /// ```
+///
+/// Namespaced session key for the tick; mirrors the slot devise keeps inside `warden.session(scope)`.
 #[must_use]
 pub fn last_request_at_key(scope: &str) -> String {
     format!("warden.user.{scope}.{LAST_REQUEST_AT_FIELD}")
@@ -79,8 +84,11 @@ pub fn last_request_at_key(scope: &str) -> String {
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// impl Timeoutable for User {}
 /// ```
+///
+/// Mirrors `Devise::Models::Timeoutable` (`devise/lib/devise/models/timeoutable.rb`) as the trait surface: `timedout` with the Devise-exact boundary.
 pub trait Timeoutable: Authenticatable {
     /// Per-model `timeout_in` window (Devise `timeout_in`): defaults to the
     /// global config so apps override per model by overriding this method
@@ -122,6 +130,8 @@ pub trait Timeoutable: Authenticatable {
 /// assert!(parse_last_request_at(&serde_json::json!("yesterday")).is_none());
 /// assert!(parse_last_request_at(&serde_json::Value::Null).is_none());
 /// ```
+///
+/// Strict parse of the stored tick; mirrors devise's permissive string parse hardened to fail closed on malformed values.
 #[must_use]
 pub fn parse_last_request_at(value: &serde_json::Value) -> Option<DateTime<Utc>> {
     if let Some(epoch) = value.as_i64() {
@@ -135,6 +145,8 @@ pub fn parse_last_request_at(value: &serde_json::Value) -> Option<DateTime<Utc>>
 }
 
 /// Classified shape of the stored tick.
+///
+/// Classification of the stored tick (Missing, Malformed, At); mirrors devise's timedout read with the fail-closed posture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LastRequestTick {
     /// No tick stored yet (first request): live, tick it.
@@ -161,6 +173,8 @@ pub enum LastRequestTick {
 ///     LastRequestTick::Malformed
 /// );
 /// ```
+///
+/// Classifies the stored session value into the tick taxonomy; the typed mirror of devise's defensive parse.
 #[must_use]
 pub fn classify_last_request(stored: Option<&serde_json::Value>) -> LastRequestTick {
     match stored {
@@ -177,6 +191,21 @@ pub fn classify_last_request(stored: Option<&serde_json::Value>) -> LastRequestT
 /// `Missing` is live (Devise `timedout?(nil)` is falsy); `Malformed` fails
 /// closed to expired (threat T-05-09); `At` uses the Devise-exact `<=`
 /// boundary.
+///
+/// Mirrors the Devise-exact less-than-or-equal boundary of `timedout?`; `Missing` stays live and `Malformed` fails closed to expired.
+///
+/// == Examples
+///
+/// ```
+/// use chrono::TimeDelta;
+/// use devise_rust::time::FixedClock;
+/// use devise_rust::timeoutable::{LastRequestTick, tick_expired};
+///
+/// let clock = FixedClock::new(chrono::Utc::now());
+/// let window = TimeDelta::minutes(30);
+/// assert!(!tick_expired(LastRequestTick::Missing, window, &clock));
+/// assert!(tick_expired(LastRequestTick::Malformed, window, &clock));
+/// ```
 #[must_use]
 pub fn tick_expired(tick: LastRequestTick, timeout_in: TimeDelta, clock: &dyn Clock) -> bool {
     match tick {
@@ -187,6 +216,8 @@ pub fn tick_expired(tick: LastRequestTick, timeout_in: TimeDelta, clock: &dyn Cl
 }
 
 /// Hook decision for one request (D-17).
+///
+/// The hook's verdict (Skipped, Live, Expired) mirroring the outcomes of `devise/lib/devise/hooks/timeoutable.rb`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutDecision {
     /// A skip flag bypassed the check entirely: no expiry, no tick.
@@ -223,6 +254,8 @@ pub enum TimeoutDecision {
 /// );
 /// assert_eq!(check_timeout(None, &flags, config.timeout_in, &clock), TimeoutDecision::Live);
 /// ```
+///
+/// Per-request timeout evaluation mirroring the devise timeoutable hook: skip flags, classification, and the tick refresh.
 #[must_use]
 pub fn check_timeout(
     stored: Option<&serde_json::Value>,
@@ -252,10 +285,13 @@ pub fn check_timeout(
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// if crate::timeoutable::remember_active_for_timeout(record, request, scope, config, clock) {
 ///     // Exempt: tick and continue.
 /// }
 /// ```
+///
+/// The live remember-me exemption mirroring the one devise's timeoutable hook honors before failing a request as timed out.
 #[must_use]
 pub fn remember_active_for_timeout(
     record: &dyn crate::failure::AnyDeviseModel,

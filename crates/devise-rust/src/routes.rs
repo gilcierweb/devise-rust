@@ -1,5 +1,7 @@
 //! Route consumption - framework-facing views over `Mapping::route_specs`
 //!
+//! Mirrors the `devise_for` route table (`devise/lib/devise/rails/routes.rb`) as framework-neutral data.
+//!
 //! The canonical table lives in [`Mapping::route_specs`](crate::scope::Mapping::route_specs)
 //! (`scope.rs`); this module adds the thin consumption layer bridges need:
 //! scope route tables plus guard descriptors for `authenticate(scope)`,
@@ -13,6 +15,8 @@ use crate::scope::{Mapping, RouteSpec};
 /// Delegates to [`Mapping::route_specs`](crate::scope::Mapping::route_specs);
 /// kept as a free function so bridges can pass mappings without importing
 /// the whole `scope` surface.
+///
+/// Builds the per-module route table mirroring `devise_for` (`devise/lib/devise/rails/routes.rb`): sessions, registrations, passwords, confirmations, and unlocks.
 #[must_use]
 pub fn devise_scope_routes(mapping: &Mapping) -> Vec<RouteSpec> {
     mapping.route_specs()
@@ -31,6 +35,8 @@ pub enum GuardMode {
 }
 
 /// Data descriptor for a scope guard a bridge registers on its router.
+///
+/// Mirrors the router constraints `authenticate(scope)`, `authenticated(scope)`, and `unauthenticated(scope)` (`devise/lib/devise/rails/routes.rb`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeGuard {
     /// Scope the guard applies to.
@@ -41,6 +47,8 @@ pub struct ScopeGuard {
 
 impl ScopeGuard {
     /// Guard running authentication for `scope`.
+    ///
+    /// Mirrors the `authenticate(scope) { ... }` constraint: require an authenticated scope inside the block.
     #[must_use]
     pub fn authenticate(scope: impl Into<String>) -> Self {
         Self {
@@ -50,6 +58,8 @@ impl ScopeGuard {
     }
 
     /// Guard allowing only signed-in `scope` requests.
+    ///
+    /// Mirrors the `authenticated(scope) { ... }` constraint: run the block only when the scope is signed in.
     #[must_use]
     pub fn authenticated(scope: impl Into<String>) -> Self {
         Self {
@@ -59,6 +69,8 @@ impl ScopeGuard {
     }
 
     /// Guard allowing only signed-out `scope` requests.
+    ///
+    /// Mirrors the `unauthenticated(scope) { ... }` constraint: run the block only when the scope is anonymous.
     #[must_use]
     pub fn unauthenticated(scope: impl Into<String>) -> Self {
         Self {
@@ -69,6 +81,8 @@ impl ScopeGuard {
 }
 
 /// Data descriptor for a `devise_scope` mount point.
+///
+/// Mount descriptor mirroring the `devise_scope(scope) { ... }` block: the explicit-scope override for route groups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeMount {
     /// Scope whose mapping applies under this path.
@@ -79,6 +93,8 @@ pub struct ScopeMount {
 
 impl ScopeMount {
     /// Mount descriptor derived from a mapping.
+    ///
+    /// Constructs a mount for one scope, mirroring `devise_scope`.
     #[must_use]
     pub fn new(mapping: &Mapping) -> Self {
         Self {

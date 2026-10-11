@@ -1,10 +1,14 @@
 //! Parameter filtering and sanitization - `ParameterFilter` and `ParameterSanitizer`
+//!
+//! Mirrors `Devise::ParameterFilter` and `Devise::ParameterSanitizer` (`devise/lib/devise/parameter_filter.rb`, `parameter_sanitizer.rb`).
 
 use crate::config::DeviseConfig;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
 /// Filter parameters for case-insensitivity and whitespace stripping
+///
+/// Mirrors `Devise::ParameterFilter` (`devise/lib/devise/parameter_filter.rb`).
 pub struct ParameterFilter;
 
 impl ParameterFilter {
@@ -13,6 +17,8 @@ impl ParameterFilter {
     /// - Downcases `case_insensitive_keys`
     /// - Strips whitespace from `strip_whitespace_keys`
     /// - Non-string scalars are left typed (stringify at the query layer if needed)
+    ///
+    /// Mirrors `ParameterFilter#filter`: downcase `case_insensitive_keys`, strip `strip_whitespace_keys`, and stringify scalar values.
     pub fn filter(value: &mut Value, config: &DeviseConfig) {
         match value {
             Value::Object(map) => {
@@ -42,6 +48,8 @@ impl ParameterFilter {
 }
 
 /// Strong-parameters style sanitizer for Devise actions
+///
+/// Mirrors `Devise::ParameterSanitizer` (`devise/lib/devise/parameter_sanitizer.rb`).
 #[derive(Debug, Clone, Default)]
 pub struct ParameterSanitizer {
     /// Permitted keys per action
@@ -50,6 +58,8 @@ pub struct ParameterSanitizer {
 
 impl ParameterSanitizer {
     /// Create a new sanitizer with Devise defaults
+    ///
+    /// Mirrors the sanitizer initialization from the auth keys, the way devise's initializer builds per-action defaults.
     #[must_use]
     pub fn new(config: &DeviseConfig) -> Self {
         let mut permitted = HashMap::new();
@@ -78,12 +88,16 @@ impl ParameterSanitizer {
     }
 
     /// Get permitted keys for an action
+    ///
+    /// Reads the permitted keys for an action, mirroring the sanitizer's defaults table.
     #[must_use]
     pub fn permitted(&self, action: &str) -> Option<&HashSet<String>> {
         self.permitted.get(action)
     }
 
     /// Permit additional keys for an action
+    ///
+    /// Mirrors the sanitizer's `permit(action, keys:)` extension API.
     pub fn permit(&mut self, action: &str, keys: &[&str]) {
         let set = self.permitted.entry(action.to_string()).or_default();
         for key in keys {
@@ -92,6 +106,8 @@ impl ParameterSanitizer {
     }
 
     /// Remove keys from permitted list for an action
+    ///
+    /// Mirrors the sanitizer's `except` extension option.
     pub fn except(&mut self, action: &str, keys: &[&str]) {
         if let Some(set) = self.permitted.get_mut(action) {
             for key in keys {
@@ -107,6 +123,8 @@ impl ParameterSanitizer {
     /// Panics if `action` has not been registered via [`Self::new`] or [`Self::permit`].
     /// Unknown actions are a programmer error, not a runtime condition - call sites
     /// must use the known action names (`sign_in`, `sign_up`, `account_update`).
+    ///
+    /// Mirrors `ParameterSanitizer#sanitize(action)`: the permitted params for `sign_in`, `sign_up`, and `account_update`.
     #[must_use]
     pub fn sanitize(&self, action: &str, params: &Map<String, Value>) -> Map<String, Value> {
         let Some(permitted) = self.permitted.get(action) else {
@@ -121,6 +139,8 @@ impl ParameterSanitizer {
     }
 
     /// Sanitize with a custom block for complex logic
+    ///
+    /// Mirrors the sanitizer's block form, `sanitize(action) { |attrs| ... }`.
     pub fn sanitize_with<F>(
         &self,
         action: &str,

@@ -1,5 +1,7 @@
 //! `AuthProxy` - warden Proxy port for session and strategy execution
 //!
+//! Mirrors `Warden::Proxy` (`warden/lib/warden/proxy.rb`): the per-request authentication state devise's controllers reach through `warden`.
+//!
 //! Manages per-scope memoized users, runs the strategy chain in Devise
 //! order (rememberable, params, HTTP Basic), persists `[key, salt]` session
 //! payloads, and dispatches hooks through `HookRegistry`.
@@ -25,6 +27,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// Event that triggered `set_user`.
+///
+/// Mirrors warden's `event:` option on `set_user`: :authentication, :fetch, and friends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetUserEvent {
     /// User authenticated (sign in, sign up).
@@ -36,6 +40,8 @@ pub enum SetUserEvent {
 }
 
 /// Options for [`AuthProxy::set_user`].
+///
+/// Mirrors warden's `set_user` options: store, event, and the run-callbacks toggle.
 #[derive(Debug, Clone)]
 pub struct SetUserOpts {
     /// Event that triggered the call.
@@ -60,6 +66,8 @@ impl Default for SetUserOpts {
 }
 
 /// Central authentication state for one request.
+///
+/// Mirrors `Warden::Proxy` (`warden/lib/warden/proxy.rb`): the per-request authentication state holding session, strategies, config, and the memoized user.
 pub struct AuthProxy {
     users: HashMap<String, Option<Box<dyn AnyDeviseModel>>>,
     performed: HashMap<String, HashSet<String>>,
@@ -77,6 +85,8 @@ impl AuthProxy {
     ///
     /// Per-scope [`ModelFinder`]s are registered separately with
     /// [`register_finder`](Self::register_finder).
+    ///
+    /// Constructs the proxy, mirroring warden's per-request proxy initialization.
     #[must_use]
     pub fn new(
         session_store: Arc<dyn SessionStore>,
@@ -98,29 +108,39 @@ impl AuthProxy {
     }
 
     /// Register the model finder backing one scope.
+    ///
+    /// Registers the scope's finder, the typed mirror of warden's config-referenced user class.
     pub fn register_finder(&mut self, scope: &str, finder: Arc<dyn ModelFinder>) {
         self.finders.insert(scope.to_string(), finder);
     }
 
     /// Borrow the scope registry.
+    ///
+    /// Borrows the scope registry; the `Devise.mappings` mirror the proxy reads.
     #[must_use]
     pub fn scope_registry(&self) -> &ScopeRegistry {
         &self.registry
     }
 
     /// Borrow the session store.
+    ///
+    /// Borrows the session store; the warden session surface mirror.
     #[must_use]
     pub fn session_store(&self) -> &dyn SessionStore {
         self.session_store.as_ref()
     }
 
     /// Borrow the hook registry.
+    ///
+    /// Borrows the hook registry; the warden callback storage mirror.
     #[must_use]
     pub fn hooks(&self) -> &HookRegistry {
         &self.hooks
     }
 
     /// Borrow the Devise config.
+    ///
+    /// Borrows the configuration; the `Devise` module mirror.
     #[must_use]
     pub fn config(&self) -> &DeviseConfig {
         &self.config
@@ -132,24 +152,32 @@ impl AuthProxy {
     /// bridges drain them after authentication and execute `Set` through
     /// `RememberableBridge::set_cookie` plus `Clear` through
     /// `RememberableBridge::clear_cookie`.
+    ///
+    /// The remember-cookie outbox the hooks fill; mirrors the cookies devise writes inline, queued as ops for the framework transport.
     #[must_use]
     pub fn remember_cookie_ops(&self) -> &[RememberCookieOp] {
         &self.remember_cookie_ops
     }
 
     /// Drain the pending remember-cookie intents for the bridge.
+    ///
+    /// Drains the queued remember ops; mirrors the cookie writes warden performs inline, handed off to the framework transport.
     #[must_use]
     pub fn take_remember_cookie_ops(&mut self) -> Vec<RememberCookieOp> {
         std::mem::take(&mut self.remember_cookie_ops)
     }
 
     /// Whether the proxy is locked for this request.
+    ///
+    /// Mirrors `Warden::Proxy#authenticated?` state probing.
     #[must_use]
     pub fn locked(&self) -> bool {
         self.locked
     }
 
     /// Lock the proxy, blocking further authentication this request.
+    ///
+    /// Mirrors `Warden::Proxy#lock!`: pinning the proxy to one scope for the request.
     pub fn lock(&mut self) {
         self.locked = true;
     }
@@ -186,6 +214,8 @@ impl AuthProxy {
     }
 
     /// Check authentication without running strategies (memo or nothing).
+    ///
+    /// Mirrors `Warden::Proxy#authenticated?(scope)`: resolve and validate the signed-in record for a scope.
     #[must_use]
     pub fn authenticated(&self, scope: &str) -> bool {
         self.users
@@ -195,6 +225,8 @@ impl AuthProxy {
     }
 
     /// Downcast the memoized user to its concrete model type.
+    ///
+    /// Mirrors `Warden::Proxy#user(scope)`: the memoized current-user read.
     #[must_use]
     pub fn user<M: 'static>(&self, scope: &str) -> Option<&M> {
         self.users

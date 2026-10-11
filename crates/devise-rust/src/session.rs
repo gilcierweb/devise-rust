@@ -1,5 +1,7 @@
 //! Session management - `SessionStore` trait, serialization, key naming
 //!
+//! Mirrors warden's session surface and devise's `serialize_into_session` / `serialize_from_session` key families and salt check.
+//!
 //! Implements Devise's exact session semantics: `[key, salt]` payload with
 //! salt-based invalidation (password change → salt mismatch → session destroyed).
 //! Key naming matches Warden exactly for cross-framework compatibility.
@@ -14,6 +16,8 @@ use serde_json::Value;
 /// Bridges implement this for their session layer. Core defines the contract;
 /// bridge controls storage I/O. Malicious bridge could corrupt session data
 /// (T-03-02) - bridge MUST sign/encrypt cookies.
+///
+/// Mirrors the warden per-scope session surface devise reads and writes (`warden.session(scope)`), including the salt-checked fetch semantics.
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     /// Get a value by key
@@ -39,29 +43,45 @@ pub trait SessionStore: Send + Sync {
 }
 
 /// Session key naming constants - exact Warden compatibility
+///
+/// Session key naming mirroring devise's key families: `warden.user.{scope}.session` and `#{scope}_return_to`.
 pub mod keys {
     /// Prefix for all warden user keys
+    ///
+    /// The `warden.` prefix; mirrors the key prefix of devise's session key family.
     pub const SCOPE_KEY_PREFIX: &str = "warden.user.";
     /// Session key for a scope: `warden.user.{scope}.session`
+    ///
+    /// The `warden.user.{scope}.session` key; mirrors the slot devise's serializer reads.
     pub const SCOPE_SESSION_KEY: &str = "warden.user.{scope}.session";
     /// Stored location key: `{scope}_return_to`
+    ///
+    /// The `#{scope}_return_to` key; mirrors the slot of devise's `store_location_for` / `stored_location_for`.
     pub const STORED_LOCATION_KEY: &str = "{scope}_return_to";
     /// Remember token cookie key: `remember_{scope}_token`
+    ///
+    /// The `remember_#{scope}_token` cookie name; mirrors the name devise's rememberable controller reads and writes.
     pub const REMEMBER_TOKEN_KEY: &str = "remember_{scope}_token";
 
     /// Build scope session key
+    ///
+    /// Builds the `warden.user.{scope}.session` key; mirrors the slot devise's `serialize_into_session` payload lives under.
     #[must_use]
     pub fn scope_session_key(scope: &str) -> String {
         SCOPE_SESSION_KEY.replace("{scope}", scope)
     }
 
     /// Build stored location key
+    ///
+    /// Builds the `#{scope}_return_to` stored-location key, mirroring devise's stored-location slot name.
     #[must_use]
     pub fn stored_location_key(scope: &str) -> String {
         STORED_LOCATION_KEY.replace("{scope}", scope)
     }
 
     /// Build remember token key (overridable via `rememberable_options[:key]`)
+    ///
+    /// Builds the `remember_#{scope}_token` cookie name, mirroring devise's remember cookie naming.
     #[must_use]
     pub fn remember_token_key(scope: &str) -> String {
         REMEMBER_TOKEN_KEY.replace("{scope}", scope)
@@ -72,6 +92,8 @@ pub mod keys {
 ///
 /// Salt derives from `encrypted_password[0,29]` (bcrypt hash prefix).
 /// Password change → new bcrypt hash → salt mismatch → session invalidated.
+///
+/// Mirrors `Devise::Models::Authenticatable.serialize_into_session` / `serialize_from_session` (`devise/lib/devise/models/authenticatable.rb`): the `[key, salt]` payload with salt invalidation.
 pub mod serializer {
     use super::{AnyDeviseModel, DeviseKey, OrmAdapter, SessionStore, keys};
     use std::str::FromStr;
@@ -189,6 +211,8 @@ pub async fn expire_devise_keys(store: &dyn SessionStore, scope: &str) {
 /// Generate a unique remember token (Devise's `remember_token` loop)
 ///
 /// Loops until the token digest is unused in the database.
+///
+/// Mirrors the `remember_token` column minting loop: `Devise.friendly_token` until unused in the store.
 pub fn generate_remember_token<A>(_adapter: &A, _scope: &str, secret_key: &str) -> (String, String)
 where
     A: Send + Sync,
@@ -206,6 +230,8 @@ where
 ///
 /// Returns `remember_token` column if present, else `authenticatable_salt`.
 /// Raises if neither available (Devise behavior).
+///
+/// Session-side remember facet; mirrors the warden remember cookie read/write seam devise's rememberable strategy drives.
 pub trait Rememberable: Send + Sync {
     /// Get the value used for remember-me validation
     fn rememberable_value(&self) -> Option<String>;

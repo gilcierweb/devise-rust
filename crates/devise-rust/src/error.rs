@@ -11,6 +11,8 @@ use thiserror::Error;
 
 /// Core Devise error taxonomy - all error paths from strategies, hooks, and
 /// controller flows map to one of these variants.
+///
+/// Programmer-error taxonomy mirroring devise's raises: `Devise::Models::MissingAttribute` and the missing-mapping assert, each with an actionable message.
 #[derive(Debug, Error)]
 pub enum DeviseError {
     /// Configuration error (missing `secret_key`, invalid config combination)
@@ -67,12 +69,16 @@ pub struct ValidationErrors {
 
 impl ValidationErrors {
     /// Create empty validation errors
+    ///
+    /// Constructs the errors map; the `ActiveModel` `errors` object mirror.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Add an error key for a field
+    ///
+    /// Mirrors `ActiveModel` `errors.add(attr, :symbol)` with devise's symbolic keys.
     pub fn add(&mut self, field: &str, key: &str) {
         self.inner
             .entry(field.to_string())
@@ -81,24 +87,32 @@ impl ValidationErrors {
     }
 
     /// Get all error keys for a field
+    ///
+    /// Mirrors `ActiveModel` `errors[attr]` reads.
     #[must_use]
     pub fn get(&self, field: &str) -> Option<&Vec<String>> {
         self.inner.get(field)
     }
 
     /// Check if there are any errors
+    ///
+    /// Mirrors `ActiveModel` `errors.empty?`, the branch point of every devise controller flow.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
     /// Get all fields that have errors
+    ///
+    /// Mirrors `ActiveModel` `errors.attribute_names`.
     #[must_use]
     pub fn fields(&self) -> Vec<String> {
         self.inner.keys().cloned().collect()
     }
 
     /// Get full messages for I18n interpolation (field + key pairs)
+    ///
+    /// Mirrors `ActiveModel` `errors.full_messages` rendered through I18n.
     #[must_use]
     pub fn full_messages(&self) -> Vec<(String, String)> {
         self.inner
@@ -108,6 +122,8 @@ impl ValidationErrors {
     }
 
     /// Merge another `ValidationErrors` into this one
+    ///
+    /// Mirrors `ActiveModel` `errors.merge!`.
     pub fn merge(&mut self, other: ValidationErrors) {
         for (field, keys) in other.inner {
             self.inner.entry(field).or_default().extend(keys);
@@ -122,6 +138,8 @@ impl ValidationErrors {
 /// # Type Parameters
 ///
 /// - `M`: The model type implementing `BlankRecord`
+///
+/// Mirrors `find_or_initialize_with_errors`: an unsaved record carrying errors instead of raising (do not collapse this to an Option).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceWithErrors<M> {
     /// The record (may be newly instantiated via `BlankRecord::blank()`)
@@ -132,12 +150,16 @@ pub struct ResourceWithErrors<M> {
 
 impl<M> ResourceWithErrors<M> {
     /// Create a new `ResourceWithErrors`
+    ///
+    /// Wraps a record with its validation errors; mirrors the value devise's `find_or_initialize_with_errors` hands to controllers.
     #[must_use]
     pub fn new(record: M, errors: ValidationErrors) -> Self {
         Self { record, errors }
     }
 
     /// Check if the resource has no errors (can be persisted)
+    ///
+    /// Mirrors the `errors.empty?` check of the devise controller flows.
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.errors.is_empty()
@@ -150,6 +172,8 @@ impl<M> ResourceWithErrors<M> {
 ///
 /// Default implementation uses `Default::default()`; implement for types that
 /// need specific initialization (e.g., setting required fields).
+///
+/// Mirrors the unsaved record `find_or_initialize_with_errors` returns instead of raising.
 pub trait BlankRecord: Send + Sync + 'static {
     /// Create a blank instance
     fn blank() -> Self;
@@ -169,6 +193,8 @@ where
 ///
 /// These are excluded from `serializable_hash` and `Debug` implementations
 /// to prevent credential leakage in logs, error reports, and API responses.
+///
+/// Mirrors the devise constant of the same name (`devise/lib/devise/models/authenticatable.rb`): attributes never serialized or printed.
 pub const UNSAFE_ATTRIBUTES_FOR_SERIALIZATION: &[&str] = &[
     "encrypted_password",
     "reset_password_token",
@@ -192,6 +218,8 @@ pub const UNSAFE_ATTRIBUTES_FOR_SERIALIZATION: &[&str] = &[
 ];
 
 /// Check if an attribute name is in the UNSAFE list
+///
+/// Membership check mirroring devise's filter over `UNSAFE_ATTRIBUTES_FOR_SERIALIZATION` that keeps secrets out of logs and exceptions.
 #[must_use]
 pub fn is_unsafe_attribute(attr: &str) -> bool {
     UNSAFE_ATTRIBUTES_FOR_SERIALIZATION.contains(&attr)

@@ -32,7 +32,7 @@ impl<'r> Decode<'r, sqlx::Postgres> for HybridUuid {
     fn decode(
         value: PgValueRef<'r>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
-        uuid::Uuid::decode(value).map(HybridUuid)
+        <uuid::Uuid as Decode<'r, sqlx::Postgres>>::decode(value).map(HybridUuid)
     }
 }
 
@@ -42,7 +42,7 @@ impl<'r> Decode<'r, sqlx::Sqlite> for HybridUuid {
         value: SqliteValueRef<'r>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
         // Decode as TEXT and parse
-        let text: &str = Decode::decode(value)?;
+        let text: &str = <&str as Decode<sqlx::Sqlite>>::decode(value)?;
         Ok(HybridUuid(uuid::Uuid::parse_str(text)?))
     }
 }

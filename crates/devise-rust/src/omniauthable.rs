@@ -52,6 +52,7 @@
 //! == Examples
 //!
 //! ```ignore
+//! // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 //! use devise_rust::omniauthable::{OAuthProviderConfig, authorize_start, verify_state};
 //!
 //! let config = OAuthProviderConfig {
@@ -403,6 +404,7 @@ pub fn verify_state(stashed_state: Option<&str>, returned_state: Option<&str>) -
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// #[async_trait]
 /// impl Omniauthable for User {
 ///     type New = NewUser;
@@ -498,6 +500,7 @@ pub trait Omniauthable: Authenticatable {
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// let outcome: ResourceWithErrors<User> =
 ///     default_from_omniauth(&adapter, &profile, &clock).await;
 /// if outcome.is_valid() {

@@ -18,6 +18,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// Authentication strategy contract.
+///
+/// Mirrors `Warden::Strategies::Base` (`devise/lib/devise/strategies/base.rb`): the valid/store/fail vocabulary every devise strategy shares.
 #[async_trait]
 pub trait Strategy: Send + Sync {
     /// Whether this strategy applies to the request.
@@ -102,6 +104,8 @@ fn extract_param(request: &AuthRequest, scope: &str, key: &str) -> Option<String
 /// paranoid-wrapped when `config.paranoid` is set. The rememberable cookie
 /// key resolves from `config` (key override aware). `AuthProxy` consumes
 /// this so the order is defined once.
+///
+/// Mirrors devise's strategy dispatch order: the no-input rememberable strategy first, then params and HTTP Basic (the RMB-04 verdict).
 #[must_use]
 pub fn strategies_for(mapping: &Mapping, config: &DeviseConfig) -> Vec<Box<dyn Strategy>> {
     fn boxed<S: Strategy + 'static>(strategy: S, paranoid: bool) -> Box<dyn Strategy> {
@@ -234,6 +238,8 @@ impl Strategy for ParamsStrategy {
 ///
 /// Honors `http_authenticatable`, `http_authenticatable_on_xhr`, and
 /// `http_authentication_key` (falling back to the first authentication key).
+///
+/// Mirrors the HTTP Basic arm of `Devise::Strategies::DatabaseAuthenticatable` (`devise/lib/devise/strategies/database_authenticatable.rb`) with the 401 handshake.
 pub struct HttpBasicStrategy {
     /// Identity keys (default `["email"]`).
     pub authentication_keys: Vec<String>,
@@ -437,12 +443,16 @@ impl Strategy for RememberableStrategy {
 /// When `config.paranoid` is set, a `NotFound` from the inner strategy is
 /// converted to `InvalidCredentials` after hashing a dummy password, so the
 /// response timing and message reveal nothing about account existence.
+///
+/// Mirrors the paranoid timing mitigation of devise's `config.paranoid`: dummy bcrypt on unknown accounts with uniform messages (CONCERNS 2).
 pub struct ParanoidStrategy<S: Strategy> {
     inner: S,
 }
 
 impl<S: Strategy> ParanoidStrategy<S> {
     /// Wrap a strategy with paranoid handling.
+    ///
+    /// Constructs the paranoid wrapper around the inner strategy chain; mirrors devise's paranoid mode wrapping its strategies.
     #[must_use]
     pub fn new(inner: S) -> Self {
         Self { inner }
@@ -489,6 +499,8 @@ impl<S: Strategy + Send + Sync> Strategy for ParanoidStrategy<S> {
 }
 
 /// Credential map for tests and bridges: scope-keyed flat params.
+///
+/// Test accessor for the params arm; no devise counterpart to mirror (devise reads `params` directly in its strategies).
 #[must_use]
 pub fn test_params(scope: &str, pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs

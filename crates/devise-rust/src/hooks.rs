@@ -1,5 +1,7 @@
 //! Hooks - Warden-compatible hook registry and event dispatch
 //!
+//! Mirrors devise's warden hooks (`devise/lib/devise/hooks/*`): the same events, filters, and registration shape.
+//!
 //! Implements Devise's hook system: `after_set_user`, `after_authentication`,
 //! `before_logout`, `after_fetch`, `on_request` with Warden's `only`/`except`
 //! filtering semantics. Phase 3 delivers the registry and stub hooks; Phase 5
@@ -30,6 +32,8 @@ pub enum Event {
 
 impl Event {
     /// All events in Devise execution order
+    ///
+    /// Lists the hook events mirroring warden's callback vocabulary: `after_set_user` `and ``before_logout`` `(`devise/lib/devise/hooks/*`).
     #[must_use]
     pub fn all() -> Vec<Event> {
         vec![
@@ -43,6 +47,8 @@ impl Event {
 }
 
 /// Hook filter - matches Warden's `only`/`except`/`scope` semantics exactly
+///
+/// Mirrors warden callback filters: the `only`, `except`, and per-scope options devise's hook declarations carry.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct HookFilter {
     /// Scope to match (None = all scopes)
@@ -57,12 +63,16 @@ pub struct HookFilter {
 
 impl HookFilter {
     /// Create a new filter for all scopes and events
+    ///
+    /// Constructs the filter with devise's default (no restriction), mirroring a bare warden callback.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set scope filter
+    ///
+    /// The per-scope filter, mirroring `Warden::Manager.before_logout scope: :user`.
     #[must_use]
     pub fn scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = Some(scope.into());
@@ -70,6 +80,8 @@ impl HookFilter {
     }
 
     /// Set only filter (events that trigger)
+    ///
+    /// The `only` filter, mirroring warden's `only: [:fetch]`.
     #[must_use]
     pub fn only(mut self, events: Vec<Event>) -> Self {
         self.only = events;
@@ -77,6 +89,8 @@ impl HookFilter {
     }
 
     /// Set except filter (events that skip)
+    ///
+    /// The `except` filter, mirroring warden's `except: :fetch`.
     #[must_use]
     pub fn except(mut self, events: Vec<Event>) -> Self {
         self.except = events;
@@ -88,6 +102,8 @@ impl HookFilter {
     /// Warden logic (hooks.rb:53-63):
     /// - scope matches (or None)
     /// - event in `only` (if `only` non-empty) AND event not in `except`
+    ///
+    /// Mirrors warden's applicability decision: whether a callback runs for this request.
     #[must_use]
     pub fn matches(&self, ctx: &HookContext<'_>) -> bool {
         // Scope check
@@ -117,6 +133,8 @@ impl HookFilter {
 }
 
 /// Context passed to hook functions
+///
+/// Mirrors the payload warden hands hooks: request, session, and the record under `after_set_user`.
 pub struct HookContext<'a> {
     /// `AuthProxy` reference for session/user manipulation
     pub proxy: &'a mut dyn HookProxy,
@@ -131,6 +149,8 @@ pub struct HookContext<'a> {
 }
 
 /// Trait for hook functions - must be Send + Sync for dyn compatibility
+///
+/// The hook signature; the typed mirror of warden's callback blocks.
 pub type HookFn = dyn for<'a> Fn(
         &'a mut HookContext<'_>,
     ) -> std::pin::Pin<
@@ -145,6 +165,8 @@ struct HookEntry {
 }
 
 /// Proxy trait for hook context - abstracts `AuthProxy` for hook access
+///
+/// Bridge trait owning the framework side effects (cookie writes, session renewal, CSRF rotation) that mirror what devise performs on the warden proxy directly.
 #[async_trait]
 pub trait HookProxy: Send + Sync {
     /// Get the session store
@@ -205,12 +227,16 @@ pub use crate::failure::AnyDeviseModel;
 ///
 /// Thread-safe for concurrent request handling. Hooks are registered at startup
 /// and dispatched per-request via `run_hooks`.
+///
+/// Mirrors `Warden::Manager`'s callback storage: the registry devise's hooks register themselves into at load time.
 pub struct HookRegistry {
     hooks: Vec<HookEntry>,
 }
 
 impl HookRegistry {
     /// Create a new empty hook registry
+    ///
+    /// Constructs an empty registry; mirrors the pre-registration state of warden's manager.
     #[must_use]
     pub fn new() -> Self {
         Self { hooks: Vec::new() }
@@ -219,6 +245,8 @@ impl HookRegistry {
     /// Add a hook with filter and prepend/append ordering
     ///
     /// `prepend = true` inserts at front (runs first), `false` appends (runs last).
+    ///
+    /// Registers one hook with its filter; mirrors `Warden::Manager.before_logout do ... end`.
     pub fn add_hook(&mut self, filter: HookFilter, hook: Box<HookFn>, prepend: bool) {
         let entry = HookEntry { filter, hook };
         if prepend {
@@ -245,12 +273,16 @@ impl HookRegistry {
     }
 
     /// Get number of registered hooks
+    ///
+    /// Registry size, used by diagnostics; collection ergonomics over the warden-mirror registry.
     #[must_use]
     pub fn len(&self) -> usize {
         self.hooks.len()
     }
 
     /// Check if registry is empty
+    ///
+    /// Registry emptiness check; collection ergonomics over the warden-mirror registry.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.hooks.is_empty()
@@ -283,6 +315,8 @@ impl Debug for HookRegistry {
 /// 7. Timeoutable Tick (`timeoutable.rb`) - checks session timeout
 ///
 /// Only adds hooks for modules present in `mapping.modules`.
+///
+/// Mirrors `devise/lib/devise/hooks/*` exactly: registers activatable, `csrf_cleaner`, rememberable, forgetable, lockable, timeoutable, and trackable.
 pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope::Mapping) {
     use crate::scope::Module;
 
@@ -590,6 +624,8 @@ fn forgetable_hook() -> Box<HookFn> {
 }
 
 /// Bridge trait for session renewal (SESS-05)
+///
+/// Mirrors warden's session rotation on `after_set_user`, the session-fixation guard devise inherits from warden.
 #[async_trait]
 pub trait SessionRenewal: Send + Sync {
     /// Renew the session (rotate CSRF, extend expiry).
@@ -607,6 +643,8 @@ pub trait SessionRenewal: Send + Sync {
 }
 
 /// Bridge trait for CSRF token rotation (SESS-05)
+///
+/// Mirrors `Devise.clean_up_csrf_token_on_authentication`: rotating the CSRF token on sign in.
 #[async_trait]
 pub trait CsrfRotation: Send + Sync {
     /// Rotate the CSRF token held by the session store.
@@ -620,6 +658,8 @@ pub trait CsrfRotation: Send + Sync {
 }
 
 /// Bridge trait for remember-me cookie management (Phase 5)
+///
+/// Cookie side-effect bridge for the rememberable and forgetable hooks; mirrors the cookies devise writes inline, queued as ops for the framework transport.
 #[async_trait]
 pub trait RememberableBridge: Send + Sync {
     /// Set the remember-me cookie for `scope`.

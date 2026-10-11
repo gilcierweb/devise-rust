@@ -1,5 +1,7 @@
 //! Failure enum - Warden-compatible failure decision types
 //!
+//! Mirrors `Devise::FailureApp` (`devise/lib/devise/failure_app.rb`): the redirect, flash, stored-location, and 401 decisions.
+//!
 //! These are the failure modes that strategies and hooks can return to halt
 //! the authentication chain. The decision logic (navigational vs API vs HTTP Basic
 //! vs Recall) is added in Plan 04; this file defines the enum variants only.
@@ -10,6 +12,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Type alias for authentication rules closure
+///
+/// Request-shape inputs to the failure decision; mirrors the Rack env data devise's failure app reads.
 pub type AuthRules = dyn Fn(&dyn AnyDeviseModel) -> bool + Send + Sync;
 
 /// Failure decision variants - mirrors Devise's `throw :warden` message types
@@ -85,24 +89,32 @@ pub enum Failure {
 
 impl Failure {
     /// Check if this failure is a navigational redirect
+    ///
+    /// Mirrors `navigational_format?` in `Devise::FailureApp` (`devise/lib/devise/failure_app.rb`): the redirect-plus-flash branch.
     #[must_use]
     pub fn is_navigational(&self) -> bool {
         matches!(self, Failure::NavigationalRedirect { .. })
     }
 
     /// Check if this failure is an API unauthorized response
+    ///
+    /// Mirrors the 401 branch of the failure app for API requests.
     #[must_use]
     pub fn is_api_unauthorized(&self) -> bool {
         matches!(self, Failure::ApiUnauthorized { .. })
     }
 
     /// Check if this failure is a recall
+    ///
+    /// Mirrors the failure app's `recall`: replaying the stored location instead of redirecting to sign in.
     #[must_use]
     pub fn is_recall(&self) -> bool {
         matches!(self, Failure::Recall { .. })
     }
 
     /// Get the flash key for navigational failures
+    ///
+    /// Maps a failure to the `devise.failure.*` flash key family, mirroring the I18n lookup devise's failure app renders.
     #[must_use]
     pub fn flash_key(&self) -> Option<&'static str> {
         match self {
@@ -112,6 +124,8 @@ impl Failure {
     }
 
     /// Get the stored location for navigational failures
+    ///
+    /// Mirrors `stored_location!` in the failure app: recalling the `#{scope}_return_to` value.
     #[must_use]
     pub fn stored_location(&self) -> Option<&str> {
         match self {
@@ -123,6 +137,8 @@ impl Failure {
     }
 
     /// Get the HTTP status code for this failure
+    ///
+    /// The 401 status arm, mirroring the failure app's API response.
     #[must_use]
     pub fn status_code(&self) -> u16 {
         match self {
@@ -133,6 +149,8 @@ impl Failure {
     }
 
     /// Get the WWW-Authenticate header value if present
+    ///
+    /// Builds the `WWW-Authenticate` header with `http_authentication_realm`, mirroring the failure app's HTTP Basic challenge.
     #[must_use]
     pub fn www_authenticate(&self) -> Option<&str> {
         match self {
@@ -145,6 +163,8 @@ impl Failure {
 }
 
 /// Result of a successful strategy authentication
+///
+/// Mirrors warden's strategy outcome vocabulary: success, fail, and the redirect carry-over devise's `throw :warden` produces.
 #[derive(Debug)]
 pub enum AuthOutcome {
     /// Authentication succeeded with a user record
@@ -176,6 +196,8 @@ pub enum AuthOutcome {
 
 /// Trait for type-erased Devise models - allows storing heterogeneous models
 /// in `AuthProxy`'s user map while preserving downcast capability.
+///
+/// Object-safe model facet mirroring the duck-typed record warden's proxy requires.
 pub trait AnyDeviseModel: Send + Sync + 'static {
     /// Get the model's primary key
     fn to_key(&self) -> DeviseKey;
@@ -308,9 +330,13 @@ impl std::fmt::Debug for dyn AnyDeviseModel {
 }
 
 /// Bridges must NOT route application 401s through Devise failure handling.
+///
+/// Mirrors `Devise.http_authenticatable_on_xhr` and the 401 interception decision in the failure app.
 pub const INTERCEPT_401: bool = false;
 
 /// Why authentication failed - maps to `devise.failure.*` I18n keys.
+///
+/// Mirrors the `throw :warden` payload: the message key and scope the failure app receives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureReason {
     /// No session or credentials presented.
@@ -329,6 +355,8 @@ pub enum FailureReason {
 
 impl FailureReason {
     /// I18n key under `devise.failure.*`.
+    ///
+    /// Mirrors the failure app's flash mapping: failure reason to devise key (`devise.failure.locked`, `devise.failure.timeout`, ...).
     #[must_use]
     pub fn flash_key(self) -> &'static str {
         match self {
@@ -345,6 +373,8 @@ impl FailureReason {
 /// Check the request format against configured navigational formats.
 ///
 /// Delegates to [`AuthRequest::is_navigational_format`](crate::request::AuthRequest::is_navigational_format).
+///
+/// Mirrors `Devise.navigational_formats` matching in the failure app.
 #[must_use]
 pub fn is_navigational_format(
     request: &crate::request::AuthRequest,
@@ -354,6 +384,8 @@ pub fn is_navigational_format(
 }
 
 /// Whether the request uses HTTP Basic auth that Devise should answer.
+///
+/// Detects the HTTP Basic request arm, mirroring the env check in `Devise::Strategies::Authenticatable`.
 #[must_use]
 pub fn http_auth(
     request: &crate::request::AuthRequest,
@@ -403,6 +435,8 @@ pub fn build_failure(
 }
 
 /// Session key holding the post-sign-in redirect target.
+///
+/// Builds the `#{scope}_return_to` key, mirroring the stored-location slot the failure app reads for redirects.
 #[must_use]
 pub fn stored_location_key(scope: &str) -> String {
     format!("{scope}_return_to")
@@ -450,6 +484,8 @@ pub async fn stored_location_for(
 ///
 /// Core decides the `Failure`; bridges render it. Core never constructs
 /// HTTP responses.
+///
+/// Mirrors `Devise::FailureApp`: redirect plus flash for navigational formats, 401 plus `WWW-Authenticate` otherwise.
 pub trait FailureRenderer: Send + Sync {
     /// The framework response type (opaque to core).
     type Response;

@@ -22,6 +22,7 @@
 //! == Examples
 //!
 //! ```ignore
+//! // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 //! user.update_tracked_fields(clock.now(), "127.0.0.1");
 //! assert_eq!(user.sign_in_count(), 1);
 //! user.update_tracked_fields_bang(Some("127.0.0.1"), &adapter, &clock).await?;
@@ -35,14 +36,24 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
 /// `sign_in_count` column.
+///
+/// Mirrors the `sign_in_count` trackable column.
 pub const SIGN_IN_COUNT_COLUMN: &str = "sign_in_count";
 /// `current_sign_in_at` column.
+///
+/// Mirrors the `current_sign_in_at` trackable column.
 pub const CURRENT_SIGN_IN_AT_COLUMN: &str = "current_sign_in_at";
 /// `last_sign_in_at` column.
+///
+/// Mirrors the `last_sign_in_at` trackable column.
 pub const LAST_SIGN_IN_AT_COLUMN: &str = "last_sign_in_at";
 /// `current_sign_in_ip` column.
+///
+/// Mirrors the `current_sign_in_ip` trackable column.
 pub const CURRENT_SIGN_IN_IP_COLUMN: &str = "current_sign_in_ip";
 /// `last_sign_in_ip` column.
+///
+/// Mirrors the `last_sign_in_ip` trackable column.
 pub const LAST_SIGN_IN_IP_COLUMN: &str = "last_sign_in_ip";
 
 /// Required model fields for Trackable, mirroring Devise's
@@ -86,11 +97,14 @@ pub fn required_fields() -> Vec<&'static str> {
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// impl Trackable for User {
 ///     fn sign_in_count(&self) -> u64 { self.sign_in_count }
 ///     // ... column accessors ...
 /// }
 /// ```
+///
+/// Mirrors `Devise::Models::Trackable` (`devise/lib/devise/models/trackable.rb`) as the trait surface: `update_tracked_fields` field shifting and the persisting variant.
 #[async_trait]
 pub trait Trackable: Authenticatable {
     /// Stored `sign_in_count` column.

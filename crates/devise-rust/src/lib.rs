@@ -5,6 +5,10 @@
 //! names, config options, I18n message keys, and route/action surface - adapted
 //! to idiomatic, DRY, high-quality Rust.
 //!
+//! Every public item carries a rustdoc parity note naming the devise method,
+//! option, or concept it mirrors; each module header cites the devise source
+//! file it ports.
+//!
 //! # Crate Structure
 //!
 //! - `config` - `DeviseConfig` with all Devise options and per-scope overrides

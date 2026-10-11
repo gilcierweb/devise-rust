@@ -18,6 +18,7 @@
 //! == Examples
 //!
 //! ```ignore
+//! // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 //! let raw = user.ensure_confirmation_token(&adapter, &config, &clock).await?;
 //! let outcome = TestUser::confirm_by_token(Some(&raw), &adapter, &config, &clock, &|_| ValidationErrors::new()).await?;
 //! assert!(outcome.is_valid());
@@ -35,6 +36,8 @@ use std::collections::HashMap;
 /// Column bound into the HMAC key for confirmation tokens.
 ///
 /// Matches Devise's `TokenGenerator` key context `"Devise #{column}"`.
+///
+/// Mirrors Devise's `TokenGenerator` key context for the `confirmation_token` column: the literal string "Devise {column}".
 pub const CONFIRMATION_TOKEN_COLUMN: &str = "confirmation_token";
 
 /// Required model fields for Confirmable, mirroring Devise's
@@ -47,7 +50,9 @@ pub const CONFIRMATION_TOKEN_COLUMN: &str = "confirmation_token";
 ///
 /// == Examples
 ///
-/// ```ignore
+/// ```
+/// use devise_rust::confirmable::required_fields;
+///
 /// assert_eq!(required_fields(false), vec!["confirmation_token", "confirmed_at", "confirmation_sent_at"]);
 /// ```
 #[must_use]
@@ -70,6 +75,8 @@ pub fn required_fields(reconfirmable: bool) -> Vec<&'static str> {
 /// assert_eq!(humanize_period(chrono::TimeDelta::days(3)), "3 days");
 /// assert_eq!(humanize_period(chrono::TimeDelta::hours(1)), "1 hour");
 /// ```
+///
+/// Mirrors `Devise::TimeInflector.time_ago_in_words` as used by the `confirmation_period_expired` message interpolation.
 #[must_use]
 pub fn humanize_period(delta: TimeDelta) -> String {
     let secs = delta.num_seconds();
@@ -116,11 +123,14 @@ const SECONDS_PER_MINUTE: i64 = 60;
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// impl Confirmable for User {
 ///     fn confirmation_token(&self) -> Option<&str> { self.confirmation_token.as_deref() }
 ///     // ... column accessors ...
 /// }
 /// ```
+///
+/// Mirrors `Devise::Models::Confirmable` (`devise/lib/devise/models/confirmable.rb`) as the trait surface: token generation, confirm, `confirm_by_token`, reconfirmable postponement, and resend reuse.
 #[async_trait]
 pub trait Confirmable: Authenticatable + HasEmail {
     /// Stored `confirmation_token` column, always the HMAC digest, never raw.
@@ -824,6 +834,8 @@ pub trait Confirmable: Authenticatable + HasEmail {
 /// assert!(confirmation_period_valid_with_allow(None, None, &clock));
 /// assert!(!confirmation_period_valid_with_allow(None, Some(chrono::TimeDelta::zero()), &clock));
 /// ```
+///
+/// Mirrors `confirmation_period_valid?` with the `allow_unconfirmed_access_for` window passed explicitly (nil means unconfirmed access is never allowed past the grace window).
 #[must_use]
 pub fn confirmation_period_valid_with_allow(
     sent_at: Option<DateTime<Utc>>,

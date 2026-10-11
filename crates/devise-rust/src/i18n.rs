@@ -1,5 +1,7 @@
 //! I18n catalog - Devise message keys via `rust-i18n` (compile-time YAML codegen)
 //!
+//! Mirrors devise's I18n catalog (`devise/config/locales/en.yml`): message keys, placeholders, and copy are identical.
+//!
 //! Translations live in `crates/devise-rust/locales/en.yml` - the vendored Devise
 //! catalog adapted to rust-i18n `_version: 1` layout (filename = locale, no
 //! top-level `en:` wrapper). Message keys, `%{placeholder}` interpolation, and
@@ -28,6 +30,8 @@ pub use rust_i18n::t;
 ///
 /// Missing keys return the key itself (rust-i18n behavior), matching how Devise
 /// surfaces `translation missing: ...` for absent keys while staying lossless.
+///
+/// Mirrors `I18n.t` scoped lookup: the `devise.*` key chain with interpolation values like `%{period}` and `%{count}`.
 #[must_use]
 pub fn translate(key: &str, interpolations: &[(&str, &str)]) -> String {
     let mut result = t!(key).to_string();
@@ -38,6 +42,8 @@ pub fn translate(key: &str, interpolations: &[(&str, &str)]) -> String {
 }
 
 /// Translate a Devise I18n key without interpolation.
+///
+/// Flat-key lookup over the embedded catalog; the storage mirror of devise's locale YAML.
 #[must_use]
 pub fn translate_simple(key: &str) -> String {
     t!(key).to_string()

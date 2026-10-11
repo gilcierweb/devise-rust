@@ -24,6 +24,8 @@ use uuid::Uuid;
 /// never a record field value (email, token) nor a connection URL. The diesel
 /// backend's error mapper (plan 02-03) is specified against this contract and
 /// its tests assert value-absence.
+///
+/// Error taxonomy for the adapter seam; mirrors the failure modes devise surfaces through `orm_adapter`, reported as typed variants instead of driver exceptions.
 #[derive(Debug, Error)]
 pub enum OrmError {
     /// No record matched (`get_strict` / `find_first_strict`).
@@ -84,6 +86,8 @@ impl std::fmt::Display for OrmError {
 }
 
 /// Key type for session serialization - supports both i64 and UUID
+///
+/// The typed primary key crossing the adapter seam; mirrors the key devise passes to `to_adapter.get` and `to_adapter.find_first`, integer and UUID alike.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DeviseKey {
@@ -93,18 +97,24 @@ pub enum DeviseKey {
 
 impl DeviseKey {
     /// Create from i64
+    ///
+    /// Mirrors the integer ids devise passes to `to_adapter.get`; builds the integer arm of the adapter key seam.
     #[must_use]
     pub fn from_i64(id: i64) -> Self {
         DeviseKey::Integer(id)
     }
 
     /// Create from UUID
+    ///
+    /// Mirrors the UUID ids devise passes to `to_adapter.get`; builds the UUID arm of the adapter key seam.
     #[must_use]
     pub fn from_uuid(id: Uuid) -> Self {
         DeviseKey::Uuid(id)
     }
 
     /// Try to get as i64
+    ///
+    /// Reads the integer arm; the typed mirror of Ruby's duck-typed ids.
     #[must_use]
     pub fn as_i64(&self) -> Option<i64> {
         match self {
@@ -114,6 +124,8 @@ impl DeviseKey {
     }
 
     /// Try to get as UUID
+    ///
+    /// Reads the UUID arm; the typed mirror of Ruby's duck-typed ids.
     #[must_use]
     pub fn as_uuid(&self) -> Option<Uuid> {
         match self {
@@ -133,6 +145,8 @@ impl std::fmt::Display for DeviseKey {
 }
 
 /// Error parsing a [`DeviseKey`] from its session string form.
+///
+/// Parse failure mirroring the malformed-id raise devise's adapter calls would produce; reported as a typed error instead.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("invalid devise session key: {0}")]
 pub struct ParseDeviseKeyError(String);
@@ -153,6 +167,8 @@ impl std::str::FromStr for DeviseKey {
 }
 
 /// JSON value wrapper for conditions
+///
+/// The neutral value set crossing the adapter seam; mirrors the `ActiveModel` attribute values devise passes into `find_first` conditions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
@@ -197,6 +213,8 @@ impl From<i32> for Value {
 }
 
 /// Type-safe container for query conditions
+///
+/// Mirrors the conditions hash devise passes to `to_adapter.find_first` (authentication keys and token lookups).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Conditions {
     inner: HashMap<String, Value>,
@@ -204,12 +222,16 @@ pub struct Conditions {
 
 impl Conditions {
     /// Create empty conditions
+    ///
+    /// Constructs the conditions map mirroring the Ruby hash devise builds for `to_adapter.find_first`.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Insert a key-value pair
+    ///
+    /// Inserts one condition, mirroring the Ruby hash inserts devise's finders perform.
     pub fn insert<K, V>(&mut self, key: K, value: V) -> &mut Self
     where
         K: Into<String>,
@@ -220,6 +242,8 @@ impl Conditions {
     }
 
     /// Get a typed value
+    ///
+    /// Reads one condition value, mirroring the Ruby hash lookup devise's finders perform.
     #[must_use]
     pub fn get<T>(&self, key: &str) -> Option<T>
     where
@@ -233,23 +257,31 @@ impl Conditions {
     }
 
     /// Check if key exists
+    ///
+    /// Membership check mirroring the `hash.key?` probes devise's token uniqueness loop performs.
     #[must_use]
     pub fn contains_key(&self, key: &str) -> bool {
         self.inner.contains_key(key)
     }
 
     /// Get raw value
+    ///
+    /// Raw value access for adapter internals; the typed mirror of Ruby's duck-typed condition values.
     #[must_use]
     pub fn get_raw(&self, key: &str) -> Option<&Value> {
         self.inner.get(key)
     }
 
     /// Iterate over conditions
+    ///
+    /// Iteration over the conditions, mirroring Ruby hash iteration.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.inner.iter()
     }
 
     /// Convert to `HashMap` for SQL generation
+    ///
+    /// Conversion for backends consuming plain maps; mirrors the hash handoff between devise's finders and `orm_adapter`.
     #[must_use]
     pub fn to_hashmap(&self) -> &HashMap<String, Value> {
         &self.inner
@@ -280,6 +312,8 @@ impl std::fmt::Display for Conditions {
 }
 
 /// Snapshot of record state for change tracking
+///
+/// Mirrors `ActiveRecord` dirty tracking: the changes hash devise's callbacks read, with explicit previous and current values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeSet {
     /// Previous values before change
@@ -290,30 +324,40 @@ pub struct ChangeSet {
 
 impl ChangeSet {
     /// Create a new change set from previous and current state
+    ///
+    /// `ChangeSet` `constructor mirroring the start of an ``ActiveRecord`` `dirty set.
     #[must_use]
     pub fn new(previous: HashMap<String, Value>, current: HashMap<String, Value>) -> Self {
         Self { previous, current }
     }
 
     /// Check if a field has changed
+    ///
+    /// Mirrors `ActiveRecord`'s `changed?` per attribute.
     #[must_use]
     pub fn has_changed(&self, field: &str) -> bool {
         self.previous.get(field) != self.current.get(field)
     }
 
     /// Get previous value of a field
+    ///
+    /// Mirrors `ActiveRecord`'s `attribute_was` read.
     #[must_use]
     pub fn previous_value(&self, field: &str) -> Option<&Value> {
         self.previous.get(field)
     }
 
     /// Get current value of a field
+    ///
+    /// Mirrors `ActiveRecord`'s current attribute read.
     #[must_use]
     pub fn current_value(&self, field: &str) -> Option<&Value> {
         self.current.get(field)
     }
 
     /// Get all changed fields
+    ///
+    /// Mirrors `ActiveRecord`'s `changed` key list.
     #[must_use]
     pub fn changed_fields(&self) -> Vec<String> {
         self.current
@@ -327,6 +371,8 @@ impl ChangeSet {
 /// The only columns [`OrmAdapter::increment_counter`] accepts (D-11):
 /// Devise's two counters - lockable's `failed_attempts` and trackable's
 /// `sign_in_count`.
+///
+/// Allowlist backing the `increment_counter` verb; mirrors devise's counter columns (`failed_attempts`, `sign_in_count`).
 pub const COUNTER_COLUMNS: &[&str] = &["failed_attempts", "sign_in_count"];
 
 /// Validates a counter column name against [`COUNTER_COLUMNS`] before any
@@ -338,6 +384,8 @@ pub const COUNTER_COLUMNS: &[&str] = &["failed_attempts", "sign_in_count"];
 /// Returns [`OrmError::Query`] naming `column` when it is not one of
 /// [`COUNTER_COLUMNS`] - the same clear-contract shape as an out-of-set
 /// finder column.
+///
+/// Single rejection point for counter writes on unknown columns so every backend errors identically before SQL exists; mirrors devise's column knowledge coming from migrations.
 pub fn validate_counter_column(column: &str) -> Result<(), OrmError> {
     if COUNTER_COLUMNS.contains(&column) {
         Ok(())
@@ -621,6 +669,8 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
 
 /// In-memory adapter for testing - the behavioral oracle later backends are
 /// checked against.
+///
+/// In-memory oracle backend for tests; mirrors the `orm_adapter` contract exactly where devise's test suite stubs the ORM.
 pub mod memory {
     use super::{
         ChangeSet, Conditions, DeviseKey, HashMap, OrmAdapter, OrmError, Value, async_trait,
@@ -630,6 +680,7 @@ pub mod memory {
     use serde::de::DeserializeOwned;
     use std::sync::{Arc, RwLock};
 
+    /// In-memory `OrmAdapter` oracle used as the shared-suite reference; mirrors devise's `orm_adapter` surface with no database.
     #[derive(Debug, Clone)]
     pub struct MemoryAdapter<M> {
         storage: Arc<RwLock<HashMap<DeviseKey, M>>>,
@@ -643,6 +694,7 @@ pub mod memory {
     }
 
     impl<M> MemoryAdapter<M> {
+        /// Constructs the in-memory oracle store mirroring the empty table state devise's tests start from.
         #[must_use]
         pub fn new() -> Self {
             Self {

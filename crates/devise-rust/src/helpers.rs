@@ -13,6 +13,8 @@ use crate::request::AuthRequest;
 use crate::scope::Mapping;
 
 /// Options for [`authenticate`] and [`authenticate_strict`].
+///
+/// Options of the `authenticate_<scope>!` helper: force, scope, and message, mirroring the arguments of `Devise::Controllers::Helpers#authenticate_user!`.
 #[derive(Debug, Clone, Default)]
 pub struct AuthenticateOpts {
     /// Force authentication even when the same user is memoized.
@@ -48,12 +50,16 @@ pub async fn authenticate_strict<'a>(
 }
 
 /// Whether `scope` is signed in.
+///
+/// Mirrors `signed_in?(scope)` from `Devise::Controllers::SignInOut`.
 #[must_use]
 pub fn signed_in(scope: &str, proxy: &AuthProxy) -> bool {
     proxy.authenticated(scope)
 }
 
 /// Typed current user for `scope`, if present.
+///
+/// Mirrors the memoized `current_<scope>` helper `Devise::Controllers::Helpers` generates per mapping.
 #[must_use]
 pub fn current_user<'a, M: 'static>(scope: &str, proxy: &'a AuthProxy) -> Option<&'a M> {
     proxy.user::<M>(scope)
@@ -68,6 +74,8 @@ pub async fn session_data(scope: &str, proxy: &AuthProxy) -> Option<serde_json::
 }
 
 /// Scope root path, falling back to `/` for unmapped scopes.
+///
+/// Mirrors `signed_in_root_path`: where a signed-in request lands instead of the sign-in page.
 #[must_use]
 pub fn signed_in_root_path(scope: &str, proxy: &AuthProxy) -> String {
     proxy
@@ -89,6 +97,8 @@ pub async fn after_sign_in_path_for(
 }
 
 /// Post-sign-out path: scope root, else `/`.
+///
+/// Mirrors `after_sign_out_path_for(scope)` from `Devise::Controllers::Helpers`.
 #[must_use]
 pub fn after_sign_out_path_for(scope: &str, proxy: &AuthProxy) -> String {
     signed_in_root_path(scope, proxy)
@@ -134,6 +144,8 @@ pub struct Group {
 
 impl Group {
     /// Create a group from a name and scope list.
+    ///
+    /// Constructs a group, mirroring `devise_group`'s scope list.
     #[must_use]
     pub fn new(name: impl Into<String>, scopes: Vec<String>) -> Self {
         Self {
@@ -160,6 +172,8 @@ pub async fn authenticate_group(
 }
 
 /// Whether any group scope is signed in.
+///
+/// Mirrors the group helpers `devise_group` generates (`blogger_signed_in?`).
 #[must_use]
 pub fn group_signed_in(group: &Group, proxy: &AuthProxy) -> bool {
     group.scopes.iter().any(|scope| signed_in(scope, proxy))
@@ -169,6 +183,8 @@ pub fn group_signed_in(group: &Group, proxy: &AuthProxy) -> bool {
 ///
 /// Bridges implement `proxy`/`proxy_mut` against their request extensions;
 /// every helper above is then available as a provided method.
+///
+/// Mirrors the per-scope helper surface `Devise::Controllers::Helpers` generates for every mapping, as an extension trait on framework request contexts.
 pub trait DeviseHelpersExt {
     /// Access the request's `AuthProxy`.
     fn proxy(&self) -> &AuthProxy;
@@ -204,12 +220,16 @@ macro_rules! devise_helpers {
             }
 
             /// Whether `scope` is signed in.
+            ///
+            /// Arbitrary-scope `signed_in?` helper, mirroring the generated `<scope>_signed_in?` for any registered scope.
             #[must_use]
             pub fn scope_signed_in(&self) -> bool {
                 $crate::helpers::DeviseHelpersExt::scope_signed_in(self, $scope)
             }
 
             /// Typed current user for `scope`, if present.
+            ///
+            /// Arbitrary-scope `current_<scope>` helper, mirroring the generated memoized current user accessor.
             #[must_use]
             pub fn current_scoped_user(&self) -> Option<&$model> {
                 $crate::helpers::current_user::<$model>($scope, self.proxy())

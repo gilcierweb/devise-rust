@@ -24,6 +24,7 @@
 //! == Examples
 //!
 //! ```ignore
+//! // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 //! // Two failures then the locking failure (maximum_attempts = 3).
 //! user.increment_failed_attempts(&adapter).await?;
 //! user.increment_failed_attempts(&adapter).await?;
@@ -44,6 +45,8 @@ use std::collections::HashMap;
 /// Column bound into the HMAC key for unlock tokens.
 ///
 /// Matches Devise's `TokenGenerator` key context `"Devise #{column}"`.
+///
+/// Mirrors Devise's `TokenGenerator` key context for the `unlock_token` column: the literal string "Devise {column}".
 pub const UNLOCK_TOKEN_COLUMN: &str = "unlock_token";
 
 /// Strategies enabled when `unlock_strategy` is `both`.
@@ -61,6 +64,7 @@ pub const BOTH_STRATEGIES: [&str; 2] = ["time", "email"];
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// assert_eq!(required_fields(&config), vec!["failed_attempts", "locked_at", "unlock_token"]);
 /// ```
 #[must_use]
@@ -86,6 +90,7 @@ pub fn required_fields(config: &DeviseConfig) -> Vec<&'static str> {
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// assert!(lock_strategy_enabled_for("failed_attempts", &config));
 /// ```
 #[must_use]
@@ -101,6 +106,7 @@ pub fn lock_strategy_enabled_for(strategy: &str, config: &DeviseConfig) -> bool 
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// assert!(unlock_strategy_enabled_for("time", &config));
 /// ```
 #[must_use]
@@ -114,6 +120,8 @@ pub fn unlock_strategy_enabled_for(strategy: &str, config: &DeviseConfig) -> boo
 ///
 /// The three variants are the patch-plus-outcome contract of Devise's
 /// `valid_for_authentication?`: success, counted failure, or lock.
+///
+/// Outcome taxonomy of the lockable arm of `valid_for_authentication?`; mirrors devise's increment, lock, and unlock decision set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockAttemptOutcome {
     /// The base check passed and the record is unlocked: proceed to sign in.
@@ -143,11 +151,14 @@ pub enum LockAttemptOutcome {
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// impl Lockable for User {
 ///     fn failed_attempts(&self) -> u32 { self.failed_attempts }
 ///     // ... column accessors ...
 /// }
 /// ```
+///
+/// Mirrors `Devise::Models::Lockable` (`devise/lib/devise/models/lockable.rb`) as the trait surface: attempt counting, `lock_access`,` ``unlock_access``,` and the unlock strategies.
 #[async_trait]
 pub trait Lockable: Authenticatable + HasEmail {
     /// Stored `failed_attempts` counter column.
@@ -682,6 +693,7 @@ pub trait Lockable: Authenticatable + HasEmail {
     /// == Examples
     ///
     /// ```ignore
+    /// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
     /// match user.apply_failed_attempt(false, &adapter, &mailer, &config, &clock).await? {
     ///     LockAttemptOutcome::Locked => { /* reject as locked */ }
     ///     LockAttemptOutcome::FailedIncremented => { /* reject as invalid */ }

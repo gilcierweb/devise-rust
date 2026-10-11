@@ -29,6 +29,7 @@
 //! == Examples
 //!
 //! ```ignore
+//! // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 //! user.remember_me(&adapter, &clock).await?;
 //! let (key, value, generated_at) = user.serialize_into_cookie(&clock)?;
 //! let encoded = devise_rust::rememberable::encode_cookie_value(&key, &value, &generated_at);
@@ -46,12 +47,18 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 /// Column holding the raw remember token on models that carry one.
+///
+/// Mirrors the optional `remember_token` column, which Devise keeps unhashed unlike confirmation and unlock tokens.
 pub const REMEMBER_TOKEN_COLUMN: &str = "remember_token";
 
 /// Column holding the remember creation timestamp (required field).
+///
+/// Mirrors the required `remember_created_at` column.
 pub const REMEMBER_CREATED_AT_COLUMN: &str = "remember_created_at";
 
 /// Virtual sign-in flag name (`remember_me` form param and accessor).
+///
+/// Mirrors the virtual `remember_me` accessor the sign-in form posts (`attr_accessor :remember_me`).
 pub const REMEMBER_ME_FLAG: &str = "remember_me";
 
 /// Required model fields for Rememberable, mirroring Devise's
@@ -91,6 +98,8 @@ impl std::fmt::Display for MissingRememberableValue {
 impl std::error::Error for MissingRememberableValue {}
 
 /// `SameSite` attribute for the remember cookie (D-16 defaults to `Lax`).
+///
+/// Cookie attribute vocabulary for the remember cookie; mirrors devise's Rails cookie options, hardened per D-16.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SameSite {
     /// Strict first-party-only cookies.
@@ -111,6 +120,8 @@ impl SameSite {
     ///
     /// assert_eq!(SameSite::Lax.header_value(), "Lax");
     /// ```
+    ///
+    /// Renders the `SameSite` attribute value; part of the `rememberable_options` surface mirroring devise's cookie option pass-through.
     #[must_use]
     pub fn header_value(self) -> &'static str {
         match self {
@@ -134,6 +145,8 @@ impl std::fmt::Display for SameSite {
 /// disables `Secure` alone: set `rememberable_options["secure"]` to
 /// `"false"` (also accepted: `"0"`, `"no"`, `"off"`). Everything else stays
 /// hardened, and the default without the flag is secure.
+///
+/// Mirrors devise's Rails cookie defaults for the remember cookie, hardened per D-16: `HttpOnly`, `SameSite=Lax`, `Secure` with the documented plain-HTTP development opt-out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RememberableCookieAttrs {
     /// Cookie name: `rememberable_options["key"]` else `remember_{scope}_token`.
@@ -158,9 +171,12 @@ impl RememberableCookieAttrs {
     /// == Examples
     ///
     /// ```ignore
+    /// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
     /// let attrs = RememberableCookieAttrs::for_scope("user", &config, &clock);
     /// assert!(attrs.httponly && attrs.secure);
     /// ```
+    ///
+    /// Resolves `rememberable_options` for one scope; mirrors the per-model option cascade devise reads through `Devise::Models.config`.
     #[must_use]
     pub fn for_scope(scope: &str, config: &DeviseConfig, clock: &dyn Clock) -> Self {
         Self {
@@ -193,6 +209,8 @@ impl RememberableCookieAttrs {
     /// assert!(header.starts_with("remember_user_token=v;"));
     /// assert!(header.contains("; HttpOnly; Secure; SameSite=Lax"));
     /// ```
+    ///
+    /// Renders the remember cookie as a `Set-Cookie` header value; the transport mirroring how devise's controllers set the `serialize_into_cookie` triple.
     #[must_use]
     pub fn to_set_cookie_header(&self, cookie_value: &str) -> String {
         let mut parts = vec![
@@ -232,6 +250,8 @@ impl RememberableCookieAttrs {
 ///
 /// assert_eq!(remember_cookie_key("user", &DeviseConfig::default()), "remember_user_token");
 /// ```
+///
+/// Mirrors the `remember_#{scope}_token` cookie name with the `rememberable_options[:key]` override (`devise/lib/devise/controllers/rememberable.rb`).
 #[must_use]
 pub fn remember_cookie_key(scope: &str, config: &DeviseConfig) -> String {
     config
@@ -250,6 +270,8 @@ pub fn remember_cookie_key(scope: &str, config: &DeviseConfig) -> String {
 /// True unless `rememberable_options["secure"]` carries a falsy value
 /// (`"false"`, `"0"`, `"no"`, `"off"`, case-insensitive). Any other value,
 /// including absence, keeps `Secure`.
+///
+/// Resolves the `Secure` attribute from `rememberable_options`; mirrors devise's cookie option read, hardened per D-16.
 #[must_use]
 pub fn cookie_secure_flag(config: &DeviseConfig) -> bool {
     !matches!(
@@ -278,6 +300,8 @@ pub fn cookie_secure_flag(config: &DeviseConfig) -> bool {
 /// assert!(!is_true_value("yes"));
 /// assert!(!is_true_value(""));
 /// ```
+///
+/// `TRUE_VALUES` parsing for `rememberable_options` booleans; mirrors devise's `ActiveSupport` type coercion in `Controllers::Rememberable`.
 #[must_use]
 pub fn is_true_value(value: &str) -> bool {
     matches!(value, "1" | "on" | "ON" | "t" | "T" | "true" | "TRUE")
@@ -320,6 +344,8 @@ pub fn remember_flag_set(request: &AuthRequest, scope: &str) -> bool {
 /// assert!(parse_generated_at("2013").is_some());
 /// assert!(parse_generated_at("not-a-time").is_none());
 /// ```
+///
+/// Strict integer-epoch parse of the cookie timestamp; mirrors devise's `time_from_json` read, resolving its TODO by failing closed on malformed values.
 #[must_use]
 pub fn parse_generated_at(raw: &str) -> Option<DateTime<Utc>> {
     let epoch: i64 = raw.trim().parse().ok()?;
@@ -345,8 +371,11 @@ pub fn parse_generated_at(raw: &str) -> Option<DateTime<Utc>> {
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// assert!(remember_cookie_valid(&stored, &token, Some(generated), Some(created), &config, &clock));
 /// ```
+///
+/// Mirrors the five-condition `remember_me?` check (`devise/lib/devise/models/rememberable.rb`): token compare, timestamp, expiry, extend period, and `created_at` ordering.
 #[must_use]
 pub fn remember_cookie_valid(
     stored_value: &str,
@@ -388,6 +417,8 @@ pub fn remember_cookie_valid(
 ///     Some(("1".to_string(), "tok".to_string(), "1700000000".to_string()))
 /// );
 /// ```
+///
+/// The wire half of the `[key, value, timestamp]` codec mirroring devise's `serialize_into_cookie` output format.
 #[must_use]
 pub fn encode_cookie_value(key: &str, value: &str, generated_at: &str) -> String {
     serde_json::json!([key, value, generated_at]).to_string()
@@ -407,6 +438,8 @@ pub fn encode_cookie_value(key: &str, value: &str, generated_at: &str) -> String
 /// assert!(decode_cookie_value("not json").is_none());
 /// assert!(decode_cookie_value("[\"1\",\"tok\"]").is_none());
 /// ```
+///
+/// The parse half of the `[key, value, timestamp]` codec mirroring devise's `serialize_from_cookie` input format.
 #[must_use]
 pub fn decode_cookie_value(raw: &str) -> Option<(String, String, String)> {
     let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
@@ -427,6 +460,8 @@ pub fn decode_cookie_value(raw: &str) -> Option<(String, String, String)> {
 /// so a cookie minted in the same second as `remember_me` compares equal and
 /// is invalid under the strict greater-than rule; callers minting and
 /// validating in one step advance the clock past the creation second first.
+///
+/// Builds the cookie triple from the record; mirrors the model-side half of devise's `serialize_into_cookie`.
 #[must_use]
 pub fn build_cookie_triple(key: &str, value: &str, clock: &dyn Clock) -> (String, String, String) {
     (
@@ -452,11 +487,14 @@ pub fn build_cookie_triple(key: &str, value: &str, clock: &dyn Clock) -> (String
 /// == Examples
 ///
 /// ```ignore
+/// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
 /// impl Rememberable for User {
 ///     fn remember_created_at(&self) -> Option<DateTime<Utc>> { self.remember_created_at }
 ///     // ... column accessors ...
 /// }
 /// ```
+///
+/// Mirrors `Devise::Models::Rememberable` (`devise/lib/devise/models/rememberable.rb`) as the trait surface: `remember_me`,` ``forget_me``,` cookie serialization, and the validity check.
 #[async_trait]
 pub trait Rememberable: Authenticatable {
     /// Stored `remember_created_at` column.
@@ -697,6 +735,8 @@ pub trait Rememberable: Authenticatable {
 /// [`RememberableCookieAttrs::to_set_cookie_header`]) and `Clear` through
 /// `RememberableBridge::clear_cookie` (the Devise `cookies.delete`
 /// equivalent).
+///
+/// Set/Clear op vocabulary the remember hooks fill and the framework transport drains; mirrors the cookie writes and deletions devise performs inline in warden hooks.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RememberCookieOp {
     /// Set (or re-issue) the remember cookie for `scope`.
@@ -721,6 +761,8 @@ pub enum RememberCookieOp {
 
 impl RememberCookieOp {
     /// Scope this op applies to.
+    ///
+    /// The scope a remember op targets; mirrors the `#{scope}` interpolation in devise's cookie names.
     #[must_use]
     pub fn scope(&self) -> &str {
         match self {
@@ -729,6 +771,8 @@ impl RememberCookieOp {
     }
 
     /// Cookie name this op applies to.
+    ///
+    /// The cookie name a remember op targets; mirrors `rememberable_options[:key]`, devise's cookie-name override.
     #[must_use]
     pub fn key(&self) -> &str {
         match self {

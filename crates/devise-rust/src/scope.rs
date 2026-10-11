@@ -1,5 +1,7 @@
 //! Scope & routing - Module enum, Mapping, `ScopeRegistry`, `RouteSpec`
 //!
+//! Mirrors `Devise::Mapping`, `Devise.add_module`, and `Devise.mappings` (`devise/lib/devise/mapping.rb`, `devise/lib/devise.rb`).
+//!
 //! Drives route generation, failure-app scope resolution, and module ordering.
 //! Canonical module order from `devise/lib/devise/modules.rb` preserved.
 
@@ -15,6 +17,8 @@ use std::collections::HashMap;
 /// - Hook registration order
 /// - Route generation order
 /// - `active_for_authentication?` super-chain evaluation
+///
+/// Mirrors `Devise::ALL`: the module list in the exact registration order of `devise/lib/devise/modules.rb`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Module {
     /// `database_authicatable` - base auth with `encrypted_password`
@@ -41,6 +45,8 @@ pub enum Module {
 
 impl Module {
     /// All modules in canonical order
+    ///
+    /// Mirrors the `Devise::ALL` constant: every module devise can register.
     #[must_use]
     pub fn all() -> Vec<Module> {
         vec![
@@ -58,6 +64,8 @@ impl Module {
     }
 
     /// Module name as Devise expects it (`snake_case`)
+    ///
+    /// The devise module name string; mirrors the symbol devise's `Devise::ALL` and route tables carry.
     #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
@@ -82,6 +90,8 @@ impl std::fmt::Display for Module {
 }
 
 /// Path name overrides for `devise_for` routes
+///
+/// Mirrors the `path_names` option of `devise_for`: per-action path overrides like `sign_in: 'login'`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathNames {
     pub sign_in: String,
@@ -112,6 +122,8 @@ impl Default for PathNames {
 }
 
 /// Sign-out HTTP method
+///
+/// Mirrors the `sign_out_via` option of `devise_for`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SignOutVia {
     #[default]
@@ -131,6 +143,8 @@ impl std::fmt::Display for SignOutVia {
 }
 
 /// Scope mapping - configuration for a single authentication scope
+///
+/// Mirrors `Devise::Mapping` (`devise/lib/devise/mapping.rb`): the per-scope record of name, path, modules, and route options.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Mapping {
     /// Scope name (singular, e.g., "user", "admin")
@@ -169,6 +183,8 @@ pub struct Mapping {
 
 impl Mapping {
     /// Get the full path prefix for this scope
+    ///
+    /// Mirrors `Mapping#fullpath` with the `.squeeze('/')` slash collapsing devise applies.
     #[must_use]
     pub fn full_path(&self) -> String {
         match &self.path_prefix {
@@ -178,48 +194,64 @@ impl Mapping {
     }
 
     /// Get the scoped path for nested routes
+    ///
+    /// Mirrors `Mapping#scoped_path`.
     #[must_use]
     pub fn scoped_path(&self) -> String {
         self.full_path()
     }
 
     /// Get sign-in path for this scope
+    ///
+    /// Builds the scope's sign-in path, mirroring the `new_<scope>_session_path` route helper.
     #[must_use]
     pub fn sign_in_path(&self) -> String {
         format!("{}/{}", self.full_path(), self.path_names.sign_in)
     }
 
     /// Get sign-out path for this scope
+    ///
+    /// Builds the scope's sign-out path, mirroring `destroy_<scope>_session_path` under `sign_out_via`.
     #[must_use]
     pub fn sign_out_path(&self) -> String {
         format!("{}/{}", self.full_path(), self.path_names.sign_out)
     }
 
     /// Get sign-up path for this scope
+    ///
+    /// Builds the scope's sign-up path, mirroring `new_<scope>_registration_path`.
     #[must_use]
     pub fn sign_up_path(&self) -> String {
         format!("{}/{}", self.full_path(), self.path_names.sign_up)
     }
 
     /// Get password path for this scope
+    ///
+    /// Builds the password path family, mirroring `new_<scope>_password_path` and siblings.
     #[must_use]
     pub fn password_path(&self) -> String {
         format!("{}/{}", self.full_path(), self.path_names.password)
     }
 
     /// Get confirmation path for this scope
+    ///
+    /// Builds the confirmation path family, mirroring `new_<scope>_confirmation_path` and siblings.
     #[must_use]
     pub fn confirmation_path(&self) -> String {
         format!("{}/{}", self.full_path(), self.path_names.confirmation)
     }
 
     /// Get unlock path for this scope
+    ///
+    /// Builds the unlock path family, mirroring `new_<scope>_unlock_path` and siblings.
     #[must_use]
     pub fn unlock_path(&self) -> String {
         format!("{}/{}", self.full_path(), self.path_names.unlock)
     }
 
     /// Get the effective modules list (applying only/skip)
+    ///
+    /// Mirrors `devise_modules` resolution: the module list honoring the `only` and `skip` options of `devise_for`.
     #[must_use]
     pub fn effective_modules(&self) -> Vec<Module> {
         let mut modules = self.modules.clone();
@@ -240,6 +272,8 @@ impl Mapping {
     }
 
     /// Check if a module is enabled for this mapping
+    ///
+    /// Mirrors the `<module>?` predicates on `Devise::Mapping` (for example `mapping.authenticatable?`).
     #[must_use]
     pub fn has_module(&self, module: Module) -> bool {
         self.effective_modules().contains(&module)
@@ -442,6 +476,8 @@ impl Mapping {
     /// Registration MUST also run [`Mapping::validate_omniauth_paths`] so
     /// the dynamic-segment ban surfaces as a `Config` error at
     /// registration time; the framework mount functions call it.
+    ///
+    /// Mirrors `devise_omniauth_callback` route generation in `devise/lib/devise/rails/routes.rb`: the authorize and callback pair per provider.
     #[must_use]
     pub fn omniauth_route_specs_for(&self, config: &DeviseConfig) -> Vec<RouteSpec> {
         omniauth_route_specs(&self.omniauth_base(config), &self.singular)
@@ -481,6 +517,8 @@ impl Mapping {
     /// let path = mapping.omniauth_callback_path(&DeviseConfig::default(), "github");
     /// assert_eq!(path, "/users/auth/github/callback");
     /// ```
+    ///
+    /// Builds the omniauth callback route shape, mirroring devise's `via: [:get, :post]` callback routing.
     #[must_use]
     pub fn omniauth_callback_path(&self, config: &DeviseConfig, provider: &str) -> String {
         self.omniauth_route_specs_for(config)
@@ -501,6 +539,8 @@ impl Mapping {
     /// Registration MUST also run [`Mapping::validate_omniauth_paths`] so
     /// the dynamic-segment ban surfaces as a `Config` error at
     /// registration time; the framework mount functions call it.
+    ///
+    /// Builds the mapping's full route table from the used modules, mirroring the route generation pass of `devise_for`.
     #[must_use]
     pub fn route_specs_for(&self, config: &DeviseConfig) -> Vec<RouteSpec> {
         let mut specs: Vec<RouteSpec> = self
@@ -571,19 +611,19 @@ fn squeezed_slashes(path: &str) -> String {
     out
 }
 
-/// Build the omniauth route-spec triple for one mapping — the ONE shared
+/// Build the omniauth route-spec triple for one mapping: the ONE shared
 /// constructor both framework crates and tests build their omniauth route
 /// expectations from (OMN-01, no per-framework route tables).
 ///
 /// Exactly three specs per omniauthable mapping, mirroring Devise's
 /// `devise_omniauth_callback` route block under `OmniAuth` 2 semantics:
 ///
-/// * `POST {base}/{provider}` — action `passthru` (authorize),
+/// * `POST {base}/{provider}` - action `passthru` (authorize),
 ///   POST-only per `OmniAuth.config.allowed_request_methods` (OMN-03).
 /// * `GET {base}/{provider}/callback` and `POST {base}/{provider}/callback`
-///   — action `callback`, matching Devise's `via: [:get, :post]`.
+///   - action `callback`, matching Devise's `via: [:get, :post]`.
 ///
-/// `base` is the RESOLVED omniauth base — the `omniauth_path_prefix`
+/// `base` is the RESOLVED omniauth base: the `omniauth_path_prefix`
 /// override or the mapping default `{full_path}/auth` (see
 /// [`Mapping::omniauth_base`]). The generic `{provider}` capture is a
 /// single table row pair: the per-provider allowlist check runs at
@@ -635,6 +675,8 @@ pub fn omniauth_route_specs(omniauth_base: &str, singular: &str) -> Vec<RouteSpe
 }
 
 /// Route specification - data structure for framework route registration
+///
+/// One row mirroring the `devise_for` route table: method, path, controller action, and route name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteSpec {
     /// Route path (e.g., `/users/sign_in`)
@@ -650,6 +692,8 @@ pub struct RouteSpec {
 }
 impl RouteSpec {
     /// Create a new route spec
+    ///
+    /// Constructs one route row, mirroring the rows devise's route generator emits per action.
     #[must_use]
     pub fn new(
         path: impl Into<String>,
@@ -667,6 +711,8 @@ impl RouteSpec {
     }
 
     /// Add an option
+    ///
+    /// Attaches a per-route option, mirroring the `defaults` and `constraints` options of `devise_for`.
     #[must_use]
     pub fn with_option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.options.insert(key.into(), value.into());
@@ -680,6 +726,8 @@ impl RouteSpec {
 /// - Route generation (`RouteSpec` table)
 /// - Failure app scope resolution (`find_by_path`)
 /// - Per-scope config lookup
+///
+/// Mirrors `Devise.mappings`: the scope-name to `Devise::Mapping` registry at the heart of devise's routing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScopeRegistry {
     scopes: HashMap<String, Mapping>,
@@ -687,12 +735,16 @@ pub struct ScopeRegistry {
 
 impl ScopeRegistry {
     /// Create a new empty scope registry
+    ///
+    /// Constructs the registry; mirrors the pre-`devise_for` state of `Devise.mappings`.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Register a scope mapping
+    ///
+    /// Mirrors `Devise.add_mapping`: registering one scope's mapping.
     pub fn register(&mut self, mut mapping: Mapping) {
         let name = mapping.name.clone();
         // Sort modules by canonical order at registration
@@ -701,12 +753,16 @@ impl ScopeRegistry {
     }
 
     /// Get a mapping by scope name
+    ///
+    /// Mirrors the `Devise.mappings[scope]` lookup.
     #[must_use]
     pub fn get(&self, scope: &str) -> Option<&Mapping> {
         self.scopes.get(scope)
     }
 
     /// Get mutable mapping by scope name
+    ///
+    /// Mutable lookup for runtime amendments; the registry mirror of devise's mapping store.
     pub fn get_mut(&mut self, scope: &str) -> Option<&mut Mapping> {
         self.scopes.get_mut(scope)
     }
@@ -714,6 +770,8 @@ impl ScopeRegistry {
     /// Find scope by request path (for failure app)
     ///
     /// Matches the longest path prefix - e.g., `/users/sign_in` maps to the `user` scope.
+    ///
+    /// Mirrors `Devise::Mapping.find_by_path!`.
     #[must_use]
     pub fn find_by_path(&self, path: &str) -> Option<&Mapping> {
         let mut best_match: Option<&Mapping> = None;
@@ -731,12 +789,16 @@ impl ScopeRegistry {
     }
 
     /// Get all registered scope names
+    ///
+    /// Mirrors `Devise.mappings.keys`.
     #[must_use]
     pub fn scope_names(&self) -> Vec<String> {
         self.scopes.keys().cloned().collect()
     }
 
     /// Get all route specs for all scopes
+    ///
+    /// The full route table across scopes; mirrors the accumulated `devise_for` routes the framework registration renders.
     #[must_use]
     pub fn all_route_specs(&self) -> Vec<RouteSpec> {
         self.scopes
@@ -746,12 +808,16 @@ impl ScopeRegistry {
     }
 
     /// Get count of registered scopes
+    ///
+    /// Registry size; collection ergonomics over the `Devise.mappings` mirror.
     #[must_use]
     pub fn len(&self) -> usize {
         self.scopes.len()
     }
 
     /// Check if registry is empty
+    ///
+    /// Registry emptiness check; collection ergonomics over the `Devise.mappings` mirror.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.scopes.is_empty()
