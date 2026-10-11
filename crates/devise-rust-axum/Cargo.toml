@@ -14,4 +14,38 @@ workspace = true
 
 [dependencies]
 devise-rust = { path = "../devise-rust" }
-# Phase 7 adds: axum, tower, tower-sessions (see .planning/ROADMAP.md)
+# Phase 9 pins (09-RESEARCH.md Standard Stack, package-audit OK):
+# - axum 0.8: `{param}` route captures, `FromRequestParts`, `Router::merge`
+# - tower-sessions 0.15: facade crate ONLY (never the split -core/-memory-store
+#   crates); `signed` enables the signed session cookie; MemoryStore is the
+#   D-01 default store
+# - tower 0.5: `Layer`/`Service` for DeviseLayer
+# - axum-extra 0.12 `cookie` + `cookie-signed`: SignedCookieJar transport
+# - oauth2 5.0: generic OAuth2 client (omniauthable, wired in 09-03/09-04)
+axum = "0.8"
+tower = "0.5"
+tower-sessions = { version = "0.15", features = ["signed"] }
+oauth2 = "5.0"
+axum-extra = { version = "0.12", features = ["cookie", "cookie-signed"] }
+# cookie 0.18 is the shared cookie lineage of tower-cookies 0.11 and
+# axum-extra 0.12 (no version skew). The direct edge exists only to enable
+# `key-expansion`, gating `Key::derive_from` (A3) — neither tower-sessions
+# nor axum-extra forwards that feature.
+cookie = { version = "0.18", features = ["key-expansion"] }
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `sync` on top of the workspace features: AuthProxyHandle is a tokio Mutex so
+# the guard may live across `.await` (std Mutex guards are !Send).
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[test]]
+name = "session_bridge"
+path = "tests/session_bridge.rs"
+harness = true
