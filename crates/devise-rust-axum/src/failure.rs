@@ -75,9 +75,14 @@ impl FailureRenderer for AxumFailureRenderer {
                 status,
                 www_authenticate,
             } => {
-                // API: 401 (+ optional WWW-Authenticate for HTTP Basic).
+                // API: 401 (+ optional WWW-Authenticate for HTTP Basic)
+                // with a JSON body.
                 let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::UNAUTHORIZED);
-                let mut response = status.into_response();
+                let mut response = (
+                    status,
+                    axum::Json(serde_json::json!({ "error": "unauthorized" })),
+                )
+                    .into_response();
                 if let Some(challenge) = www_authenticate {
                     if let Ok(value) = HeaderValue::from_str(challenge) {
                         response
@@ -96,8 +101,12 @@ impl FailureRenderer for AxumFailureRenderer {
             }
             // Catch-all for the raw strategy/hook variants (Timeout,
             // InvalidCredentials, Locked, Unconfirmed, NotFound, Config,
-            // Internal): generic 401, classified upstream when rendered.
-            _ => StatusCode::UNAUTHORIZED.into_response(),
+            // Internal): 401 JSON, classified upstream when rendered.
+            _ => (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({ "error": "unauthorized" })),
+            )
+                .into_response(),
         }
     }
 }

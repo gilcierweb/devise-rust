@@ -179,6 +179,21 @@ where
             }
             Err(failure) => {
                 drop(proxy);
+                // Devise `store_location!`: GET navigational non-XHR
+                // requests are remembered in the session so post-sign-in
+                // can return here (same-host-only via the core validator;
+                // POST and absolute-URL targets store nothing).
+                if let Some(session) = parts.extensions.get::<tower_sessions::Session>().cloned() {
+                    if let Some(config) = config.as_deref() {
+                        devise_rust::failure::store_location(
+                            &request,
+                            &mapping.name,
+                            config,
+                            &crate::bridge::TowerSessionStore::new(session),
+                        )
+                        .await;
+                    }
+                }
                 let response = render_failure(&failure, &request, &mapping, config.as_deref());
                 Err(AuthRejection(response))
             }

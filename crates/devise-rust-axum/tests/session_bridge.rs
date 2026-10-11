@@ -110,11 +110,23 @@ fn user_mapping() -> Mapping {
     }
 }
 
+fn user_mapping_with(modules: Vec<Module>) -> Mapping {
+    Mapping {
+        modules,
+        ..user_mapping()
+    }
+}
+
 /// Protected route: strict extractor, so an anonymous hit renders the core
 /// failure decision (302 navigational here).
 async fn dashboard(user: RequireAuth<TracerUser>) -> String {
     user.user()
         .map_or_else(|| "anonymous".to_string(), |user| user.email.clone())
+}
+
+/// POST route behind the strict extractor (stored-location POST matrix).
+async fn submit(_: RequireAuth<TracerUser>) -> &'static str {
+    "created"
 }
 
 /// Peer probe: exposes the layer-built `AuthRequest.peer_addr` so tests
@@ -125,10 +137,35 @@ async fn peer_probe(
     request.peer_addr.unwrap_or_else(|| "none".to_string())
 }
 
-async fn tracer_app() -> Router {
-    let config = Arc::new(test_config());
+/// Session dump: exposes the session-side state the layer and extractors
+/// persist (epoch tick, stored location) for the Task 3 probes.
+async fn session_dump(session: Session) -> axum::Json<serde_json::Value> {
+    let last_request_at = session
+        .get_value(&devise_rust::timeoutable::last_request_at_key("user"))
+        .await
+        .ok()
+        .flatten();
+    let stored_location = session
+        .get_value(&devise_rust::failure::stored_location_key("user"))
+        .await
+        .ok()
+        .flatten();
+    axum::Json(serde_json::json!({
+        "last_request_at": last_request_at,
+        "stored_location": stored_location,
+    }))
+}
+
+/// App factory: config + hook registry + module set in, full Devise stack
+/// out (session layer outermost).
+async fn devise_app(
+    config: DeviseConfig,
+    hooks: Arc<HookRegistry>,
+    modules: Vec<Module>,
+) -> Router {
+    let config = Arc::new(config);
     let mut registry = ScopeRegistry::new();
-    let mapping = user_mapping();
+    let mapping = user_mapping_with(modules);
     registry.register(mapping.clone());
 
     // Seed the oracle adapter; the bcrypt digest drives the salt and the
@@ -151,8 +188,9 @@ async fn tracer_app() -> Router {
         finders: HashMap::from([("user".to_string(), finder.clone())]),
     };
 
-    let devise_layer =
-        DeviseLayer::new(Arc::new(registry), config.clone()).with_finder("user", finder);
+    let devise_layer = DeviseLayer::new(Arc::new(registry), config.clone())
+        .with_hooks(hooks)
+        .with_finder("user", finder);
     // SameSite Lax + signed cookie over the Devise-derived key (A2/A3 wiring).
     let session_layer = session_manager_layer(&config).expect("session layer builds");
 
@@ -160,8 +198,19 @@ async fn tracer_app() -> Router {
         .merge(sessions_router(state))
         .route("/users/dashboard", get(dashboard))
         .route("/users/peer-probe", get(peer_probe))
+        .route("/users/session-dump", get(session_dump))
+        .route("/users/submit", axum::routing::post(submit))
         .layer(devise_layer)
         .layer(session_layer)
+}
+
+async fn tracer_app() -> Router {
+    devise_app(
+        test_config(),
+        Arc::new(HookRegistry::new()),
+        vec![Module::DatabaseAuthenticatable],
+    )
+    .await
 }
 
 fn sign_in_request(cookie: Option<&str>) -> Request<Body> {
@@ -777,4 +826,346 @@ async fn peer_addr_comes_from_the_socket_not_forwarded_headers() {
     let response = app.oneshot(probe).await.expect("oneshot");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_string(response).await, "203.0.113.9");
+}
+
+// ============================================================================
+// Task 3 battery — layer pipeline, layer-order probe (A2), session cookie
+// posture, stored-location matrix, 302/401 split, Request-hook tick,
+// remember-ops drain.
+// ============================================================================
+
+/// A2 probe, positive leg: with `SessionManagerLayer` outermost the
+/// `Session` is resolvable inside `DeviseLayer`, so a handler reading the
+/// session directly answers 200 through the full stack.
+#[tokio::test]
+async fn layer_order_probe_session_resolvable_inside_devise_layer() {
+    let app = tracer_app().await;
+    let response = app
+        .oneshot(request(Method::GET, "/users/session-dump", "", None))
+        .await
+        .expect("oneshot");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "session layer must be outermost so DeviseLayer never fails closed here"
+    );
+}
+
+/// The `session_manager_layer` contract: SameSite=Lax (never the Strict
+/// default that breaks OAuth round-trips), `HttpOnly`, `Secure`, and a signed
+/// value (cookie 0.18 prepends a 44-char base64 HMAC digest to the id).
+#[tokio::test]
+async fn session_cookie_attributes_lax_signed_httponly_secure() {
+    let app = tracer_app().await;
+    let response = app
+        .clone()
+        .oneshot(sign_in_request(None))
+        .await
+        .expect("oneshot sign-in");
+    assert_eq!(response.status(), StatusCode::FOUND);
+
+    let session_pair = session_cookie(&response).expect("session cookie");
+    let raw = session_pair.trim_start_matches("id=");
+    assert!(
+        raw.contains(';')
+            || response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|v| v.to_str().is_ok_and(|c| c.contains("SameSite=Lax"))),
+        "attributes render on the cookie"
+    );
+    let all: Vec<String> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(str::to_string))
+        .collect();
+    let id_cookie = all
+        .iter()
+        .find(|c| c.starts_with("id="))
+        .expect("session cookie present");
+    assert!(
+        id_cookie.contains("SameSite=Lax"),
+        "Lax override, not Strict"
+    );
+    assert!(id_cookie.contains("HttpOnly"));
+    assert!(id_cookie.contains("Secure"));
+    assert!(id_cookie.contains("Path=/"));
+    let value = id_cookie
+        .trim_start_matches("id=")
+        .split(';')
+        .next()
+        .unwrap_or_default();
+    assert!(
+        value.len() > 44,
+        "signed cookie: value carries the 44-char HMAC digest prefix"
+    );
+}
+
+/// Stored-location matrix, GET leg: an unauthenticated navigational GET is
+/// remembered in the session so post-sign-in can return.
+#[tokio::test]
+async fn stored_location_get_navigational_is_stored() {
+    let app = tracer_app().await;
+    let response = app
+        .clone()
+        .oneshot(request(Method::GET, "/users/dashboard", "", None))
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let cookie = session_cookie(&response)
+        .expect("store_location wrote the session, so a cookie was issued");
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/users/session-dump",
+            "",
+            Some(&cookie),
+        ))
+        .await
+        .expect("oneshot dump");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_string(response).await).expect("json body");
+    assert_eq!(
+        body["stored_location"],
+        serde_json::json!("/users/dashboard")
+    );
+}
+
+/// Stored-location matrix, POST + absolute legs: POST stores nothing (no
+/// session write at all), and the core parser rejects absolute and
+/// protocol-relative targets (the failure.rs assert shapes).
+#[tokio::test]
+async fn stored_location_post_and_absolute_targets_store_nothing() {
+    let app = tracer_app().await;
+    let response = app
+        .oneshot(request(Method::POST, "/users/submit", "", None))
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert!(
+        session_cookie(&response).is_none(),
+        "POST stores nothing — the session is never written (only the flash may be set)"
+    );
+
+    // Core parser matrix (mirrors devise-rust/src/failure.rs tests).
+    assert!(AuthRequest::parse_stored_uri("http://evil.example/x").is_none());
+    assert!(AuthRequest::parse_stored_uri("https://evil.example/x").is_none());
+    assert!(AuthRequest::parse_stored_uri("//evil.example/x").is_none());
+    assert!(AuthRequest::parse_stored_uri("relative").is_none());
+    assert_eq!(
+        AuthRequest::parse_stored_uri("/users/dashboard"),
+        Some("/users/dashboard".to_string())
+    );
+}
+
+/// The failure split (D-09): navigational requests get the core 302 +
+/// flash; API requests (navigational formats without `*/*`) get 401 JSON.
+#[tokio::test]
+async fn failure_split_navigational_302_api_401() {
+    // Navigational: 302 toward the mapping's sign-in path with the flash.
+    let app = tracer_app().await;
+    let response = app
+        .clone()
+        .oneshot(request(Method::GET, "/users/dashboard", "", None))
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/users/sign_in")
+    );
+    let has_flash = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .any(|v| {
+            v.to_str()
+                .is_ok_and(|c| c.contains("devise.flash=unauthenticated"))
+        });
+    assert!(has_flash, "navigational failures carry the flash cookie");
+
+    // API: 401 JSON, no redirect.
+    let api_config = DeviseConfig {
+        navigational_formats: vec!["html".to_string(), "turbo_stream".to_string()],
+        ..test_config()
+    };
+    let app = devise_app(
+        api_config,
+        Arc::new(HookRegistry::new()),
+        vec![Module::DatabaseAuthenticatable],
+    )
+    .await;
+    let mut probe = request(Method::GET, "/users/dashboard", "", None);
+    probe.headers_mut().insert(
+        header::ACCEPT,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    let response = app.oneshot(probe).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().get(header::LOCATION).is_none());
+    assert_eq!(body_string(response).await, r#"{"error":"unauthorized"}"#);
+}
+
+/// http_auth-eligible failures render 401 with the `WWW-Authenticate:
+/// Basic realm=...` challenge from config.
+#[tokio::test]
+async fn http_auth_failure_carries_www_authenticate_challenge() {
+    let config = DeviseConfig {
+        http_authenticatable: true,
+        navigational_formats: vec!["html".to_string()],
+        ..test_config()
+    };
+    let app = devise_app(
+        config,
+        Arc::new(HookRegistry::new()),
+        vec![Module::DatabaseAuthenticatable],
+    )
+    .await;
+    let mut probe = request(Method::GET, "/users/dashboard", "", None);
+    probe.headers_mut().insert(
+        header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Basic dXNlcjp3cm9uZw=="),
+    );
+    probe.headers_mut().insert(
+        header::ACCEPT,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    let response = app.oneshot(probe).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok()),
+        Some("Basic realm=Application")
+    );
+}
+
+/// The layer dispatches `Event::Request` hooks with the live record: the
+/// core timeoutable body persists the integer-epoch `last_request_at`
+/// tick into the session on authenticated requests.
+#[tokio::test]
+async fn layer_dispatches_request_hooks_persisting_epoch_tick() {
+    let modules = vec![Module::DatabaseAuthenticatable, Module::Timeoutable];
+    let mut hooks = HookRegistry::new();
+    devise_rust::hooks::register_devise_hooks(&mut hooks, &user_mapping_with(modules.clone()));
+    let app = devise_app(test_config(), Arc::new(hooks), modules).await;
+
+    // Sign in, then make an authenticated request: the Request hooks fire.
+    let response = app
+        .clone()
+        .oneshot(sign_in_request(None))
+        .await
+        .expect("sign-in");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let cookie = session_cookie(&response).expect("session cookie");
+
+    let response = app
+        .clone()
+        .oneshot(request(Method::GET, "/users/dashboard", "", Some(&cookie)))
+        .await
+        .expect("dashboard");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/users/session-dump",
+            "",
+            Some(&cookie),
+        ))
+        .await
+        .expect("dump");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_string(response).await).expect("json body");
+    assert!(
+        body["last_request_at"].is_i64(),
+        "integer-epoch tick persisted by the Request hook, got {body}"
+    );
+}
+
+/// The layer drains the remember-cookie outbox into Set-Cookie: `Set` ops
+/// render the hardened attributes, `Clear` ops render tombstones.
+#[tokio::test]
+async fn remember_ops_drain_into_set_cookie() {
+    use devise_rust::hooks::HookFilter;
+    use devise_rust::rememberable::{
+        RememberCookieOp, RememberableCookieAttrs, remember_cookie_key,
+    };
+    use devise_rust::time::SystemClock;
+
+    let mut hooks = HookRegistry::new();
+    hooks.add_hook(
+        HookFilter::new().only(vec![devise_rust::hooks::Event::Request]),
+        Box::new(|ctx| {
+            Box::pin(async move {
+                let config = ctx.proxy.devise_config().clone();
+                let scope = ctx.scope.to_string();
+                let attrs = RememberableCookieAttrs::for_scope(&scope, &config, &SystemClock);
+                ctx.proxy.push_remember_cookie_op(RememberCookieOp::Set {
+                    scope: scope.clone(),
+                    key: remember_cookie_key(&scope, &config),
+                    value: "encoded-cookie-triple".to_string(),
+                    attrs,
+                });
+                ctx.proxy.push_remember_cookie_op(RememberCookieOp::Clear {
+                    scope,
+                    key: "remember_admin_token".to_string(),
+                });
+                Ok(())
+            })
+        }),
+        false,
+    );
+
+    let app = devise_app(
+        test_config(),
+        Arc::new(hooks),
+        vec![Module::DatabaseAuthenticatable],
+    )
+    .await;
+
+    // Sign in, then hit the protected route: the Request hook queues both
+    // ops and the layer drains them onto the response.
+    let response = app
+        .clone()
+        .oneshot(sign_in_request(None))
+        .await
+        .expect("sign-in");
+    let cookie = session_cookie(&response).expect("session cookie");
+
+    let response = app
+        .oneshot(request(Method::GET, "/users/dashboard", "", Some(&cookie)))
+        .await
+        .expect("dashboard");
+    assert_eq!(response.status(), StatusCode::OK);
+    let set_cookies: Vec<String> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(str::to_string))
+        .collect();
+
+    let set = set_cookies
+        .iter()
+        .find(|c| c.starts_with("remember_user_token=encoded-cookie-triple"))
+        .expect("Set op drained into Set-Cookie");
+    assert!(set.contains("HttpOnly"));
+    assert!(set.contains("Secure"));
+    assert!(set.contains("SameSite=Lax"));
+    assert!(set.contains("Expires="));
+
+    let clear = set_cookies
+        .iter()
+        .find(|c| c.starts_with("remember_admin_token="))
+        .expect("Clear op drained into a tombstone");
+    assert!(clear.contains("Max-Age=0"));
 }

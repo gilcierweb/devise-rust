@@ -29,9 +29,21 @@
 //! 3. Owned `AuthRequest` snapshot: headers, cookies, query, method, path,
 //!    `RequestFlags`, and the socket peer from `ConnectInfo<SocketAddr>`
 //!    only — proxy forwarding headers are never consulted (D-20).
-//! 4. `TowerSessionStore` over the cloned session plus a per-request
+//! 4. Non-strict `AuthProxy` fetch for the resolved scope: the warden
+//!    payload through the bridge store, salt validation via the scope's
+//!    finder (mismatch deletes the key), then `Event::Request` hook
+//!    dispatch with the live record — the core hook bodies own the
+//!    timeout check, the live remember-me exemption, and the
+//!    integer-epoch `last_request_at` tick, honoring the
+//!    `skip_timeoutable` / `skip_timeout` / `skip_trackable` flags carried
+//!    on the `AuthRequest`.
+//! 5. `TowerSessionStore` over the cloned session plus the per-request
 //!    `AuthProxy` with the configured finders, staged in extensions as
 //!    [`AuthProxyHandle`] for extractors and handlers.
+//! 6. After the inner service responds, the remember-cookie outbox
+//!    drains into `Set-Cookie` headers: hardened `Set` cookies via the
+//!    core attribute renderer, `Clear` tombstones for deletes. (The
+//!    signed-jar transport lands with the remember wiring in 09-02.)
 //!
 //! ## Options
 //!
@@ -46,18 +58,23 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::extract::ConnectInfo;
-use axum::http::{Request, Response, StatusCode, header};
+use axum::http::{HeaderValue, Request, Response, StatusCode, header};
+use devise_rust::adapter::DeviseKey;
 use devise_rust::config::DeviseConfig;
 use devise_rust::error::DeviseError;
-use devise_rust::hooks::HookRegistry;
+use devise_rust::failure::AnyDeviseModel;
+use devise_rust::hooks::{Event, HookContext, HookProxy, HookRegistry};
 use devise_rust::model::ModelFinder;
-use devise_rust::proxy::AuthProxy;
+use devise_rust::proxy::{AuthProxy, SetUserEvent, SetUserOpts};
+use devise_rust::rememberable::RememberCookieOp;
 use devise_rust::request::{AuthRequest, HttpMethod, RequestFlags, build_auth_request_with_peer};
 use devise_rust::scope::{Mapping, ScopeRegistry};
+use devise_rust::session::keys;
 use tower::{Layer, Service};
 use tower_sessions::MemoryStore;
 use tower_sessions::Session;
@@ -145,7 +162,7 @@ where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     ReqBody: Send + 'static,
-    ResBody: Default,
+    ResBody: Default + Send,
 {
     type Response = Response<ResBody>;
     type Error = S::Error;
@@ -193,17 +210,140 @@ where
             for (scope, finder) in &layer.finders {
                 proxy.register_finder(scope, finder.clone());
             }
+
+            // Non-strict fetch + Event::Request hooks for the resolved
+            // scope (timeout tick, remember exemption — core hook bodies).
+            if let Some(mapping) = &mapping {
+                fetch_and_dispatch_request_hooks(
+                    &mut proxy,
+                    &layer.finders,
+                    &layer.hooks,
+                    mapping,
+                    &auth_request,
+                )
+                .await;
+            }
+
             let handle: AuthProxyHandle = Arc::new(tokio::sync::Mutex::new(proxy));
 
             req.extensions_mut().insert(auth_request);
             req.extensions_mut().insert(layer.config.clone());
-            req.extensions_mut().insert(handle);
+            req.extensions_mut().insert(handle.clone());
             if let Some(mapping) = mapping {
                 req.extensions_mut().insert(mapping);
             }
 
-            inner.call(req).await
+            let mut response = inner.call(req).await?;
+
+            // Drain the remember-cookie outbox into Set-Cookie (Set ops
+            // render the hardened attributes; Clear ops delete).
+            let ops = handle.lock().await.take_remember_cookie_ops();
+            apply_remember_ops(&mut response, &ops);
+            Ok(response)
         })
+    }
+}
+
+/// Non-strict warden fetch plus `Event::Request` hook dispatch for the
+/// resolved scope.
+///
+/// The fetch mirrors core `AuthProxy::fetch_from_session` semantics over
+/// the erased finder (the proxy's own fetch stays strategy-coupled for the
+/// strict path): read the `[key, salt]` payload, fetch the record, compare
+/// salts constant-time, and on mismatch DELETE the session key and yield
+/// nothing (T-09-02).
+///
+/// Request hooks run with the local record BEFORE memoization — the same
+/// borrow shape core uses — so the core `timeoutable_tick_hook` body can
+/// sign the user out on expiry; a hook failure leaves the request
+/// anonymous instead of resurrecting a timed-out record.
+async fn fetch_and_dispatch_request_hooks(
+    proxy: &mut AuthProxy,
+    finders: &HashMap<String, Arc<dyn ModelFinder>>,
+    hooks: &Arc<HookRegistry>,
+    mapping: &Mapping,
+    request: &AuthRequest,
+) {
+    let scope = mapping.name.as_str();
+    let Some(finder) = finders.get(scope) else {
+        return;
+    };
+
+    let Some(record) = fetch_session_record(proxy, finder.as_ref(), scope).await else {
+        return;
+    };
+
+    // Event::Request hooks with the live record: core bodies own the
+    // timeout check (skip flags honored through `request.flags`), the
+    // live remember-me exemption, and the integer-epoch tick.
+    let mut ctx = HookContext {
+        proxy: proxy as &mut dyn HookProxy,
+        scope,
+        event: Event::Request,
+        request: Some(request),
+        record: Some(record.as_ref()),
+    };
+    let hook_result = hooks.run_hooks(&mut ctx).await;
+
+    if hook_result.is_ok() {
+        // Memoize (Fetch event: no hooks, no session write).
+        let opts = SetUserOpts {
+            event: SetUserEvent::Fetch,
+            store: false,
+            run_callbacks: false,
+            force: false,
+        };
+        let _ = proxy.set_user(scope, Some(record), opts).await;
+    }
+}
+
+/// Non-strict warden fetch over the erased finder.
+///
+/// Mirrors core `AuthProxy::fetch_from_session` semantics: read the
+/// `[key, salt]` payload, load the record, compare salts constant-time; a
+/// mismatch DELETES the session key and yields nothing (T-09-02), and a
+/// salt-less record fails closed the same way core does.
+async fn fetch_session_record(
+    proxy: &mut AuthProxy,
+    finder: &dyn ModelFinder,
+    scope: &str,
+) -> Option<Box<dyn AnyDeviseModel>> {
+    let session_key = keys::scope_session_key(scope);
+    let payload = proxy.session_store().get_value(&session_key).await?;
+    let arr = payload.as_array()?;
+    if arr.len() < 2 {
+        return None;
+    }
+    let key_str = arr.first()?.as_str()?;
+    let stored_salt = arr.get(1)?.as_str()?;
+    let key = DeviseKey::from_str(key_str).ok()?;
+    let record = finder.get_boxed(&key).await.ok()??;
+    let current_salt = record.authenticatable_salt()?;
+    if !devise_rust::crypto::secure_compare(&current_salt, stored_salt) {
+        proxy.session_store().remove(&session_key).await;
+        return None;
+    }
+    Some(record)
+}
+
+/// Render the drained remember-cookie intents onto the response.
+///
+/// `Set` ops carry core-rendered hardened attributes (`HttpOnly`, `Secure`,
+/// `SameSite=Lax`, `Expires`); `Clear` ops render a deletion tombstone. The
+/// signed-jar transport (axum-extra `SignedCookieJar`) is the 09-02
+/// remember wiring; the codec + five-condition check in core carry the
+/// validation security here.
+fn apply_remember_ops<ResBody>(response: &mut Response<ResBody>, ops: &[RememberCookieOp]) {
+    for op in ops {
+        let header = match op {
+            RememberCookieOp::Set { value, attrs, .. } => attrs.to_set_cookie_header(value),
+            RememberCookieOp::Clear { key, .. } => {
+                format!("{key}=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; Path=/")
+            }
+        };
+        if let Ok(value) = HeaderValue::from_str(&header) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
     }
 }
 
