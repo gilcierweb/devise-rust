@@ -20,6 +20,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use common::{FixtureUser, SystemClock, default_mapping, test_config};
 use devise_rust::adapter::OrmAdapter;
+use devise_rust::config::DeviseConfig;
 
 use devise_rust::failure::AnyDeviseModel;
 use devise_rust::rememberable::{RememberCookieOp, encode_cookie_value};
@@ -380,6 +381,142 @@ async fn passwords_controller_basics() {
             .iter()
             .any(|c| c.starts_with("devise.flash=no_token")),
         "{cookies:?}"
+    );
+}
+
+/// Unconfirmed fixture with the DIGEST of `raw` stored in the token column
+/// (the real mailed-link shape: emails carry the raw, the DB the digest).
+fn unconfirmed_with_token(email: &str, raw: &str, config: &DeviseConfig) -> FixtureUser {
+    let mut user = FixtureUser::new_with_password(email, "secret123", config);
+    user.confirmation_token = Some(devise_rust::crypto::token_generator::digest(
+        &config.secret_key,
+        devise_rust::confirmable::CONFIRMATION_TOKEN_COLUMN,
+        raw,
+    ));
+    user.confirmation_sent_at = Some(SystemClock.now());
+    user
+}
+
+/// Confirmations controller: the mailed raw token confirms the account —
+/// HTML answers 302 to the sign-in path with the `confirmed` flash, JSON
+/// answers 200 with the confirmed body (CNF controller happy path).
+#[tokio::test]
+async fn confirmations_controller_happy_path() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    let config = common::test_config();
+    state
+        .adapter
+        .create(unconfirmed_with_token(
+            "confirm@example.com",
+            "raw-confirm-one",
+            &config,
+        ))
+        .await
+        .expect("seed html user");
+    state
+        .adapter
+        .create(unconfirmed_with_token(
+            "confirm-json@example.com",
+            "raw-confirm-two",
+            &config,
+        ))
+        .await
+        .expect("seed json user");
+
+    // HTML: 302 → sign-in path with the `confirmed` flash.
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/users/confirmation?confirmation_token=raw-confirm-one",
+        ))
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/users/sign_in")
+    );
+    let cookies = set_cookie_pairs(&response);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=confirmed")),
+        "{cookies:?}"
+    );
+
+    // JSON: 200 with the confirmed body.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/users/confirmation?confirmation_token=raw-confirm-two")
+                .header(header::ACCEPT, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["confirmed"], serde_json::json!(true));
+}
+
+/// Unlocks controller: the emailed raw token unlocks the locked account —
+/// HTML answers 302 to the sign-in path with the `unlocked` flash and the
+/// lock is released in the store (LCK controller happy path).
+#[tokio::test]
+async fn unlocks_controller_happy_path() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    let config = common::test_config();
+    let mut user = FixtureUser::new_with_password("locked@example.com", "secret123", &config)
+        .confirmed_now(&SystemClock);
+    user.locked_at = Some(SystemClock.now());
+    user.unlock_token = Some(devise_rust::crypto::token_generator::digest(
+        &config.secret_key,
+        devise_rust::lockable::UNLOCK_TOKEN_COLUMN,
+        "raw-unlock-one",
+    ));
+    let user = state.adapter.create(user).await.expect("seed locked user");
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/users/unlock?unlock_token=raw-unlock-one",
+        ))
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/users/sign_in")
+    );
+    let cookies = set_cookie_pairs(&response);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=unlocked")),
+        "{cookies:?}"
+    );
+
+    // The account is actually unlocked in the store.
+    let reloaded = state
+        .adapter
+        .get(&user.to_key())
+        .await
+        .expect("reload")
+        .expect("user persists");
+    assert!(
+        reloaded.locked_at.is_none(),
+        "lock released: {:?}",
+        reloaded.locked_at
     );
 }
 
