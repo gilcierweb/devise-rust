@@ -344,7 +344,13 @@ where
         >,
     >>::Output: Send,
     DB: Backend + BackendWrites<M, Conn> + Send + Sync + 'static,
-    Conn: AsyncConnection<Backend = DB>,
+    // rustc 1.85 (the MSRV) enforces the `Conn: 'static` well-formedness
+    // obligation implied by `LoadQuery<'static, Conn, M>`; rustc 1.98
+    // dropped the implied obligation, which is why only the MSRV leg
+    // failed. Every shipped pool hands out `'static` connection types
+    // (AsyncPgConnection, SyncConnectionWrapper<SqliteConnection>), so
+    // the explicit bound matches every existing instantiation.
+    Conn: AsyncConnection<Backend = DB> + 'static,
 {
     type New = M::New;
 
@@ -459,7 +465,7 @@ where
         >,
     >>::Output: Send,
     DB: Backend + BackendWrites<M, Conn> + Send + Sync + 'static,
-    Conn: AsyncConnection<Backend = DB>,
+    Conn: AsyncConnection<Backend = DB> + 'static,
 {
     /// Shared partial-write path: empty maps short-circuit to a re-read
     /// (missing → `NotFound`); otherwise the backend executes one `UPDATE`
