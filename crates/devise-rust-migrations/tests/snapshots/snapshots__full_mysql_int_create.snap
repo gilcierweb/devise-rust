@@ -24,6 +24,8 @@ CREATE TABLE users (
   unlock_token VARCHAR(255),
   -- stores HMAC-SHA256 digest; raw token only ever in email (devise parity)
   locked_at DATETIME,
+  provider VARCHAR(255),
+  uid VARCHAR(255),
   created_at DATETIME NOT NULL,
   updated_at DATETIME NOT NULL
 );

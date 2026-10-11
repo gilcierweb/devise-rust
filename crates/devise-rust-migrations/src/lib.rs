@@ -57,8 +57,8 @@ pub use emit::emit;
 /// A Devise model module that contributes database columns.
 ///
 /// Only modules that add columns exist here. Devise modules without columns
-/// (`validatable`, `registerable`, `timeoutable`, `omniauthable`) are rejected
-/// at the [`FromStr`] boundary with [`EmitError::UnknownModule`].
+/// (`validatable`, `registerable`, `timeoutable`) are rejected at the
+/// [`FromStr`] boundary with [`EmitError::UnknownModule`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Module {
     /// `email` + `encrypted_password` (`NOT NULL DEFAULT ''`).
@@ -74,6 +74,9 @@ pub enum Module {
     Confirmable,
     /// `failed_attempts`, `locked_at` (+ `unlock_token` for email strategies).
     Lockable,
+    /// `provider` + `uid` (the identity pair only - D-11/D-12: OAuth access
+    /// and refresh tokens stay session-resident and never get columns).
+    Omniauthable,
 }
 
 impl Module {
@@ -87,12 +90,13 @@ impl Module {
             Self::Trackable => "trackable",
             Self::Confirmable => "confirmable",
             Self::Lockable => "lockable",
+            Self::Omniauthable => "omniauthable",
         }
     }
 
     /// Every column-bearing module, in devise heredoc emission order.
     #[must_use]
-    pub const fn all() -> [Self; 6] {
+    pub const fn all() -> [Self; 7] {
         [
             Self::DatabaseAuthenticatable,
             Self::Recoverable,
@@ -100,6 +104,7 @@ impl Module {
             Self::Trackable,
             Self::Confirmable,
             Self::Lockable,
+            Self::Omniauthable,
         ]
     }
 }
@@ -119,7 +124,7 @@ impl FromStr for Module {
     ///
     /// Returns [`EmitError::UnknownModule`] for anything that is not a
     /// column-bearing module — including valid Devise modules that add no
-    /// columns (`validatable`, `registerable`, `timeoutable`, `omniauthable`).
+    /// columns (`validatable`, `registerable`, `timeoutable`).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim() {
             "database_authenticatable" => Ok(Self::DatabaseAuthenticatable),
@@ -128,6 +133,7 @@ impl FromStr for Module {
             "trackable" => Ok(Self::Trackable),
             "confirmable" => Ok(Self::Confirmable),
             "lockable" => Ok(Self::Lockable),
+            "omniauthable" => Ok(Self::Omniauthable),
             other => Err(EmitError::UnknownModule(other.to_owned())),
         }
     }
@@ -484,7 +490,6 @@ mod tests {
             "validatable",
             "registerable",
             "timeoutable",
-            "omniauthable",
             "authenticatable",
             "bogus",
             "",
@@ -495,5 +500,18 @@ mod tests {
                 "unexpected message for {name:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn omniauthable_parses_and_all_grows_by_exactly_one() {
+        // D-11: the omniauthable block is opt-in and emits provider + uid.
+        assert_eq!(
+            Module::from_str("omniauthable").unwrap(),
+            Module::Omniauthable
+        );
+        assert_eq!(Module::Omniauthable.as_str(), "omniauthable");
+        assert_eq!(Module::Omniauthable.to_string(), "omniauthable");
+        assert_eq!(Module::all().len(), 7);
+        assert!(Module::all().contains(&Module::Omniauthable));
     }
 }

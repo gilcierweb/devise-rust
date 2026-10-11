@@ -31,7 +31,9 @@ OPTIONS:
             (default: bigint)
     --modules <csv|all>
             Comma-separated devise module names, or `all` for every
-            column-bearing module (default:
+            column-bearing module. Accepted: database_authenticatable,
+            recoverable, rememberable, trackable, confirmable, lockable,
+            omniauthable (default:
             database_authenticatable,recoverable,rememberable)
     --reconfirmable[=<true|false>]
             Emit `unconfirmed_email` with confirmable (default: true)
@@ -331,6 +333,25 @@ mod tests {
         assert!(!options_from(&cfg).timestamps);
         let cfg = parse_args(&args(&["users", "--existing", "--timestamps"])).unwrap();
         assert!(options_from(&cfg).timestamps);
+    }
+
+    #[test]
+    fn omniauthable_module_parses_on_the_cli_path() {
+        let cfg = parse_args(&args(&["users", "--modules", "omniauthable"])).unwrap();
+        let opts = options_from(&cfg);
+        assert!(opts.modules.contains(&Module::Omniauthable));
+        assert_eq!(opts.modules.len(), 1);
+
+        // Mixed CSV sets accept omniauthable alongside the other modules.
+        let cfg = parse_args(&args(&[
+            "users",
+            "--modules",
+            "database_authenticatable,omniauthable",
+        ]))
+        .unwrap();
+        let opts = options_from(&cfg);
+        assert!(opts.modules.contains(&Module::DatabaseAuthenticatable));
+        assert!(opts.modules.contains(&Module::Omniauthable));
     }
 
     #[test]

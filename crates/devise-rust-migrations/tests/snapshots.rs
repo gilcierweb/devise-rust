@@ -27,6 +27,8 @@ const ALL_COLUMNS: &[&str] = &[
     "last_sign_in_at",
     "current_sign_in_ip",
     "last_sign_in_ip",
+    "provider",
+    "uid",
 ];
 
 fn full_options() -> EmitOptions {
@@ -128,6 +130,8 @@ const EMISSION_ORDER: &[&str] = &[
     "failed_attempts",
     "unlock_token",
     "locked_at",
+    "provider",
+    "uid",
     "created_at",
     "updated_at",
 ];
@@ -240,6 +244,8 @@ fn matrix_minimal_create(#[case] dialect: Dialect) {
         "failed_attempts",
         "unlock_token",
         "index_users_on_reset_password_token",
+        "provider",
+        "uid",
     ] {
         assert!(
             !files.up_sql.contains(absent),
@@ -380,6 +386,71 @@ fn recoverable_adds_its_index_without_confirmation_index() {
     assert!(files.up_sql.contains("index_users_on_reset_password_token"));
     assert!(!files.up_sql.contains("index_users_on_confirmation_token"));
     assert!(!files.up_sql.contains("index_users_on_unlock_token"));
+}
+
+/// D-11: the omniauthable block emits the identity pair as plain string
+/// columns, and D-12: no token-adjacent column ever ships.
+#[rstest]
+#[case(Dialect::Postgres, "provider VARCHAR", "uid VARCHAR")]
+#[case(Dialect::Sqlite, "provider TEXT", "uid TEXT")]
+#[case(Dialect::Mysql, "provider VARCHAR(255)", "uid VARCHAR(255)")]
+fn omniauthable_block_emits_provider_and_uid_and_no_token_column(
+    #[case] dialect: Dialect,
+    #[case] provider_spec: &str,
+    #[case] uid_spec: &str,
+) {
+    let opts = EmitOptions {
+        modules: BTreeSet::from([Module::DatabaseAuthenticatable, Module::Omniauthable]),
+        ..EmitOptions::new("users")
+    }
+    .dialect(dialect);
+    let files = emit(&opts).unwrap();
+
+    // The identity pair as plain string columns.
+    assert!(
+        files.up_sql.contains(provider_spec),
+        "{} up.sql missing {provider_spec:?}",
+        files.up_sql
+    );
+    assert!(
+        files.up_sql.contains(uid_spec),
+        "{} up.sql missing {uid_spec:?}",
+        files.up_sql
+    );
+    // D-12: OAuth tokens are session-only - no token column, no index.
+    for absent in [
+        "access_token",
+        "refresh_token",
+        "oauth_token",
+        "omniauth_token",
+        "index_users_on_provider",
+        "index_users_on_uid",
+    ] {
+        assert!(
+            !files.up_sql.contains(absent),
+            "omniauth block must not emit {absent}"
+        );
+    }
+
+    if dialect == Dialect::Postgres {
+        insta::assert_snapshot!(
+            "omniauthable_block",
+            format!("{}\n---\n{}", files.up_sql, files.down_sql)
+        );
+    }
+}
+
+/// D-11: the omniauthable block is opt-in - omitting the module emits
+/// neither identity column.
+#[test]
+fn omniauthable_omitted_emits_neither_identity_column() {
+    let opts = EmitOptions {
+        modules: BTreeSet::from([Module::DatabaseAuthenticatable]),
+        ..EmitOptions::new("users")
+    };
+    let files = emit(&opts).unwrap();
+    assert!(!files.up_sql.contains("provider"), "{}", files.up_sql);
+    assert!(!files.up_sql.contains("uid"), "{}", files.up_sql);
 }
 
 #[test]

@@ -225,6 +225,20 @@ fn lockable_cols(t: &DialectTypes, opts: &EmitOptions) -> Vec<ColumnDef> {
     cols
 }
 
+/// The omniauthable identity pair (D-11): `provider` + `uid` as plain
+/// string columns, following the `rememberable_cols` shape.
+///
+/// D-12: no token-adjacent column ever ships here - OAuth access and
+/// refresh tokens live in the session for the requesting flow only and are
+/// never persisted.
+fn omniauthable_cols(t: &DialectTypes) -> Vec<ColumnDef> {
+    let string = t.string;
+    vec![
+        ColumnDef::plain("provider", format!("provider {string}")),
+        ColumnDef::plain("uid", format!("uid {string}")),
+    ]
+}
+
 /// Devise column block in heredoc order, honoring module/strategy conditionals.
 pub(crate) fn column_defs(opts: &EmitOptions) -> Vec<ColumnDef> {
     let types = DialectTypes::of(opts.dialect);
@@ -248,6 +262,9 @@ pub(crate) fn column_defs(opts: &EmitOptions) -> Vec<ColumnDef> {
     }
     if modules.contains(&Module::Lockable) {
         cols.extend(lockable_cols(&types, opts));
+    }
+    if modules.contains(&Module::Omniauthable) {
+        cols.extend(omniauthable_cols(&types));
     }
     cols
 }
