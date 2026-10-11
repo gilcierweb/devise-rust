@@ -34,6 +34,9 @@
 //!   ([`devise_for_router`]) translating core `RouteSpec` data into an
 //!   axum `Router`, plus all five controller groups (D-03/D-14), plus the
 //!   09-01 tracer session routes.
+//! - [`omniauth`] — the authorize + callback pair rendering the 09-03
+//!   core omniauth policy over the shared route spec data (POST-only
+//!   authorize, GET-or-POST callback, PKCE-state always-on).
 //! - [`test_helpers`] — `sign_in` / `sign_out` bypass helpers with
 //!   `Set-Cookie` capture and replay, mirroring Devise's
 //!   `IntegrationHelpers` (test-only surface, shipped like the actix
@@ -74,6 +77,7 @@ pub mod callbacks;
 pub mod extractors;
 pub mod failure;
 pub mod layer;
+pub mod omniauth;
 pub mod remember;
 pub mod routes;
 pub mod test_helpers;
@@ -94,6 +98,7 @@ pub use failure::AxumFailureRenderer;
 pub use layer::{
     AuthProxyHandle, DeviseLayer, session_manager_layer, session_manager_layer_with_secure,
 };
+pub use omniauth::{OmniauthWebState, omniauth_router};
 pub use remember::{
     RememberRead, apply_op, apply_ops, attrs_for_scope, clear_op, cookie_for_set,
     derive_remember_key, forget_op, ops_as_set_cookie_headers, read_cookie, removal_cookie,

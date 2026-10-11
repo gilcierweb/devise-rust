@@ -380,6 +380,13 @@ where
     // GET+POST sign-in, the registration root verbs) share one route.
     let mut by_path: BTreeMap<String, Vec<RouteSpec>> = BTreeMap::new();
     for spec in state.mapping.route_specs() {
+        // Omniauth legs mount through [`crate::omniauth::omniauth_router`]
+        // (the omniauthable seam is a per-mount opt-in over the SAME
+        // shared spec data); claiming the paths here would collide with
+        // that mount.
+        if spec.name.contains("omniauth") {
+            continue;
+        }
         if spec.name.contains("unlock")
             && !lockable::unlock_strategy_enabled_for("email", &state.config)
         {
@@ -545,7 +552,7 @@ where
 /// Devise sign-in params arrive scoped (`user[email]=…` form-encoding or
 /// a nested JSON object under the scope singular); both collapse to flat
 /// keys here, mirroring the actix `body_map`.
-pub struct DeviseParams(Map<String, JsonValue>);
+pub struct DeviseParams(pub(crate) Map<String, JsonValue>);
 
 impl<S> FromRequest<S> for DeviseParams
 where
@@ -703,6 +710,64 @@ where
     proxy.user::<M>(scope).cloned()
 }
 
+/// Durable sign-in bookkeeping shared by the password sign-in and the
+/// omniauth callback sign-in paths: the trackable shift
+/// (current→last, now + socket peer) persisted through `update_columns`.
+///
+/// The warden `after_set_user` Authentication hooks are memo-only by the
+/// Phase 5 hook design, so the controllers own the durable write (the
+/// lockable failed-attempt reset is a single call left at the call
+/// sites, where its ordering around the active-for-authentication gate
+/// differs per controller).
+pub(crate) async fn sign_in_bookkeeping<M, A>(
+    record: &mut M,
+    adapter: &A,
+    peer_addr: &str,
+    clock: &dyn Clock,
+) where
+    M: FullDeviseModel,
+    A: OrmAdapter<M> + Send + Sync,
+{
+    // Trackable: shift current→last, stamp now + socket peer (D-11), and
+    // persist durably (the hook owns only the memo copy).
+    record.update_tracked_fields(clock.now(), peer_addr);
+    let fields = HashMap::from([
+        (
+            "sign_in_count".to_string(),
+            AdapterValue::Integer(i64::try_from(record.sign_in_count()).unwrap_or(i64::MAX)),
+        ),
+        (
+            "current_sign_in_at".to_string(),
+            record
+                .current_sign_in_at()
+                .map_or(AdapterValue::Null, |at| {
+                    AdapterValue::String(at.to_rfc3339())
+                }),
+        ),
+        (
+            "last_sign_in_at".to_string(),
+            record.last_sign_in_at().map_or(AdapterValue::Null, |at| {
+                AdapterValue::String(at.to_rfc3339())
+            }),
+        ),
+        (
+            "current_sign_in_ip".to_string(),
+            record
+                .current_sign_in_ip()
+                .map_or(AdapterValue::Null, |ip| {
+                    AdapterValue::String(ip.to_string())
+                }),
+        ),
+        (
+            "last_sign_in_ip".to_string(),
+            record.last_sign_in_ip().map_or(AdapterValue::Null, |ip| {
+                AdapterValue::String(ip.to_string())
+            }),
+        ),
+    ]);
+    drop(adapter.update_columns(&record.to_key(), &fields).await);
+}
+
 // ============================================================================
 // Controllers (D-14)
 // ============================================================================
@@ -789,47 +854,16 @@ where
         return auth_fail(&auth_request, &st, record.inactive_message());
     }
 
-    // Trackable: shift current→last, stamp now + socket peer (D-11), and
-    // persist durably (the hook owns only the memo copy).
-    record.update_tracked_fields(
-        st.clock.now(),
+    // Trackable: the shared durable sign-in bookkeeping (current→last
+    // shift + persist; the Authentication hooks are memo-only by the
+    // Phase 5 hook design).
+    sign_in_bookkeeping(
+        &mut record,
+        st.adapter.as_ref(),
         &auth_request.peer_addr.clone().unwrap_or_default(),
-    );
-    let fields = HashMap::from([
-        (
-            "sign_in_count".to_string(),
-            AdapterValue::Integer(i64::try_from(record.sign_in_count()).unwrap_or(i64::MAX)),
-        ),
-        (
-            "current_sign_in_at".to_string(),
-            record
-                .current_sign_in_at()
-                .map_or(AdapterValue::Null, |at| {
-                    AdapterValue::String(at.to_rfc3339())
-                }),
-        ),
-        (
-            "last_sign_in_at".to_string(),
-            record.last_sign_in_at().map_or(AdapterValue::Null, |at| {
-                AdapterValue::String(at.to_rfc3339())
-            }),
-        ),
-        (
-            "current_sign_in_ip".to_string(),
-            record
-                .current_sign_in_ip()
-                .map_or(AdapterValue::Null, |ip| {
-                    AdapterValue::String(ip.to_string())
-                }),
-        ),
-        (
-            "last_sign_in_ip".to_string(),
-            record.last_sign_in_ip().map_or(AdapterValue::Null, |ip| {
-                AdapterValue::String(ip.to_string())
-            }),
-        ),
-    ]);
-    drop(st.adapter.update_columns(&record.to_key(), &fields).await);
+        st.clock.as_ref(),
+    )
+    .await;
 
     // Rememberable: durable `remember_me` BEFORE set_user (the core
     // rememberable-set hook owns the cookie intent and reads the flag).

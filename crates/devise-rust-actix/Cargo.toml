@@ -18,6 +18,10 @@ devise-rust = { path = "../devise-rust" }
 # — Pitfall 6 / RESEARCH.md); actix-session 0.11 pairs with it.
 actix-web = { version = "~4.12", default-features = false }
 actix-session = { version = "0.11", features = ["cookie-session"], default-features = false }
+# oauth2 5.0: generic OAuth2 client types for the omniauth authorize +
+# callback pair (09-04; same workspace pin as the core + axum crates,
+# registry-OK per the 09-RESEARCH package audit; rust-version 1.65).
+oauth2 = "5.0"
 futures-util = { version = "0.3", default-features = false }
 async-trait.workspace = true
 chrono.workspace = true

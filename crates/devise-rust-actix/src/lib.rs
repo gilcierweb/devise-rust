@@ -16,6 +16,9 @@
 //!   CSRF-rotation hook for `clean_up_csrf_token_on_authentication`.
 //! - [`extractors`] — `Auth<M>` / `RequireAuth` / per-scope helper fns.
 //! - [`routes`] — `devise_for` route spec → actix `Scope` translator.
+//! - [`omniauth`] — the authorize + callback pair rendering the 09-03
+//!   core omniauth policy over the shared route spec data (POST-only
+//!   authorize, GET-or-POST callback, PKCE-state always-on).
 //! - [`test_helpers`] — `sign_in`/`sign_out`/bypass helpers for
 //!   `actix_web::test`, mirroring Devise's `IntegrationHelpers`.
 
@@ -26,6 +29,7 @@ pub mod callbacks;
 pub mod extractors;
 pub mod failure;
 pub mod middleware;
+pub mod omniauth;
 pub mod remember;
 pub mod routes;
 pub mod test_helpers;
@@ -40,6 +44,7 @@ pub use extractors::{
 };
 pub use failure::ActixFailureRenderer;
 pub use middleware::{DeviseMiddleware, DeviseMiddlewareConfig, ResolvedAuth, ResolvedAuthHandle};
+pub use omniauth::{OmniauthWebState, devise_omniauth_scope};
 pub use remember::{
     RememberRead, apply_op, apply_ops, attrs_for_scope, clear_op, cookie_for_set,
     derive_remember_key, forget_op, read_cookie, removal_cookie, resolve_inbound,

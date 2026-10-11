@@ -1181,6 +1181,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "futures-util",
+ "oauth2",
  "pretty_assertions",
  "regex",
  "rstest",
