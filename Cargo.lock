@@ -1151,6 +1151,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hmac 0.13.0",
+ "oauth2",
  "once_cell",
  "pretty_assertions",
  "regex",

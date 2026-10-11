@@ -21,6 +21,7 @@
 //! - `confirmable` - `Confirmable` email confirmation (chain position 6, before `Lockable`): digest-only tokens, reconfirmable postponement, resend reuse, paranoid uniformity
 //! - `lockable` - `Lockable` attempt counting (chain position 7, after `Confirmable`): counter-to-lock, time/email/both strategies, digest-only unlock tokens, paranoid suppression
 //! - `mailer` - `Mailer` trait (5 actions), `MailerContext`, `TestMailer`, Tera templates
+//! - `omniauthable` - `Omniauthable` generic `OAuth2` (chain position 3, after `Rememberable`): provider config, always-on PKCE + state, `ProviderProfile`, `from_omniauth` seam, default find-link-create policy
 //! - `proxy` - `AuthProxy` session and strategy execution
 //! - `rememberable` - `Rememberable` persistent sessions (chain position 1, after `DatabaseAuthenticatable`): cookie codec, 5-condition check, hardened attributes
 //! - `request` - `AuthRequest`, `RequestFlags`, `HttpMethod`
@@ -50,6 +51,7 @@ pub mod i18n;
 pub mod lockable;
 pub mod mailer;
 pub mod model;
+pub mod omniauthable;
 pub mod parameter;
 pub mod proxy;
 pub mod rememberable;

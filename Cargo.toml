@@ -53,6 +53,10 @@ subtle = "2.5"
 # tera: template engine for Devise mailer bodies (RESEARCH.md standard stack; package-audit OK)
 tera = "1.19"
 regex = "1.10"
+# oauth2 5.0: generic OAuth2 client for the omniauthable module (09-RESEARCH
+# package-audit OK; typestate BasicClient, PKCE, CSRF state; default features
+# pull reqwest + rustls, re-exported only through omniauthable)
+oauth2 = "5.0"
 insta = "1.49"
 rstest = "0.27"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

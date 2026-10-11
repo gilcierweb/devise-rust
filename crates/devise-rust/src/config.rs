@@ -174,6 +174,8 @@ pub struct DeviseConfig {
     pub clean_up_csrf_token_on_authentication: bool,
     /// `OmniAuth` path prefix (default: nil)
     pub omniauth_path_prefix: Option<String>,
+    /// `OmniAuth` provider name allowlist (default: [])
+    pub omniauth_providers: Vec<String>,
 
     // Behavior flags
     /// Paranoid mode - uniform failure messages + dummy password hash on missing users
@@ -240,6 +242,7 @@ impl Default for DeviseConfig {
             reload_routes: true,
             clean_up_csrf_token_on_authentication: true,
             omniauth_path_prefix: None,
+            omniauth_providers: vec![],
             paranoid: false,
             send_email_changed_notification: false,
             send_password_change_notification: false,
@@ -303,6 +306,7 @@ pub struct DeviseConfigOverride {
     pub reload_routes: Option<bool>,
     pub clean_up_csrf_token_on_authentication: Option<bool>,
     pub omniauth_path_prefix: Option<String>,
+    pub omniauth_providers: Option<Vec<String>>,
     pub paranoid: Option<bool>,
     pub send_email_changed_notification: Option<bool>,
     pub send_password_change_notification: Option<bool>,
@@ -369,7 +373,8 @@ impl DeviseConfigOverride {
             parent_controller,
             parent_mailer,
             navigational_formats,
-            responder
+            responder,
+            omniauth_providers
         );
 
         // Option assignment (config: Option<T>, override: Option<T>)
