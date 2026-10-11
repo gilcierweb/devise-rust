@@ -1260,5 +1260,39 @@ Blocks that exercise Ruby or Rails runtime machinery (concern inclusion, load ho
 
 Every waived and deviated row above carries its per-case written reason and v1 impact (D-12); no block is unaccounted for (D-11). Reversing any waiver reopens the corresponding test work and invalidates the v1 scope statement that relies on it; the reversal cost is flagged in the phase SUMMARY.
 
-The TEST-03 security re-green evidence (the 8-item regression list) and the TEST-02 framework-leg matrix with per-leg commands and outcomes are appended below by the plan's second task after they run on the current tree.
+The TEST-03 security re-green evidence (the 8-item regression list) and the TEST-02 framework-leg matrix below were appended by the plan's second task after running them on the current tree (2026-10-11). No regression was found: every gate ran green with zero fixes required.
+
+## TEST-03: security regression re-green (8 items, run 2026-10-11)
+
+Per D-13, each of the 8 items re-ran on the current tree through its asserting test. Every item is green; none required a fix.
+
+| # | Regression item | Proving test | Command run | Outcome |
+|---|---|---|---|---|
+| 1 | Paranoid timing: dummy bcrypt on unknown account plus uniform `:invalid` message | `crates/devise-rust/src/strategy.rs tests (test_paranoid_strategy_masks_not_found)` | `cargo test -p devise-rust --lib test_paranoid_strategy_masks_not_found` | green: 1 passed, 0 failed |
+| 2 | Session salt invalidation on password change (stale session rejected) | `crates/devise-rust/src/session.rs tests (test_session_salt_mismatch_deletes_key)` plus both framework `flow_two_cookie_jar_password_change_kills_session_and_remember` | `cargo test -p devise-rust --lib test_session_salt_mismatch_deletes_key`; `cargo test -p devise-rust-axum --test devise_flows`; `cargo test -p devise-rust-actix --test devise_flows` | green: 1 passed core, both flow suites green (the two cookie jar regression: salt plus remember_created_at) |
+| 3 | Reconfirmable forced `unconfirmed_email` write for the #5783 race | `crates/devise-rust/src/confirmable.rs tests (confirmable_5783_double_submit_keeps_victim_unconfirmed)` | `cargo test -p devise-rust --lib confirmable_5783_double_submit_keeps_victim_unconfirmed` | green: 1 passed, 0 failed |
+| 4 | Blank token guards on token lookups (confirm, unlock, reset) | `confirmable_tracer_blank_token_touches_no_adapter`, `lockable_unlock_access_by_token_blank_touches_no_adapter`, `model.rs reset_password_by_token_guards` | `cargo test -p devise-rust --lib` (all three named tests) | green: each 1 passed, 0 failed |
+| 5 | `update_with_password` never persists on failure | `crates/devise-rust-axum/tests/devise_flows.rs (flow_account_update_requires_current_password)` plus core `database_authenticatable_methods` | `cargo test -p devise-rust-axum --test devise_flows flow_account_update_requires_current_password` | green: 1 passed, 0 failed (invalid current password leaves the record unmodified) |
+| 6 | `email_changed` recipient is the original address | `crates/devise-rust/tests/notifications.rs (email_change_notification_goes_to_original_address)` | `cargo test -p devise-rust --test notifications` | green: 4 passed, 0 failed |
+| 7 | Remember cookie 5-condition check | `crates/devise-rust/src/rememberable.rs tests (rememberable_nil_case_* matrix, rememberable_nil_case_wrong_token, rememberable_password_rotation_kills_older_cookies)` | `cargo test -p devise-rust --lib rememberable_nil_case` | green: full nil-case matrix passed inside the 241-test lib run |
+| 8 | Open redirect guard on timeout redirect targets (devise 5.0.4 Referer fix equivalent) | `crates/devise-rust/src/request.rs tests (test_parse_stored_uri: external hosts rejected)` plus `failure.rs test_stored_location` and `test_recall_target` | `cargo test -p devise-rust --lib test_parse_stored_uri test_stored_location test_recall_target` | green: each 1 passed, 0 failed (`http://example.com/...` and `https://...` stored targets are rejected) |
+
+## TEST-02: framework-leg matrix (run 2026-10-11)
+
+Both harnesses exist on the current tree: the Phase 8 actix harness (`actix_web::test` in `crates/devise-rust-actix/tests/devise_flows.rs`) and the Phase 9 axum harness (`tower::ServiceExt` oneshot with the stub provider in `crates/devise-rust-axum/tests/devise_flows.rs`). No leg is gated; every leg below ran green.
+
+| Leg | Command run | Outcome |
+|---|---|---|
+| axum session bridge | `cargo test -p devise-rust-axum --test session_bridge` | green: 24 passed, 0 failed |
+| axum extractors | `cargo test -p devise-rust-axum --test extractors` | green: 5 passed, 0 failed |
+| axum routes | `cargo test -p devise-rust-axum --test routes` | green: 13 passed, 0 failed |
+| axum full browser-parity flow matrix | `cargo test -p devise-rust-axum --test devise_flows` | green: 11 passed, 0 failed (sign up, confirm, sign in plus remember, edit account, lock and unlock, reset, sign out, two cookie jar regression, renewal rotation, stored location) |
+| axum omniauth flows | `cargo test -p devise-rust-axum --test omniauth_flows` | green: 10 passed, 0 failed (stub provider, real jar replay) |
+| actix full browser-parity flow matrix | `cargo test -p devise-rust-actix --test devise_flows` | green: 10 passed, 0 failed (same matrix as the axum leg) |
+| actix extractors | `cargo test -p devise-rust-actix --test extractors` | green: 8 passed, 0 failed |
+| actix routes | `cargo test -p devise-rust-actix --test routes` | green: 8 passed, 0 failed |
+| actix session bridge | `cargo test -p devise-rust-actix --test session_bridge` | green: 3 passed, 0 failed |
+| actix omniauth flows | `cargo test -p devise-rust-actix --test omniauth_flows` | green: 10 passed, 0 failed |
+
+Supporting TEST-01 and gate runs on the same tree: `cargo test -p devise-rust` green (241 lib, 5 model_validation, 4 notifications, 44 doctests), `cargo test -p devise-rust-migrations` green (43 tests across the lib and snapshot matrix), `cargo test -p devise-rust --lib scope` green (23 passed), `cargo test -p devise-rust --lib omniauthable` green (17 passed), `cargo clippy --all-targets --all-features -- -D warnings` green (exit 0, no warnings), `cargo fmt --all -- --check` green (exit 0).
 
