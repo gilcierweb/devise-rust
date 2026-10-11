@@ -41,9 +41,14 @@
 //!    `AuthProxy` with the configured finders, staged in extensions as
 //!    [`AuthProxyHandle`] for extractors and handlers.
 //! 6. After the inner service responds, the remember-cookie outbox
-//!    drains into `Set-Cookie` headers: hardened `Set` cookies via the
-//!    core attribute renderer, `Clear` tombstones for deletes. (The
-//!    signed-jar transport lands with the remember wiring in 09-02.)
+//!    drains into signed `Set-Cookie` headers (the 09-02 transport):
+//!    `Set` ops carry the core codec value through the cookie 0.18
+//!    signed jar — the same lineage the session cookie signs with —
+//!    dressed in the hardened attributes; `Clear` ops render signed
+//!    tombstones. Inbound, the resolved scope's remember cookie is
+//!    signature-verified so the core strategy reads the plaintext
+//!    triple (a failed verify keeps the raw value, which the strategy
+//!    classifies as stale — delete and pass through).
 //!
 //! ## Options
 //!
@@ -196,7 +201,19 @@ where
             let mapping: Option<Mapping> = layer.registry.find_by_path(&path).cloned();
 
             // Owned snapshot of the request for core decisions.
-            let auth_request = build_auth_request(&req, &layer.config);
+            let mut auth_request = build_auth_request(&req, &layer.config);
+
+            // Inbound remember transport (09-02): unwrap the signature on
+            // the resolved scope's remember cookie so the core strategy
+            // reads the plaintext triple. A failed verify KEEPS the raw
+            // value — the strategy then classifies it as stale and the
+            // response pipeline renders the delete tombstone (unsigned
+            // 09-01-era cookies still parse, backward compatible).
+            if let Some(mapping) = &mapping {
+                if mapping.has_module(devise_rust::scope::Module::Rememberable) {
+                    verify_inbound_remember_cookie(&mut auth_request, &layer.config, &mapping.name);
+                }
+            }
 
             // Bridge store over the cloned session (Clone + Send + Sync —
             // no owned-extract dance) plus the per-request proxy.
@@ -235,10 +252,10 @@ where
 
             let mut response = inner.call(req).await?;
 
-            // Drain the remember-cookie outbox into Set-Cookie (Set ops
-            // render the hardened attributes; Clear ops delete).
+            // Drain the remember-cookie outbox into signed Set-Cookie
+            // headers (the 09-02 transport; codec validation stays core).
             let ops = handle.lock().await.take_remember_cookie_ops();
-            apply_remember_ops(&mut response, &ops);
+            apply_remember_ops(&mut response, &layer.config, &ops);
             Ok(response)
         })
     }
@@ -326,37 +343,62 @@ async fn fetch_session_record(
     Some(record)
 }
 
-/// Render the drained remember-cookie intents onto the response.
+/// Render the drained remember-cookie intents onto the response as
+/// SIGNED `Set-Cookie` headers (the 09-02 transport).
 ///
-/// `Set` ops carry core-rendered hardened attributes (`HttpOnly`, `Secure`,
-/// `SameSite=Lax`, `Expires`); `Clear` ops render a deletion tombstone. The
-/// signed-jar transport (axum-extra `SignedCookieJar`) is the 09-02
-/// remember wiring; the codec + five-condition check in core carry the
-/// validation security here.
-fn apply_remember_ops<ResBody>(response: &mut Response<ResBody>, ops: &[RememberCookieOp]) {
-    for op in ops {
-        let header = match op {
-            RememberCookieOp::Set { value, attrs, .. } => attrs.to_set_cookie_header(value),
-            RememberCookieOp::Clear { key, .. } => {
-                format!("{key}=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; Path=/")
-            }
-        };
+/// `Set` ops carry the core codec value signed with the Devise-derived
+/// key (cookie 0.18 `SignedJar`, the session cookie's own lineage) plus
+/// the core-rendered hardened attributes; `Clear` ops render signed
+/// tombstones. The 5-condition check and the strict integer-epoch parse
+/// live in core; this is transport only.
+///
+/// A `Config` secret too short for derivation skips the ops — unreachable
+/// for a correctly wired app, whose session layer already failed closed
+/// on the same secret at construction.
+fn apply_remember_ops<ResBody>(
+    response: &mut Response<ResBody>,
+    config: &DeviseConfig,
+    ops: &[RememberCookieOp],
+) {
+    if ops.is_empty() {
+        return;
+    }
+    let Ok(key) = crate::remember::derive_remember_key(config) else {
+        return;
+    };
+    for header in crate::remember::ops_as_set_cookie_headers(&key, ops) {
         if let Ok(value) = HeaderValue::from_str(&header) {
             response.headers_mut().append(header::SET_COOKIE, value);
         }
     }
 }
 
-/// Build the session layer over the D-01 `MemoryStore` default with the
-/// security posture the phase contract pins:
+/// Signature-verify the resolved scope's inbound remember cookie, swapping
+/// the raw value for the verified plaintext when the signature holds.
 ///
-/// - `SameSite=Lax` — tower-sessions defaults to `Strict`, which withholds
-///   the session cookie on the cross-site OAuth provider→app callback and
-///   breaks the PKCE/state round-trip (Pitfall 6);
-/// - signed cookie over the Devise-derived [`Key`](tower_sessions::cookie::Key)
-///   (id-forgery probing hits an HMAC, not the store);
-/// - `HttpOnly` and `Secure` on (the plain-HTTP `Secure` opt-out is
-///   example-config-only, 09-02).
+/// A failed verify keeps the raw value: the core rememberable strategy
+/// then cannot decode it and reports a stale cookie, which the response
+/// pipeline deletes (delete-and-pass-through, never `Failure`).
+fn verify_inbound_remember_cookie(
+    auth_request: &mut AuthRequest,
+    config: &DeviseConfig,
+    scope: &str,
+) {
+    let name = devise_rust::rememberable::remember_cookie_key(scope, config);
+    let Some(raw) = auth_request.cookies.get(&name) else {
+        return;
+    };
+    let Ok(key) = crate::remember::derive_remember_key(config) else {
+        return;
+    };
+    if let Some(verified) = crate::remember::verified_cookie_value(&key, &name, raw) {
+        auth_request.cookies.insert(name, verified);
+    }
+}
+
+/// Build the session layer over the D-01 `MemoryStore` default with the
+/// security posture the phase contract pins (production default:
+/// `Secure` on).
 ///
 /// # Errors
 ///
@@ -372,11 +414,30 @@ fn apply_remember_ops<ResBody>(response: &mut Response<ResBody>, ops: &[Remember
 pub fn session_manager_layer(
     config: &DeviseConfig,
 ) -> Result<SessionManagerLayer<MemoryStore, SignedCookie>, DeviseError> {
+    session_manager_layer_with_secure(config, true)
+}
+
+/// [`session_manager_layer`] with an explicit `Secure` attribute.
+///
+/// The ONLY sanctioned opt-out surface for plain-HTTP local development
+/// (the browser-parity example runs `secure(false)` behind a loud
+/// comment; production apps keep the `session_manager_layer` default).
+/// Everything else keeps the phase posture: `SameSite=Lax`, signed
+/// cookie over the Devise-derived key, `HttpOnly`.
+///
+/// # Errors
+///
+/// Returns [`DeviseError::Config`] when the Devise `secret_key` is empty
+/// (key derivation refuses empty secrets).
+pub fn session_manager_layer_with_secure(
+    config: &DeviseConfig,
+    secure: bool,
+) -> Result<SessionManagerLayer<MemoryStore, SignedCookie>, DeviseError> {
     let key = crate::callbacks::derive_session_key(&config.secret_key)?;
     Ok(SessionManagerLayer::new(MemoryStore::default())
         .with_same_site(SameSite::Lax)
         .with_http_only(true)
-        .with_secure(true)
+        .with_secure(secure)
         .with_signed(key))
 }
 

@@ -1156,8 +1156,15 @@ async fn remember_ops_drain_into_set_cookie() {
 
     let set = set_cookies
         .iter()
-        .find(|c| c.starts_with("remember_user_token=encoded-cookie-triple"))
+        .find(|c| c.starts_with("remember_user_token="))
         .expect("Set op drained into Set-Cookie");
+    // 09-02 signed transport: the value is the 44-char HMAC digest prefix
+    // followed by the core codec payload in plaintext (cookie 0.18
+    // signed-jar semantics — the 09-01 unsigned intermediate is closed).
+    assert!(
+        set.contains("encoded-cookie-triple"),
+        "signed value carries the core codec payload: {set}"
+    );
     assert!(set.contains("HttpOnly"));
     assert!(set.contains("Secure"));
     assert!(set.contains("SameSite=Lax"));
