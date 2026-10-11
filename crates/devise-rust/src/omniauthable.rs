@@ -28,6 +28,27 @@
 //! [`DeviseConfig`](crate::config::DeviseConfig), mirroring Devise's
 //! `devise :omniauthable, omniauth_providers: [...]`.
 //!
+//! == The model seam
+//!
+//! [`Omniauthable`] carries the REQUIRED [`from_omniauth`](Omniauthable::from_omniauth)
+//! method (D-08): the Devise convention `User.from_omniauth(auth)` where the
+//! app owns the handoff. The core DEFAULT policy
+//! ([`default_from_omniauth`]) implements find-by-identity, link on VERIFIED
+//! email only, else create (D-09/D-10); apps override by writing their own
+//! trait method body.
+//!
+//! Super-chain position: third, after `DatabaseAuthenticatable` and
+//! `Rememberable` (`database_authenticatable -> rememberable -> omniauthable
+//! -> ...` from `devise/lib/devise/modules.rb`).
+//!
+//! == Token contract (D-12)
+//!
+//! OAuth access and refresh tokens live in the SESSION for the duration of
+//! the requesting flow only; the trait never receives them and they never
+//! reach the database. Only the identity pair (`provider` + `uid`)
+//! persists; [`ProviderProfile`] carries the identity pair plus display
+//! claims, never tokens.
+//!
 //! == Examples
 //!
 //! ```ignore
@@ -47,14 +68,20 @@
 //! assert!(!verify_state(Some(&start.state), Some("tampered")));
 //! ```
 
+use crate::adapter::{Conditions, OrmAdapter, OrmError, Value};
 use crate::crypto::secure_compare;
-use crate::error::DeviseError;
+use crate::error::{DeviseError, ResourceWithErrors, ValidationErrors};
+use crate::model::Authenticatable;
+use crate::time::Clock;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use oauth2::basic::BasicClient;
 use oauth2::{
     AuthUrl, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet, PkceCodeChallenge,
     RedirectUrl, Scope, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// The `oauth2` crate's reqwest re-export, namespaced behind this module.
 ///
@@ -355,6 +382,234 @@ pub fn verify_state(stashed_state: Option<&str>, returned_state: Option<&str>) -
     }
 }
 
+/// The `Omniauthable` model module - the `from_omniauth` seam (D-08).
+///
+/// Devise's convention is `User.from_omniauth(request.env["omniauth.auth"])`:
+/// the app owns the handoff. Core mirrors this as a REQUIRED trait method
+/// with no default body - router-registered callback closures are rejected
+/// by design. Apps wanting Devise's standard behavior delegate to
+/// [`default_from_omniauth`], which implements find-by-identity, link on
+/// VERIFIED email only, else create (D-09/D-10).
+///
+/// Super-chain position: third, after `DatabaseAuthenticatable` and
+/// `Rememberable` (`database_authenticatable -> rememberable ->
+/// omniauthable -> ...` from `devise/lib/devise/modules.rb`).
+///
+/// == Options
+///
+/// * `omniauth_providers` (config) - the provider-name allowlist the
+///   framework handlers check at request time.
+///
+/// == Examples
+///
+/// ```ignore
+/// #[async_trait]
+/// impl Omniauthable for User {
+///     type New = NewUser;
+///
+///     async fn from_omniauth<A>(
+///         profile: ProviderProfile,
+///         adapter: &A,
+///         clock: &dyn Clock,
+///     ) -> ResourceWithErrors<Self>
+///     where
+///         Self: Sized,
+///         A: OrmAdapter<Self, New = Self::New> + Send + Sync,
+///     {
+///         default_from_omniauth(adapter, &profile, clock).await
+///     }
+///
+///     fn new_from_profile(profile: &ProviderProfile, now: DateTime<Utc>) -> Self::New {
+///         NewUser {
+///             email: profile.email.clone().unwrap_or_default(),
+///             provider: Some(profile.provider.clone()),
+///             uid: Some(profile.uid.clone()),
+///             name: profile.name.clone(),
+///             created_at: Some(now),
+///         }
+///     }
+/// }
+/// ```
+#[async_trait]
+pub trait Omniauthable: Authenticatable {
+    /// The insert shape [`default_from_omniauth`] persists on the create
+    /// path - the same `New` type the app's
+    /// [`OrmAdapter`](crate::adapter::OrmAdapter) consumes.
+    type New: Send + Sync + 'static;
+
+    /// Devise's `from_omniauth` seam (REQUIRED - no default body, D-08).
+    ///
+    /// Returns the record-with-errors flow value the other modules use
+    /// ([`ResourceWithErrors`]), never a bare `Option`: an empty `errors`
+    /// set means the record is ready to sign in, a populated one means the
+    /// caller renders the failure path.
+    ///
+    /// == Token contract (D-12)
+    ///
+    /// This method NEVER receives access or refresh tokens: they live in
+    /// the session for the requesting flow only and never reach the model
+    /// or the database. [`ProviderProfile`] carries only the identity pair
+    /// plus display claims.
+    async fn from_omniauth<A>(
+        profile: ProviderProfile,
+        adapter: &A,
+        clock: &dyn Clock,
+    ) -> ResourceWithErrors<Self>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self, New = Self::New> + Send + Sync;
+
+    /// Build the insert shape for a new identity row (the create path of
+    /// [`default_from_omniauth`]).
+    ///
+    /// `now` is the flow's authoritative instant from `clock`, so created
+    /// rows stamp `created_at` consistently regardless of backend
+    /// auto-stamping.
+    fn new_from_profile(profile: &ProviderProfile, now: DateTime<Utc>) -> Self::New;
+
+    /// Normalize an incoming profile before the policy runs (defaulted hook).
+    ///
+    /// Override to downcase emails, trim whitespace, or map vendor-specific
+    /// claim shapes. [`default_from_omniauth`] runs the profile through
+    /// this hook first.
+    #[must_use]
+    fn normalize_profile(profile: ProviderProfile) -> ProviderProfile {
+        profile
+    }
+}
+
+/// Core DEFAULT find-link-create policy (D-09) behind the verified gate (D-10).
+///
+/// 1. Look up `find_first` on `(provider, uid)` and return the row on hit.
+/// 2. Else look up `find_first` on email: when the profile asserts
+///    `email_verified` true, persist `provider` + `uid` onto the row and
+///    return it. When the email is unverified - or the claim is absent,
+///    which deserializes to `false` - linking is skipped entirely and a new
+///    row is created: unverified provider emails NEVER link to an existing
+///    account (T-09-08 security boundary, not a nicety).
+/// 3. When no email row exists, create a new row with provider, uid,
+///    email, and name via [`Omniauthable::new_from_profile`].
+///
+/// Lookup failures surface as a blank record carrying errors (the same flow
+/// as `find_or_initialize_with_errors`); persist failures return the best
+/// available record with errors, so callers render the failure path instead
+/// of signing in - nothing fails silently.
+///
+/// == Examples
+///
+/// ```ignore
+/// let outcome: ResourceWithErrors<User> =
+///     default_from_omniauth(&adapter, &profile, &clock).await;
+/// if outcome.is_valid() {
+///     proxy.set_user("user", Some(Box::new(outcome.record)), SetUserOpts {
+///         event: SetUserEvent::Authentication, ..SetUserOpts::default()
+///     }).await?;
+/// }
+/// ```
+pub async fn default_from_omniauth<M, A>(
+    adapter: &A,
+    profile: &ProviderProfile,
+    clock: &dyn Clock,
+) -> ResourceWithErrors<M>
+where
+    M: Omniauthable + Default + Sized + Send + Sync + 'static,
+    A: OrmAdapter<M, New = <M as Omniauthable>::New> + Send + Sync,
+{
+    let profile = M::normalize_profile(profile.clone());
+
+    // 1. Existing identity pair: return the row untouched.
+    let mut identity = Conditions::new();
+    identity.insert(PROVIDER_COLUMN, profile.provider.as_str());
+    identity.insert(UID_COLUMN, profile.uid.as_str());
+    if let Ok(Some(record)) = adapter.find_first(&identity).await {
+        return ResourceWithErrors::new(record, ValidationErrors::new());
+    }
+
+    // 2. Email collision: link ONLY on a provider-asserted verified email.
+    if let Some(email) = profile.email.as_deref() {
+        let mut by_email = Conditions::new();
+        by_email.insert("email", email);
+        if let Ok(Some(existing)) = adapter.find_first(&by_email).await {
+            if profile.email_verified {
+                let mut fields = HashMap::new();
+                fields.insert(
+                    PROVIDER_COLUMN.to_string(),
+                    Value::from(profile.provider.as_str()),
+                );
+                fields.insert(UID_COLUMN.to_string(), Value::from(profile.uid.as_str()));
+                if let Ok(linked) = adapter.update_columns(&existing.to_key(), &fields).await {
+                    return ResourceWithErrors::new(linked, ValidationErrors::new());
+                }
+                // The row stays unlinked; the caller sees the errors.
+                let mut errors = ValidationErrors::new();
+                errors.add(PROVIDER_COLUMN, ":invalid");
+                return ResourceWithErrors::new(existing, errors);
+            }
+            // Unverified: fall through to create-new. NEVER link (T-09-08).
+        }
+    }
+
+    // 3. Create the new identity row.
+    let new = M::new_from_profile(&profile, clock.now());
+    match adapter.create(new).await {
+        Ok(created) => ResourceWithErrors::new(created, ValidationErrors::new()),
+        Err(orm_error) => {
+            let mut errors = ValidationErrors::new();
+            if matches!(orm_error, OrmError::UniqueViolation { .. }) {
+                errors.add("email", ":taken");
+            } else {
+                errors.add(PROVIDER_COLUMN, ":invalid");
+            }
+            ResourceWithErrors::new(M::default(), errors)
+        }
+    }
+}
+
+/// `devise.omniauth_callbacks.failure` flash text.
+///
+/// Mirrors the Devise callbacks controller's
+/// `set_flash_message! :alert, :failure, kind: ..., reason: ...` with the
+/// vendored en.yml copy: `Could not authenticate you from %{kind} because
+/// "%{reason}".`
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::omniauthable::failure_message;
+///
+/// assert_eq!(
+///     failure_message("GitHub", "Invalid credentials"),
+///     "Could not authenticate you from GitHub because \"Invalid credentials\"."
+/// );
+/// ```
+#[must_use]
+pub fn failure_message(kind: &str, reason: &str) -> String {
+    crate::i18n::translate(
+        "devise.omniauth_callbacks.failure",
+        &[("kind", kind), ("reason", reason)],
+    )
+}
+
+/// `devise.omniauth_callbacks.success` flash text.
+///
+/// Mirrors the callbacks controller's success flash with the vendored
+/// en.yml copy: `Successfully authenticated from %{kind} account.`
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::omniauthable::success_message;
+///
+/// assert_eq!(
+///     success_message("GitHub"),
+///     "Successfully authenticated from GitHub account."
+/// );
+/// ```
+#[must_use]
+pub fn success_message(kind: &str) -> String {
+    crate::i18n::translate("devise.omniauth_callbacks.success", &[("kind", kind)])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +736,402 @@ mod tests {
         assert_eq!(
             resolved.omniauth_providers,
             vec!["github".to_string(), "stub".to_string()]
+        );
+    }
+
+    // ========================================================================
+    // Default linking-policy matrix (D-09/D-10) over the MemoryAdapter oracle
+    // ========================================================================
+
+    use crate::adapter::DeviseKey;
+    use crate::adapter::memory::MemoryAdapter;
+    use crate::failure::AnyDeviseModel;
+    use crate::hooks::{HookRegistry, register_devise_hooks};
+    use crate::proxy::{AuthProxy, SetUserEvent, SetUserOpts};
+    use crate::scope::{Mapping, Module, PathNames, SignOutVia};
+    use crate::session::{SessionStore, keys};
+    use crate::time::FixedClock;
+    use chrono::TimeZone;
+
+    /// Identity-carrying test model: the omniauthable column surface plus the
+    /// `database_authenticatable` pair.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    struct OmniUser {
+        id: i64,
+        email: String,
+        encrypted_password: String,
+        provider: Option<String>,
+        uid: Option<String>,
+        name: Option<String>,
+        created_at: Option<DateTime<Utc>>,
+    }
+
+    impl AnyDeviseModel for OmniUser {
+        fn to_key(&self) -> DeviseKey {
+            DeviseKey::from_i64(self.id)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl Authenticatable for OmniUser {}
+
+    #[async_trait]
+    impl Omniauthable for OmniUser {
+        type New = OmniUser;
+
+        // D-08: the required seam - apps delegate to the default policy.
+        async fn from_omniauth<A>(
+            profile: ProviderProfile,
+            adapter: &A,
+            clock: &dyn Clock,
+        ) -> ResourceWithErrors<Self>
+        where
+            Self: Sized,
+            A: OrmAdapter<Self, New = Self::New> + Send + Sync,
+        {
+            default_from_omniauth(adapter, &profile, clock).await
+        }
+
+        fn new_from_profile(profile: &ProviderProfile, now: DateTime<Utc>) -> Self::New {
+            OmniUser {
+                id: 0,
+                email: profile.email.clone().unwrap_or_default(),
+                encrypted_password: String::new(),
+                provider: Some(profile.provider.clone()),
+                uid: Some(profile.uid.clone()),
+                name: profile.name.clone(),
+                created_at: Some(now),
+            }
+        }
+    }
+
+    fn omni_profile(email: Option<&str>, email_verified: bool) -> ProviderProfile {
+        ProviderProfile {
+            provider: "stub".to_string(),
+            uid: "uid-42".to_string(),
+            email: email.map(ToString::to_string),
+            email_verified,
+            name: Some("Stub User".to_string()),
+            raw_claims: serde_json::json!({ "sub": "uid-42" }),
+        }
+    }
+
+    async fn seed_row(adapter: &MemoryAdapter<OmniUser>, email: &str) {
+        // The MemoryAdapter oracle assigns synthetic storage keys 1, 2, ... in
+        // create order and returns the model unchanged; mirroring the key in
+        // the fixture id keeps `to_key()` resolvable (real backends return
+        // the DB-assigned id from the adapter, so no alignment is needed).
+        adapter
+            .create(OmniUser {
+                id: 1,
+                email: email.to_string(),
+                encrypted_password: "$2a$12$seededhash".to_string(),
+                provider: None,
+                uid: None,
+                name: None,
+                created_at: None,
+            })
+            .await
+            .expect("seed row");
+    }
+
+    #[tokio::test]
+    async fn omniauthable_policy_returns_existing_identity_row() {
+        let adapter = MemoryAdapter::<OmniUser>::new();
+        // A row already carrying this exact identity pair.
+        adapter
+            .create(OmniUser {
+                id: 0,
+                email: "known@example.com".to_string(),
+                encrypted_password: String::new(),
+                provider: Some("stub".to_string()),
+                uid: Some("uid-42".to_string()),
+                name: None,
+                created_at: None,
+            })
+            .await
+            .expect("seed identity row");
+
+        let clock = FixedClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        let outcome: ResourceWithErrors<OmniUser> = default_from_omniauth(
+            &adapter,
+            &omni_profile(Some("known@example.com"), true),
+            &clock,
+        )
+        .await;
+
+        assert!(outcome.is_valid());
+        assert_eq!(outcome.record.email, "known@example.com");
+        assert_eq!(outcome.record.provider.as_deref(), Some("stub"));
+        assert_eq!(outcome.record.uid.as_deref(), Some("uid-42"));
+        // Hit path: the row under the identity pair is the seeded one, not a
+        // second row minted by the policy.
+        let mut identity = Conditions::new();
+        identity.insert(PROVIDER_COLUMN, "stub");
+        identity.insert(UID_COLUMN, "uid-42");
+        let stored = adapter
+            .find_first(&identity)
+            .await
+            .expect("store readable")
+            .expect("identity row");
+        assert_eq!(stored.email, "known@example.com");
+        assert_eq!(stored.provider.as_deref(), Some("stub"));
+    }
+
+    #[tokio::test]
+    async fn omniauthable_policy_links_verified_email_collision() {
+        let adapter = MemoryAdapter::<OmniUser>::new();
+        seed_row(&adapter, "user@example.com").await;
+
+        let clock = FixedClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        let outcome: ResourceWithErrors<OmniUser> = default_from_omniauth(
+            &adapter,
+            &omni_profile(Some("user@example.com"), true),
+            &clock,
+        )
+        .await;
+
+        assert!(outcome.is_valid());
+        // The pre-existing row now carries the identity pair.
+        let mut by_email = Conditions::new();
+        by_email.insert("email", "user@example.com");
+        let row = adapter
+            .find_first(&by_email)
+            .await
+            .expect("store readable")
+            .expect("email row");
+        assert_eq!(row.provider.as_deref(), Some("stub"));
+        assert_eq!(row.uid.as_deref(), Some("uid-42"));
+        // Linking is an update, not a create: exactly one row exists.
+        let mut identity = Conditions::new();
+        identity.insert(PROVIDER_COLUMN, "stub");
+        identity.insert(UID_COLUMN, "uid-42");
+        assert!(
+            adapter
+                .find_first(&identity)
+                .await
+                .expect("store readable")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn omniauthable_policy_unverified_email_never_links() {
+        let adapter = MemoryAdapter::<OmniUser>::new();
+        seed_row(&adapter, "user@example.com").await;
+
+        let clock = FixedClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        // Same email, but the provider does NOT assert verification.
+        let outcome: ResourceWithErrors<OmniUser> = default_from_omniauth(
+            &adapter,
+            &omni_profile(Some("user@example.com"), false),
+            &clock,
+        )
+        .await;
+
+        // The fallthrough is create-new - a valid outcome, never a silent error.
+        assert!(outcome.is_valid());
+        assert_eq!(outcome.record.provider.as_deref(), Some("stub"));
+        assert_eq!(outcome.record.uid.as_deref(), Some("uid-42"));
+
+        // T-09-08 boundary: the pre-existing row keeps EMPTY provider and uid.
+        let mut unlinked = Conditions::new();
+        unlinked.insert("email", "user@example.com");
+        unlinked.insert(PROVIDER_COLUMN, Value::Null);
+        let original = adapter
+            .find_first(&unlinked)
+            .await
+            .expect("store readable")
+            .expect("original row untouched");
+        assert_eq!(original.provider, None);
+        assert_eq!(original.uid, None);
+        assert_eq!(original.encrypted_password, "$2a$12$seededhash");
+    }
+
+    #[tokio::test]
+    async fn omniauthable_policy_creates_new_row_on_unknown_email() {
+        let adapter = MemoryAdapter::<OmniUser>::new();
+
+        let fixed = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let clock = FixedClock::new(fixed);
+        let outcome: ResourceWithErrors<OmniUser> = default_from_omniauth(
+            &adapter,
+            &omni_profile(Some("fresh@example.com"), true),
+            &clock,
+        )
+        .await;
+
+        assert!(outcome.is_valid());
+        assert_eq!(outcome.record.email, "fresh@example.com");
+        assert_eq!(outcome.record.provider.as_deref(), Some("stub"));
+        assert_eq!(outcome.record.uid.as_deref(), Some("uid-42"));
+        assert_eq!(outcome.record.name.as_deref(), Some("Stub User"));
+        // The clock is the flow's authoritative instant: created_at is the
+        // fixed stamp, not wall time.
+        assert_eq!(outcome.record.created_at, Some(fixed));
+    }
+
+    #[tokio::test]
+    async fn omniauthable_policy_without_email_never_links_and_creates() {
+        let adapter = MemoryAdapter::<OmniUser>::new();
+        seed_row(&adapter, "user@example.com").await;
+
+        let clock = FixedClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        // A profile with no email at all: nothing to collide with, and the
+        // default policy cannot look up by a nonexistent column value.
+        let outcome: ResourceWithErrors<OmniUser> =
+            default_from_omniauth(&adapter, &omni_profile(None, false), &clock).await;
+
+        assert!(outcome.is_valid());
+        assert_eq!(outcome.record.provider.as_deref(), Some("stub"));
+        // The email-less create path stores the empty-string email.
+        assert_eq!(outcome.record.email, "");
+    }
+
+    #[test]
+    fn omniauthable_failure_message_renders_devise_template() {
+        // en.yml: Could not authenticate you from %{kind} because "%{reason}".
+        assert_eq!(
+            failure_message("GitHub", "Invalid credentials"),
+            "Could not authenticate you from GitHub because \"Invalid credentials\"."
+        );
+        assert_eq!(
+            failure_message("Stub Provider", "not authorized"),
+            "Could not authenticate you from Stub Provider because \"not authorized\"."
+        );
+    }
+
+    #[test]
+    fn omniauthable_success_message_renders_devise_template() {
+        // en.yml: Successfully authenticated from %{kind} account.
+        assert_eq!(
+            success_message("GitHub"),
+            "Successfully authenticated from GitHub account."
+        );
+    }
+
+    /// `HashMap` session store for the proxy wiring test.
+    #[derive(Default, Clone)]
+    struct MapSessionStore(std::sync::Arc<std::sync::RwLock<HashMap<String, serde_json::Value>>>);
+
+    #[async_trait]
+    impl SessionStore for MapSessionStore {
+        async fn get_value(&self, key: &str) -> Option<serde_json::Value> {
+            self.0.read().unwrap().get(key).cloned()
+        }
+
+        async fn insert_value(&self, key: &str, value: serde_json::Value) {
+            self.0.write().unwrap().insert(key.to_string(), value);
+        }
+
+        async fn remove(&self, key: &str) {
+            self.0.write().unwrap().remove(key);
+        }
+
+        async fn remove_prefix(&self, prefix: &str) {
+            self.0
+                .write()
+                .unwrap()
+                .retain(|key, _| !key.starts_with(prefix));
+        }
+
+        async fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+            self.0
+                .read()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect()
+        }
+
+        async fn renew(&self) -> Result<(), DeviseError> {
+            Ok(())
+        }
+
+        async fn reset(&self) -> Result<(), DeviseError> {
+            self.0.write().unwrap().clear();
+            Ok(())
+        }
+    }
+
+    fn omniauth_test_proxy() -> (AuthProxy, std::sync::Arc<MapSessionStore>) {
+        let store = std::sync::Arc::new(MapSessionStore::default());
+        let mut scope_registry = crate::scope::ScopeRegistry::new();
+        let mapping = Mapping {
+            name: "user".to_string(),
+            class_name: "User".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![Module::DatabaseAuthenticatable],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: SignOutVia::Delete,
+            failure_app: None,
+        };
+        let mut hooks = HookRegistry::new();
+        register_devise_hooks(&mut hooks, &mapping);
+        scope_registry.register(mapping);
+        let proxy = AuthProxy::new(
+            store.clone(),
+            std::sync::Arc::new(scope_registry),
+            std::sync::Arc::new(hooks),
+            std::sync::Arc::new(crate::config::DeviseConfig::default()),
+        );
+        (proxy, store)
+    }
+
+    #[tokio::test]
+    async fn omniauthable_success_path_signs_in_with_set_user_event_authentication() {
+        // The full core handoff: default policy -> valid record -> the SESS
+        // sign-in path with SetUserEvent::Authentication (fires the
+        // Authentication hooks, persists the [key, salt] session pair).
+        let adapter = MemoryAdapter::<OmniUser>::new();
+        let clock = FixedClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        let outcome: ResourceWithErrors<OmniUser> = default_from_omniauth(
+            &adapter,
+            &omni_profile(Some("new@example.com"), true),
+            &clock,
+        )
+        .await;
+        assert!(outcome.is_valid());
+
+        let (mut proxy, store) = omniauth_test_proxy();
+        let accepted = proxy
+            .set_user(
+                "user",
+                Some(Box::new(outcome.record)),
+                SetUserOpts {
+                    event: SetUserEvent::Authentication,
+                    store: true,
+                    run_callbacks: true,
+                    force: false,
+                },
+            )
+            .await
+            .expect("omniauth success sign-in persists the session");
+        assert!(accepted);
+
+        // The session holds the warden [key, salt] pair and the scope is signed in.
+        let session_key = keys::scope_session_key("user");
+        assert!(store.get_value(&session_key).await.is_some());
+        assert!(proxy.authenticated("user"));
+        assert!(
+            proxy
+                .user::<OmniUser>("user")
+                .expect("typed user")
+                .provider
+                .is_some()
         );
     }
 }
