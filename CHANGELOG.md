@@ -11,10 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial release: a faithful Rust port of the Devise Ruby gem (v5.0.4),
 preserving Devise's module surface, method names, database column names,
-configuration option names, I18n message keys, and route table. Version
-0.1.0 is the first crates.io release; it does not carry long-term
-stability guarantees. Every entry below cites the Devise behavior it
-mirrors.
+configuration option names, I18n message keys, and route table.
+
+The v1 parity claim is a scope statement, not a version number. Parity
+with Devise v5.0.4 is the delivered v1 scope, proven by the exhaustive
+audit artifacts shipped in this repo: `docs/rails-parity.md` (379 rows
+covering every public method, config option, migration column, message
+key, unsafe serialization attribute, and `devise_for` route) and
+`docs/parity-checklist.md` (all 882 vendored Devise test blocks
+accounted for: 770 ported, 20 deviated, 92 waived, every waiver
+carrying a written reason and v1 impact). The crates.io version stays
+0.1.0 until post-release hardening earns 1.0: 0.1.0 is the first
+crates.io release version and does not carry long-term stability
+guarantees. Every entry below cites the Devise behavior it mirrors.
 
 ### Added
 
