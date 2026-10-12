@@ -9,7 +9,9 @@ description = "Shared data-parameterized OrmAdapter contract suite for devise-ru
 repository.workspace = true
 homepage.workspace = true
 # Test-only harness crate (PA-12): never published to crates.io; backend
-# crates consume it as a version-carrying path dev-dependency.
+# crates consume it as a path-only dev-dependency: a version key would be
+# rewritten into a registry requirement in their packaged manifests and
+# permanently break their publishes, since this crate never uploads.
 publish = false
 # Only named test targets: the MemoryAdapter oracle leg lives here; backend
 # crates run the shared library cases from their own integration tests

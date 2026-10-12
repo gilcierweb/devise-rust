@@ -66,7 +66,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Self-dependency: enables the `test-support` feature for THIS crate's
 # own integration tests (dev-dependency features unify into the lib
 # build under `cargo test`; the lib gate build never sees them).
-devise-rust-axum = { path = ".", version = "0.1.0", features = ["test-support"] }
+devise-rust-axum = { path = ".", features = ["test-support"] }
 # axum-demo example persistence (D-18 analogue): diesel over an in-memory
 # sqlite pool — zero Docker; the MemoryAdapter oracle stays the unit-speed
 # leg and the testcontainers Postgres path stays documented-only.

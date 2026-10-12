@@ -82,7 +82,7 @@ testcontainers = { version = "=0.25.0", default-features = false }
 testcontainers-modules = { version = "0.13.0", default-features = false, features = ["postgres"] }
 # Shared contract suite (D-24): this crate's integration tests are thin
 # wrappers that run the shared cases against the sqlite/pg rigs (D-27).
-devise-rust-adapter-tests = { path = "../devise-rust-adapter-tests", version = "0.1.0" }
+devise-rust-adapter-tests = { path = "../devise-rust-adapter-tests" }
 
 [[test]]
 name = "adapter"

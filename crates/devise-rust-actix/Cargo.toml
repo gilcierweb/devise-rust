@@ -50,7 +50,7 @@ diesel-async = { version = "0.6.1", features = ["sqlite", "deadpool"] }
 # 09-04: the actix omniauth flow tests consume the axum crate's generic
 # OAuth2 stub provider (D-06) so both frameworks prove one stub; the
 # feature is test-support only and never enters the actix lib build.
-devise-rust-axum = { path = "../devise-rust-axum", version = "0.1.0", features = ["test-support"] }
+devise-rust-axum = { path = "../devise-rust-axum", features = ["test-support"] }
 oauth2 = "5.0"
 
 [[test]]
