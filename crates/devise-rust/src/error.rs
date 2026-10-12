@@ -188,8 +188,10 @@ where
     }
 }
 
-/// UNSAFE attributes that must never be serialized or logged - exact list from
-/// Devise's `UNSAFE_ATTRIBUTES_FOR_SERIALIZATION` (19 attributes).
+/// UNSAFE attributes that must never be serialized or logged - Devise's
+/// 18-attribute `UNSAFE_ATTRIBUTES_FOR_SERIALIZATION` from
+/// `authenticatable.rb` plus the port's 3 virtual password fields
+/// (`password`, `password_confirmation`, `current_password`), 21 entries.
 ///
 /// These are excluded from `serializable_hash` and `Debug` implementations
 /// to prevent credential leakage in logs, error reports, and API responses.
@@ -205,9 +207,11 @@ pub const UNSAFE_ATTRIBUTES_FOR_SERIALIZATION: &[&str] = &[
     "last_sign_in_at",
     "current_sign_in_ip",
     "last_sign_in_ip",
+    "password_salt",
     "confirmation_token",
     "confirmed_at",
     "confirmation_sent_at",
+    "remember_token",
     "unconfirmed_email",
     "failed_attempts",
     "locked_at",
