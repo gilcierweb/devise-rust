@@ -387,11 +387,11 @@ The embedded catalog (`crates/devise-rust/locales/en.yml`) carries Devise's exac
 | `last_sign_in_at` | method | `models/authenticatable.rb:59` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | |
 | `current_sign_in_ip` | method | `models/authenticatable.rb:59` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | |
 | `last_sign_in_ip` | method | `models/authenticatable.rb:59` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | |
-| `password_salt` | method | `models/authenticatable.rb:60` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | bcrypt salt segment of the digest |
+| `password_salt` | method | `models/authenticatable.rb:60` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | bcrypt salt segment of the digest; restored to the filter in the 10-05 gap closure (was omitted while marked ported) |
 | `confirmation_token` | method | `models/authenticatable.rb:60` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` and `confirmable.rs tests (confirmable_unsafe_attributes_cover_confirmation_columns)` | |
 | `confirmed_at` | method | `models/authenticatable.rb:60` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | |
 | `confirmation_sent_at` | method | `models/authenticatable.rb:60` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | |
-| `remember_token` | method | `models/authenticatable.rb:61` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | |
+| `remember_token` | method | `models/authenticatable.rb:61` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | stored unhashed in the DB-token rememberable mode; restored to the filter in the 10-05 gap closure (was omitted while marked ported) |
 | `unconfirmed_email` | method | `models/authenticatable.rb:61` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | |
 | `failed_attempts` | method | `models/authenticatable.rb:61` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | |
 | `unlock_token` | method | `models/authenticatable.rb:61` | `UNSAFE_ATTRIBUTES` | ported | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | |
@@ -516,7 +516,7 @@ The full `devise_for` route table (`devise/lib/devise/rails/routes.rb`, rows sho
 
 | devise name | kind | devise source | Rust counterpart | status | test evidence | notes |
 |---|---|---|---|---|---|---|
-| `Devise::Encryptor.digest` | method | `lib/devise/encryptor.rb:7` | `crypto::encryptor::digest` (`crates/devise-rust/src/crypto.rs:66`) | ported | `crates/devise-rust/src/crypto.rs tests (test_encryptor_digest_compare, test_encryptor_with_pepper)` | bcrypt with pepper and stretches, spawn_blocking at the framework seams |
+| `Devise::Encryptor.digest` | method | `lib/devise/encryptor.rb:7` | `crypto::encryptor::digest` (`crates/devise-rust/src/crypto.rs:66`) | ported | `crates/devise-rust/src/crypto.rs tests (test_encryptor_digest_compare, test_encryptor_with_pepper)` | bcrypt with pepper and stretches; digest and compare run synchronously on the caller's thread (no runtime offload) |
 | `Devise::Encryptor.compare` | method | `lib/devise/encryptor.rb:14` | `crypto::encryptor::compare` (`crates/devise-rust/src/crypto.rs:94`) | ported | `crates/devise-rust/src/crypto.rs tests (test_encryptor_digest_compare)` | re-hash plus constant-time compare, never `==` |
 | `Devise::TokenGenerator#digest` | method | `lib/devise/token_generator.rb:12` | `crypto::token_generator::digest` (`crates/devise-rust/src/crypto.rs:126`) | ported | `crates/devise-rust/src/crypto.rs tests (test_token_generator_digest)` | HMAC-SHA256 keyed `"Devise {column}"` |
 | `Devise::TokenGenerator#generate` | method | `lib/devise/token_generator.rb:16` | `crypto::token_generator::generate` (`crates/devise-rust/src/crypto.rs:162`) | ported | `crates/devise-rust/src/crypto.rs tests` | raw plus digest pair, uniqueness loop against the adapter |

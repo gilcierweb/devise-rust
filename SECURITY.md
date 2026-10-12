@@ -13,7 +13,7 @@ security regression suite:
 | **Session salt invalidation** | Password change → salt mismatch → old sessions rejected |
 | **Paranoid mode** | Uniform `:invalid` error; dummy bcrypt for unknown accounts |
 | **Secret filtering** | `UNSAFE_ATTRIBUTES_FOR_SERIALIZATION` excluded from `Debug`/`Serialize` |
-| **Bcrypt cost** | Configurable `stretches` (default 12); runs in `spawn_blocking` |
+| **Bcrypt cost** | Configurable `stretches` (default 12); digest and verify run synchronously on the calling thread |
 | **CSRF protection** | Framework bridge callbacks (`handle_unverified_request`); token rotation on sign in |
 | **Blank-token guards** | Token lookups fail closed on blank input |
 | **Remember cookie integrity** | Signed cookie with the five-condition validity check and hardened attributes (`HttpOnly`, `SameSite=Lax`, `Secure`) |
