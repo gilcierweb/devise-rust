@@ -306,6 +306,8 @@ mod tests {
         assert!(is_unsafe_attribute("encrypted_password"));
         assert!(is_unsafe_attribute("reset_password_token"));
         assert!(is_unsafe_attribute("password"));
+        assert!(is_unsafe_attribute("password_salt"));
+        assert!(is_unsafe_attribute("remember_token"));
         assert!(!is_unsafe_attribute("email"));
         assert!(!is_unsafe_attribute("name"));
         assert!(!is_unsafe_attribute("id"));
@@ -313,7 +315,9 @@ mod tests {
 
     #[test]
     fn test_unsafe_attributes_count() {
-        // Devise has 19 unsafe attributes (updated from 18 in newer versions)
-        assert_eq!(UNSAFE_ATTRIBUTES_FOR_SERIALIZATION.len(), 19);
+        // Devise's list carries 18 attributes (authenticatable.rb:58-61); the
+        // port adds the 3 virtual password fields (password,
+        // password_confirmation, current_password), so the list has 21 entries.
+        assert_eq!(UNSAFE_ATTRIBUTES_FOR_SERIALIZATION.len(), 21);
     }
 }
