@@ -20,6 +20,14 @@ jobs:
       # links must fail before the link checker runs (key_links ordering).
       - name: Rustdoc warning free
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+      # Pre-publish exclusions (IN-03, gap 5): every docs.rs/devise-rust and
+      # crates.io/crates/devise-rust target in the scanned surface (README
+      # badge and hub links, guide pages, CHANGELOG) returns 404 until the
+      # first crates.io publish exists. Remove BOTH excludes at the publish
+      # session once the first crate is live, per the Publish Session
+      # Checklist recorded in the project planning artifacts
+      # (10-USER-SETUP.md), so this gate resumes checking the real registry
+      # targets.
       # Markdown link check over the hub, the guide corpus, and the
       # changelog. Pinned to the full commit SHA of tag v2 per the
       # supply-chain hygiene rule (T-10-SC); localhost targets are excluded.
@@ -29,6 +37,8 @@ jobs:
           args: >-
             --verbose --no-progress
             --exclude '^https?://(localhost|127\.0\.0\.1)'
+            --exclude 'https://docs\.rs/devise-rust'
+            --exclude 'https://crates\.io/crates/devise-rust'
             README.md docs/ CHANGELOG.md
       # D-06 house prose rule: no em dash codepoints in README, guides,
       # changelog, or core rustdoc. grep -P over the U+2014 codepoint.
