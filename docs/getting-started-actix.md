@@ -143,11 +143,15 @@ module, for Postgres, SQLite, and MySQL:
 ```text
 cargo install --path crates/devise-rust-migrations
 
-devise-migrations users --dialect sqlite --modules all --pk-type bigint --output migrations/001_devise_users.sql
+devise-migrations users --dialect sqlite --modules all --pk bigint --output migrations
 ```
 
-Apply the emitted SQL with the migration tool you already use
-(`sqlx migrate run`, `diesel migration run`, or `psql -f`).
+The tool writes a timestamped migration directory under the output path,
+named with the pattern `TIMESTAMP_devise_create_users` and containing
+`up.sql` and `down.sql`, the diesel-CLI-compatible migration shape. Apply
+it with the tooling already in use: `diesel migration run` picks the
+directory up directly, the generated `up.sql` can be fed to `psql -f`, or
+the directory can be registered with the `sqlx` migration tooling.
 
 ### 4. Configure Devise
 
