@@ -8,6 +8,9 @@ authors.workspace = true
 description = "Devise-parity migration generator for devise-rust (ORM-agnostic DDL)"
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords = ["devise", "authentication", "migrations", "schema"]
+categories = ["authentication"]
 
 [lints]
 workspace = true

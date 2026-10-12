@@ -8,6 +8,9 @@ authors.workspace = true
 description = "Diesel ORM adapter for devise-rust"
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords = ["devise", "authentication", "diesel", "diesel-async"]
+categories = ["authentication"]
 # Only the contract suite is an integration target; `tests/models.rs` is a
 # shared support module, never a target on its own.
 autotests = false
@@ -40,7 +43,9 @@ mysql = ["diesel-async/mysql"]
 e2e-pg = ["postgres"]
 
 [dependencies]
-devise-rust = { path = "../devise-rust" }
+# `version` alongside `path` is required for publishing: the registry
+# cannot resolve a path dependency after upload (publish blocker, D-15).
+devise-rust = { path = "../devise-rust", version = "0.1.0" }
 diesel.workspace = true
 diesel-async.workspace = true
 async-trait.workspace = true
@@ -70,14 +75,14 @@ uuid.workspace = true
 # DDL bootstrap for the sqlite rig: the fixture schema is the DDL that
 # `devise-rust-migrations::emit()` generates (publish-DAG order: migrations
 # ships before the diesel backend consumes it in tests).
-devise-rust-migrations = { path = "../devise-rust-migrations" }
+devise-rust-migrations = { path = "../devise-rust-migrations", version = "0.1.0" }
 # testcontainers for e2e-pg harness (exact pin =0.25.0; 0.25.1+ needs rustc 1.88 — Pitfall 6)
 # Only compiled when the `e2e-pg` feature is enabled via #[cfg(feature = "e2e-pg")]
 testcontainers = { version = "=0.25.0", default-features = false }
 testcontainers-modules = { version = "0.13.0", default-features = false, features = ["postgres"] }
 # Shared contract suite (D-24): this crate's integration tests are thin
 # wrappers that run the shared cases against the sqlite/pg rigs (D-27).
-devise-rust-adapter-tests = { path = "../devise-rust-adapter-tests" }
+devise-rust-adapter-tests = { path = "../devise-rust-adapter-tests", version = "0.1.0" }
 
 [[test]]
 name = "adapter"

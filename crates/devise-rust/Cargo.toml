@@ -8,7 +8,13 @@ authors.workspace = true
 description.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+# Package-relative readme: `readme.workspace = true` inherits the
+# workspace-root path, which cargo resolves outside the package and warns
+# on every packaging run. The explicit in-package path is what
+# `cargo package --list` proves.
+readme = "README.md"
+keywords = ["devise", "authentication", "auth", "sessions"]
+categories = ["authentication"]
 
 [lints]
 workspace = true

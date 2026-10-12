@@ -8,6 +8,9 @@ authors.workspace = true
 description = "sqlx ORM adapter for devise-rust"
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords = ["devise", "authentication", "sqlx", "database"]
+categories = ["authentication"]
 # Only named test targets: `tests/models.rs` and `tests/common/mod.rs` are
 # shared support modules, never targets on their own (diesel precedent).
 autotests = false
@@ -34,7 +37,7 @@ mysql = ["sqlx/mysql"]
 e2e-pg-sqlx = ["postgres"]
 
 [dependencies]
-devise-rust = { path = "../devise-rust", version = "0.1" }
+devise-rust = { path = "../devise-rust", version = "0.1.0" }
 # Pinned EXACT per D-31/Pitfall 12: sqlx declares no rust-version, so a caret
 # `0.8` could silently resolve a future 0.8.7 with newer transitive deps that
 # break the 1.85 MSRV job. `macros` stays OFF - the `query!` family would leak
@@ -65,10 +68,10 @@ chrono.workspace = true
 uuid.workspace = true
 # DDL bootstrap for the sqlite rig: the fixture schema is the DDL that
 # `devise-rust-migrations::emit()` generates, applied verbatim (D-08).
-devise-rust-migrations = { path = "../devise-rust-migrations" }
+devise-rust-migrations = { path = "../devise-rust-migrations", version = "0.1.0" }
 # Shared contract suite (D-24): this crate's integration tests are thin
 # wrappers that run the shared cases against the sqlite rigs (D-26).
-devise-rust-adapter-tests = { path = "../devise-rust-adapter-tests" }
+devise-rust-adapter-tests = { path = "../devise-rust-adapter-tests", version = "0.1.0" }
 # testcontainers for the pg rig (D-25/D-32): pinned to 0.25.0 / modules 0.13.0
 # per STATE.md decisions; never in default/MSRV builds.
 testcontainers = { version = "=0.25.0", default-features = false }

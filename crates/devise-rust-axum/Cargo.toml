@@ -8,6 +8,9 @@ authors.workspace = true
 description = "Axum integration for devise-rust"
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords = ["devise", "authentication", "axum", "web"]
+categories = ["authentication"]
 
 [lints]
 workspace = true
@@ -23,7 +26,9 @@ workspace = true
 test-support = ["dep:sha2", "dep:base64"]
 
 [dependencies]
-devise-rust = { path = "../devise-rust" }
+# `version` alongside `path` is required for publishing: the registry
+# cannot resolve a path dependency after upload (publish blocker, D-15).
+devise-rust = { path = "../devise-rust", version = "0.1.0" }
 # Phase 9 pins (09-RESEARCH.md Standard Stack, package-audit OK):
 # - axum 0.8: `{param}` route captures, `FromRequestParts`, `Router::merge`
 # - tower-sessions 0.15: facade crate ONLY (never the split -core/-memory-store
@@ -61,12 +66,12 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Self-dependency: enables the `test-support` feature for THIS crate's
 # own integration tests (dev-dependency features unify into the lib
 # build under `cargo test`; the lib gate build never sees them).
-devise-rust-axum = { path = ".", features = ["test-support"] }
+devise-rust-axum = { path = ".", version = "0.1.0", features = ["test-support"] }
 # axum-demo example persistence (D-18 analogue): diesel over an in-memory
 # sqlite pool — zero Docker; the MemoryAdapter oracle stays the unit-speed
 # leg and the testcontainers Postgres path stays documented-only.
-devise-rust-diesel = { path = "../devise-rust-diesel", features = ["sqlite"] }
-devise-rust-migrations = { path = "../devise-rust-migrations" }
+devise-rust-diesel = { path = "../devise-rust-diesel", version = "0.1.0", features = ["sqlite"] }
+devise-rust-migrations = { path = "../devise-rust-migrations", version = "0.1.0" }
 diesel.workspace = true
 diesel-async = { version = "0.6.1", features = ["sqlite", "deadpool"] }
 

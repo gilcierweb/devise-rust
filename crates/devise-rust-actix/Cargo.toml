@@ -8,12 +8,17 @@ authors.workspace = true
 description = "Actix Web integration for devise-rust"
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords = ["devise", "authentication", "actix-web", "actix"]
+categories = ["authentication"]
 
 [lints]
 workspace = true
 
 [dependencies]
-devise-rust = { path = "../devise-rust" }
+# `version` alongside `path` is required for publishing: the registry
+# cannot resolve a path dependency after upload (publish blocker, D-15).
+devise-rust = { path = "../devise-rust", version = "0.1.0" }
 # D-14/D-31 posture: actix-web pinned to the 4.12 line (4.13 requires rustc 1.88
 # — Pitfall 6 / RESEARCH.md); actix-session 0.11 pairs with it.
 actix-web = { version = "~4.12", default-features = false }
@@ -38,14 +43,14 @@ actix-session = { version = "0.11", features = ["cookie-session"], default-featu
 actix-web = { version = "~4.12", default-features = false, features = ["macros"] }
 actix-http = "3"
 regex = { workspace = true }
-devise-rust-diesel = { path = "../devise-rust-diesel", features = ["sqlite"] }
-devise-rust-migrations = { path = "../devise-rust-migrations" }
+devise-rust-diesel = { path = "../devise-rust-diesel", version = "0.1.0", features = ["sqlite"] }
+devise-rust-migrations = { path = "../devise-rust-migrations", version = "0.1.0" }
 diesel.workspace = true
 diesel-async = { version = "0.6.1", features = ["sqlite", "deadpool"] }
 # 09-04: the actix omniauth flow tests consume the axum crate's generic
 # OAuth2 stub provider (D-06) so both frameworks prove one stub; the
 # feature is test-support only and never enters the actix lib build.
-devise-rust-axum = { path = "../devise-rust-axum", features = ["test-support"] }
+devise-rust-axum = { path = "../devise-rust-axum", version = "0.1.0", features = ["test-support"] }
 oauth2 = "5.0"
 
 [[test]]
