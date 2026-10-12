@@ -48,7 +48,10 @@ never persists:
 
 <!-- text fence: adapter-dependent; compiled in the example apps -->
 ```text
-let outcome = user.update_with_password(&changes, "current-pass", &adapter, &config).await?;
+let mut params = serde_json::Map::new();
+params.insert("email".into(), serde_json::json!("new@example.com"));
+params.insert("current_password".into(), serde_json::json!("wrong"));
+match user.update_with_password(&mut params, &config) { Ok(()) => {} Err(errors) => {} }
 ```
 
 ## Chaining note

@@ -29,7 +29,7 @@
 //! user.increment_failed_attempts(&adapter).await?;
 //! user.increment_failed_attempts(&adapter).await?;
 //! user.increment_failed_attempts(&adapter).await?;
-//! user.lock_access(&adapter, &mailer, &config, &clock, true).await?;
+//! user.lock_access(&adapter, &mailer, &config, &clock).await?;
 //! assert!(user.access_locked(&config, &clock));
 //! ```
 

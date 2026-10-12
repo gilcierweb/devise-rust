@@ -31,8 +31,8 @@ plus `reload`):
      lockable model tests and the example apps -->
 ```text
 user.increment_failed_attempts(&adapter).await?;
-assert!(user.last_attempt(&config, &clock));
-user.lock_access(&adapter, &mailer, &config, &clock, true).await?;
+user.last_attempt(&config);
+user.lock_access(&adapter, &mailer, &config, &clock).await?;
 assert!(user.access_locked(&config, &clock));
 ```
 
@@ -41,7 +41,7 @@ digest lookup and the raw-token restore:
 
 <!-- text fence: adapter-dependent; compiled in the lockable model tests -->
 ```text
-let outcome = User::unlock_access_by_token(&raw, &adapter, &config, &clock).await?;
+let outcome = User::unlock_access_by_token(Some(&raw), &adapter, &config).await?;
 assert!(outcome.is_valid());
 ```
 
