@@ -158,7 +158,7 @@ pub enum LockAttemptOutcome {
 /// }
 /// ```
 ///
-/// Mirrors `Devise::Models::Lockable` (`devise/lib/devise/models/lockable.rb`) as the trait surface: attempt counting, `lock_access`,` ``unlock_access``,` and the unlock strategies.
+/// Mirrors `Devise::Models::Lockable` (`devise/lib/devise/models/lockable.rb`) as the trait surface: attempt counting, `lock_access`, `unlock_access`, and the unlock strategies.
 #[async_trait]
 pub trait Lockable: Authenticatable + HasEmail {
     /// Stored `failed_attempts` counter column.

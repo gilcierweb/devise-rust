@@ -325,7 +325,7 @@ pub struct ChangeSet {
 impl ChangeSet {
     /// Create a new change set from previous and current state
     ///
-    /// `ChangeSet` `constructor mirroring the start of an ``ActiveRecord`` `dirty set.
+    /// `ChangeSet` constructor mirroring the start of an `ActiveRecord` dirty set.
     #[must_use]
     pub fn new(previous: HashMap<String, Value>, current: HashMap<String, Value>) -> Self {
         Self { previous, current }

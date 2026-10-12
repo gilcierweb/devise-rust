@@ -33,7 +33,7 @@ pub enum Event {
 impl Event {
     /// All events in Devise execution order
     ///
-    /// Lists the hook events mirroring warden's callback vocabulary: `after_set_user` `and ``before_logout`` `(`devise/lib/devise/hooks/*`).
+    /// Lists the hook events mirroring warden's callback vocabulary: `after_set_user` and `before_logout` (`devise/lib/devise/hooks/*`).
     #[must_use]
     pub fn all() -> Vec<Event> {
         vec![
