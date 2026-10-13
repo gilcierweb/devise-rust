@@ -494,7 +494,7 @@ pub fn build_cookie_triple(key: &str, value: &str, clock: &dyn Clock) -> (String
 /// }
 /// ```
 ///
-/// Mirrors `Devise::Models::Rememberable` (`devise/lib/devise/models/rememberable.rb`) as the trait surface: `remember_me`,` ``forget_me``,` cookie serialization, and the validity check.
+/// Mirrors `Devise::Models::Rememberable` (`devise/lib/devise/models/rememberable.rb`) as the trait surface: `remember_me`, `forget_me`, cookie serialization, and the validity check.
 #[async_trait]
 pub trait Rememberable: Authenticatable {
     /// Stored `remember_created_at` column.
