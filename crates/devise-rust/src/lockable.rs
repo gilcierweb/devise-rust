@@ -748,6 +748,7 @@ mod tests {
     use crate::adapter::memory::MemoryAdapter;
     use crate::failure::AnyDeviseModel;
     use crate::mailer::TestMailer;
+    use crate::scope::{Mapping, Module, PathNames, SignOutVia};
     use crate::time::{Clock, FixedClock};
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
@@ -757,6 +758,7 @@ mod tests {
     struct TestUser {
         id: i64,
         email: String,
+        encrypted_password: String,
         failed_attempts: u32,
         locked_at: Option<DateTime<Utc>>,
         unlock_token: Option<String>,
@@ -774,9 +776,53 @@ mod tests {
         }
     }
 
+    impl TestUser {
+        fn with_password(mut self, password: &str, config: &DeviseConfig) -> Self {
+            self.encrypted_password = crate::crypto::encryptor::digest(password, config);
+            self
+        }
+    }
+
+    impl crate::model::PasswordVerifiable for TestUser {
+        fn valid_password(&self, password: &str, config: &DeviseConfig) -> bool {
+            crate::crypto::encryptor::compare(password, &self.encrypted_password, config)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model::DatabaseAuthenticatable for TestUser {
+        fn encrypted_password(&self) -> Option<&str> {
+            Some(&self.encrypted_password)
+        }
+        fn set_encrypted_password(&mut self, hash: Option<String>) {
+            self.encrypted_password = hash.unwrap_or_default();
+        }
+        fn password(&self) -> Option<&str> {
+            None
+        }
+        fn set_password(&mut self, password: Option<String>, config: &DeviseConfig) {
+            if let Some(password) = password {
+                self.encrypted_password = crate::crypto::encryptor::digest(&password, config);
+            }
+        }
+        fn password_confirmation(&self) -> Option<&str> {
+            None
+        }
+        fn set_password_confirmation(&mut self, _confirmation: Option<String>) {}
+        fn set_password_virtual(&mut self, _password: Option<String>) {}
+        fn persisted(&self) -> bool {
+            true
+        }
+        fn assign_attributes(&mut self, _attrs: &serde_json::Map<String, serde_json::Value>) {}
+    }
+
     impl AnyDeviseModel for TestUser {
         fn to_key(&self) -> crate::adapter::DeviseKey {
             crate::adapter::DeviseKey::from_i64(self.id)
+        }
+
+        fn as_password_verifiable(&self) -> Option<&dyn crate::model::PasswordVerifiable> {
+            Some(self)
         }
 
         fn reset_failed_attempts_hook(&mut self) -> bool {
@@ -1642,5 +1688,181 @@ mod tests {
             .downcast_ref::<TestUser>()
             .expect("memoized record is the lockable test user");
         assert_eq!(kept.failed_attempts(), 5);
+    }
+
+    use crate::adapter::DeviseKey;
+    use crate::failed_attempt::{AttemptVerdict, FailedAttemptSink};
+    use crate::failure::{AuthOutcome, Failure};
+    use crate::lockable::LockAttemptOutcome;
+    use crate::model::AdapterBridge;
+    use crate::request::AuthRequest;
+    use crate::strategy::{ParamsStrategy, Strategy as _};
+
+    fn chain_config() -> DeviseConfig {
+        DeviseConfig {
+            maximum_attempts: 3,
+            unlock_strategy: "time".to_string(),
+            stretches: 4,
+            ..test_config()
+        }
+    }
+
+    fn mapping() -> crate::scope::Mapping {
+        let mut mapping = Mapping {
+            name: "user".to_string(),
+            class_name: "TestUser".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![Module::DatabaseAuthenticatable, Module::Lockable],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: SignOutVia::Delete,
+            failure_app: None,
+        };
+        mapping.modules.sort();
+        mapping
+    }
+
+    /// Typed sink over the in-memory adapter — the shape a framework bridge
+    /// registers per scope.
+    struct MemorySink {
+        adapter: Arc<MemoryAdapter<TestUser>>,
+        mailer: Arc<TestMailer>,
+        config: Arc<DeviseConfig>,
+        clock: Arc<FixedClock>,
+    }
+
+    #[async_trait::async_trait]
+    impl FailedAttemptSink for MemorySink {
+        async fn record(&self, key: &DeviseKey, password_ok: bool) -> AttemptVerdict {
+            let Ok(Some(mut record)) = self.adapter.get(key).await else {
+                return AttemptVerdict::Recorded;
+            };
+            match record
+                .apply_failed_attempt(
+                    password_ok,
+                    self.adapter.as_ref(),
+                    self.mailer.as_ref(),
+                    &self.config,
+                    self.clock.as_ref(),
+                )
+                .await
+            {
+                Ok(LockAttemptOutcome::Locked | LockAttemptOutcome::FailedIncremented) => {
+                    AttemptVerdict::Failed(
+                        record.lock_unauthenticated_message(&self.config, self.clock.as_ref()),
+                    )
+                }
+                Ok(LockAttemptOutcome::Authenticated) | Err(_) => AttemptVerdict::Recorded,
+            }
+        }
+    }
+
+    fn request(password: &str) -> AuthRequest {
+        let mut request = AuthRequest::new(crate::request::HttpMethod::Post, "/users/sign_in");
+        request.params = HashMap::from([
+            ("user[email]".to_string(), "chain@example.com".to_string()),
+            ("password".to_string(), password.to_string()),
+        ]);
+        request.flags.allow_params_authentication = true;
+        request
+    }
+
+    #[tokio::test]
+    async fn strategy_chain_counts_and_locks_through_the_sink() {
+        let config = chain_config();
+        let clock = FixedClock::now();
+        let adapter = Arc::new(MemoryAdapter::<TestUser>::new());
+        let seeded = TestUser::fresh(1, "chain@example.com").with_password("secret123", &config);
+        adapter.create(seeded).await.unwrap();
+
+        let finder = AdapterBridge::new((*adapter).clone());
+        let sink = Arc::new(MemorySink {
+            adapter: adapter.clone(),
+            mailer: Arc::new(TestMailer::default()),
+            config: Arc::new(config.clone()),
+            clock: Arc::new(clock),
+        });
+        let strategy = ParamsStrategy::default().with_failed_attempt_sink(sink);
+        let mapping = mapping();
+
+        // Wrong password #1: counted, reported :invalid.
+        let first = strategy
+            .authenticate(&request("wrong"), &mapping, &finder, &config)
+            .await;
+        assert!(matches!(
+            first,
+            Err(Failure::InvalidCredentials { message: "invalid" })
+        ));
+        let stored = adapter.get(&DeviseKey::from_i64(1)).await.unwrap().unwrap();
+        assert_eq!(
+            stored.failed_attempts(),
+            1,
+            "attempt 1 counted on the chain"
+        );
+
+        // Attempt 3 crosses maximum_attempts: the chain reports `locked`.
+        let _ = strategy
+            .authenticate(&request("wrong"), &mapping, &finder, &config)
+            .await;
+        let third = strategy
+            .authenticate(&request("wrong"), &mapping, &finder, &config)
+            .await;
+        assert!(matches!(
+            third,
+            Err(Failure::InvalidCredentials { message: "locked" })
+        ));
+
+        // Locked record: even the correct password fails with `locked`.
+        let right = strategy
+            .authenticate(&request("secret123"), &mapping, &finder, &config)
+            .await;
+        assert!(matches!(
+            right,
+            Err(Failure::InvalidCredentials { message: "locked" })
+        ));
+
+        // Without a sink the chain keeps the pre-seam behavior: plain
+        // :invalid, nothing counted.
+        let plain = ParamsStrategy::default();
+        let result = plain
+            .authenticate(&request("wrong"), &mapping, &finder, &config)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Failure::InvalidCredentials { message: "invalid" })
+        ));
+    }
+
+    #[tokio::test]
+    async fn strategy_chain_success_with_sink_stays_authenticated() {
+        let config = chain_config();
+        let clock = FixedClock::now();
+        let adapter = Arc::new(MemoryAdapter::<TestUser>::new());
+        let seeded = TestUser::fresh(1, "chain@example.com").with_password("secret123", &config);
+        adapter.create(seeded).await.unwrap();
+
+        let finder = AdapterBridge::new((*adapter).clone());
+        let sink = Arc::new(MemorySink {
+            adapter: adapter.clone(),
+            mailer: Arc::new(TestMailer::default()),
+            config: Arc::new(config.clone()),
+            clock: Arc::new(clock),
+        });
+        let strategy = ParamsStrategy::default().with_failed_attempt_sink(sink);
+        let result = strategy
+            .authenticate(&request("secret123"), &mapping(), &finder, &config)
+            .await;
+        assert!(
+            matches!(result, Ok(AuthOutcome::Success(_))),
+            "correct password authenticates through the chain"
+        );
     }
 }

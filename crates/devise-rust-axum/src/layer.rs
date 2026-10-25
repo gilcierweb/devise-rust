@@ -112,6 +112,7 @@ pub struct DeviseLayer {
     config: Arc<DeviseConfig>,
     hooks: Arc<HookRegistry>,
     finders: HashMap<String, Arc<dyn ModelFinder>>,
+    failed_attempt_sinks: HashMap<String, Arc<dyn devise_rust::failed_attempt::FailedAttemptSink>>,
 }
 
 impl DeviseLayer {
@@ -123,6 +124,7 @@ impl DeviseLayer {
             config,
             hooks: Arc::new(HookRegistry::new()),
             finders: HashMap::new(),
+            failed_attempt_sinks: HashMap::new(),
         }
     }
 
@@ -131,6 +133,24 @@ impl DeviseLayer {
     #[must_use]
     pub fn with_finder(mut self, scope: &str, finder: Arc<dyn ModelFinder>) -> Self {
         self.finders.insert(scope.to_string(), finder);
+        self
+    }
+
+    /// Register the failed-attempt accounting sink for one scope.
+    ///
+    /// Devise runs the lockable counter side effects inside the strategy
+    /// chain, so a request that authenticates through the chain (not the
+    /// sign-in POST) locks the account at the threshold too. Apps register
+    /// [`devise_rust::failed_attempt::LockableFailedAttemptSink`] over their
+    /// adapter/mailer/config/clock; without it the chain keeps the
+    /// no-accounting behavior.
+    #[must_use]
+    pub fn with_failed_attempt_sink(
+        mut self,
+        scope: &str,
+        sink: Arc<dyn devise_rust::failed_attempt::FailedAttemptSink>,
+    ) -> Self {
+        self.failed_attempt_sinks.insert(scope.to_string(), sink);
         self
     }
 
@@ -226,6 +246,9 @@ where
             );
             for (scope, finder) in &layer.finders {
                 proxy.register_finder(scope, finder.clone());
+            }
+            for (scope, sink) in &layer.failed_attempt_sinks {
+                proxy.register_failed_attempt_sink(scope, sink.clone());
             }
 
             // Non-strict fetch + Event::Request hooks for the resolved

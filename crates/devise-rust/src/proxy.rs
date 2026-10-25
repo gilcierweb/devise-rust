@@ -76,6 +76,7 @@ pub struct AuthProxy {
     registry: Arc<ScopeRegistry>,
     hooks: Arc<HookRegistry>,
     finders: HashMap<String, Arc<dyn ModelFinder>>,
+    failed_attempt_sinks: HashMap<String, Arc<dyn crate::failed_attempt::FailedAttemptSink>>,
     config: Arc<DeviseConfig>,
     remember_cookie_ops: Vec<RememberCookieOp>,
 }
@@ -102,6 +103,7 @@ impl AuthProxy {
             registry,
             hooks,
             finders: HashMap::new(),
+            failed_attempt_sinks: HashMap::new(),
             config,
             remember_cookie_ops: Vec::new(),
         }
@@ -112,6 +114,21 @@ impl AuthProxy {
     /// Registers the scope's finder, the typed mirror of warden's config-referenced user class.
     pub fn register_finder(&mut self, scope: &str, finder: Arc<dyn ModelFinder>) {
         self.finders.insert(scope.to_string(), finder);
+    }
+
+    /// Register the failed-attempt accounting sink for one scope.
+    ///
+    /// Devise runs the lockable counter side effects inside the strategy
+    /// chain (`valid_for_authentication?`); this is the port's seam for that
+    /// path — the rules stay in core, the persistence comes from the app's
+    /// typed sink. Without a registration the chain keeps its pre-seam
+    /// behavior (the controllers account on the sign-in POST path).
+    pub fn register_failed_attempt_sink(
+        &mut self,
+        scope: &str,
+        sink: Arc<dyn crate::failed_attempt::FailedAttemptSink>,
+    ) {
+        self.failed_attempt_sinks.insert(scope.to_string(), sink);
     }
 
     /// Borrow the scope registry.
@@ -462,7 +479,12 @@ impl AuthProxy {
             .cloned()
             .ok_or_else(|| Failure::Config(format!("no finder for scope '{scope}'")))?;
         let config = self.config.clone();
-        let strategies = crate::strategy::strategies_for(&mapping, &config);
+        let mut strategies = crate::strategy::strategies_for(&mapping, &config);
+        if let Some(sink) = self.failed_attempt_sinks.get(scope).cloned() {
+            for strategy in &mut strategies {
+                strategy.with_failed_attempt_sink(sink.clone());
+            }
+        }
 
         for strategy in &strategies {
             let strategy_id = strategy.id();
