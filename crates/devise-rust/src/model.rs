@@ -20,26 +20,61 @@ use std::marker::PhantomData;
 
 /// Normalize one credential value per Devise config (AUTH-06).
 ///
-/// Single home for the downcase/trim rules that `ParameterFilter::filter`
-/// applies to `serde_json::Value` trees; this is its flat `Conditions`
-/// counterpart, shared by finders and strategies.
+/// Single home for the downcase/trim rules Devise applies in
+/// `ParameterFilter#filter` and in the `downcase_keys`/`strip_whitespace`
+/// `before_validation` hooks. The finder path (`Conditions`), the JSON-tree
+/// path (`ParameterFilter::filter`), and the write path
+/// (`normalize_attribute_map`) all share this function, so a value can never
+/// normalize differently depending on which door it came through.
 ///
-/// Mirrors the per-value half of `Devise::ParameterFilter#filter` (`devise/lib/devise/parameter_filter.rb`): downcase and strip of a single credential value.
+/// Mirrors the per-value half of `Devise::ParameterFilter#filter` (`devise/lib/devise/parameter_filter.rb`): Ruby's `String#downcase`/`strip`, Unicode-aware like the original.
 #[must_use]
 pub fn normalize_credential_value(
-    value: String,
+    value: &str,
     key: &str,
     case_insensitive_keys: &[String],
     strip_whitespace_keys: &[String],
 ) -> String {
     let mut value = value;
     if case_insensitive_keys.iter().any(|k| k == key) {
-        value.make_ascii_lowercase();
+        value = value.trim();
+        value.to_lowercase()
+    } else if strip_whitespace_keys.iter().any(|k| k == key) {
+        value = value.trim();
+        value.to_string()
+    } else {
+        value.to_string()
     }
-    if strip_whitespace_keys.iter().any(|k| k == key) {
-        value = value.trim().to_string();
+}
+
+/// Normalize a write-path attribute map per Devise config (AUTH-06).
+///
+/// The counterpart of [`normalize_auth_conditions`] for attribute maps:
+/// applies [`normalize_credential_value`] to every string entry of the flat
+/// param map that lands on a record through `assign_attributes`. This is the
+/// port of Devise's `before_validation :downcase_keys` /
+/// `:strip_whitespace` (`devise/lib/devise/models/authenticatable.rb:198-204`)
+/// — normalizing on WRITE, not just on lookup, so `"  Foo@Bar.COM "` is
+/// stored as `foo@bar.com` and cannot coexist with `foo@bar.com`
+/// (`CONCERNS.md` items 4 and 44).
+#[must_use]
+pub fn normalize_attribute_map(
+    params: &serde_json::Map<String, JsonValue>,
+    config: &DeviseConfig,
+) -> serde_json::Map<String, JsonValue> {
+    let mut normalized = params.clone();
+    for (key, value) in &mut normalized {
+        if let JsonValue::String(text) = value {
+            let raw = std::mem::take(text);
+            *text = normalize_credential_value(
+                &raw,
+                key,
+                &config.case_insensitive_keys,
+                &config.strip_whitespace_keys,
+            );
+        }
     }
-    value
+    normalized
 }
 
 /// Normalize auth conditions per Devise config (AUTH-06).///
@@ -54,9 +89,8 @@ pub fn normalize_auth_conditions(conditions: &Conditions, config: &DeviseConfig)
     for (key, value) in conditions.iter() {
         let mut value = value.clone();
         if let Value::String(text) = &mut value {
-            let raw = std::mem::take(text);
             *text = normalize_credential_value(
-                raw,
+                text,
                 key,
                 &config.case_insensitive_keys,
                 &config.strip_whitespace_keys,
@@ -198,6 +232,10 @@ pub trait DatabaseAuthenticatable: Authenticatable {
         params: &mut serde_json::Map<String, JsonValue>,
         config: &DeviseConfig,
     ) -> Result<(), ValidationErrors> {
+        // Devise `before_validation :downcase_keys` / `:strip_whitespace`
+        // (`authenticatable.rb:198-204`): normalize configured keys on WRITE
+        // (CONCERNS #4) — the same single home the finder path uses.
+        *params = normalize_attribute_map(params, config);
         let current = params
             .remove("current_password")
             .and_then(|v| v.as_str().map(str::to_string));
@@ -231,7 +269,16 @@ pub trait DatabaseAuthenticatable: Authenticatable {
         self.assign_attributes(params);
         let mut errors = ValidationErrors::new();
         if !allowed {
-            errors.add("current_password", ":invalid");
+            // Devise (`database_authenticatable.rb:100`): a BLANK
+            // current password reports `:blank`; a wrong one reports
+            // `:invalid`. The keys carry distinct I18n copy (blank =
+            // "can't be blank"), so collapsing them loses the distinction.
+            let key = if current.as_deref().is_none_or(str::is_empty) {
+                ":blank"
+            } else {
+                ":invalid"
+            };
+            errors.add("current_password", key);
         }
         // Virtuals always cleared after the round-trip (Devise
         // `clean_up_passwords` runs on both branches).
@@ -245,7 +292,13 @@ pub trait DatabaseAuthenticatable: Authenticatable {
 
     /// `update_without_password(params)` (DBAU-04): never touches password
     /// fields - strips all three keys and applies the rest.
-    fn update_without_password(&mut self, params: &mut serde_json::Map<String, JsonValue>) {
+    fn update_without_password(
+        &mut self,
+        params: &mut serde_json::Map<String, JsonValue>,
+        config: &DeviseConfig,
+    ) {
+        // Same write-path normalization as `update_with_password` (CONCERNS #4).
+        *params = normalize_attribute_map(params, config);
         params.remove("password");
         params.remove("password_confirmation");
         params.remove("current_password");
@@ -423,8 +476,12 @@ pub trait Registerable: DatabaseAuthenticatable {
         Self: Default + Sized,
     {
         let _ = session;
+        // Devise `before_validation :downcase_keys` / `:strip_whitespace`
+        // (`authenticatable.rb:198-204`): normalize configured keys on WRITE
+        // so the stored email matches what lookups will send (CONCERNS #4).
+        let params = normalize_attribute_map(params, config);
         let mut record = Self::default();
-        record.assign_attributes(params);
+        record.assign_attributes(&params);
         if let Some(password) = params.get("password").and_then(JsonValue::as_str) {
             record.set_password(Some(password.to_string()), config);
         }
@@ -756,7 +813,9 @@ pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
     /// `reset_password_by_token(attributes)` (RCV-02/03): blank token ->
     /// `:reset_password_token :blank` on a fresh record; unknown token ->
     /// `:not_found`; expired window -> `:expired`; otherwise reset, clear,
-    /// and restore the RAW token on the returned record (in memory).
+    /// and restore the RAW token on the returned record (in memory) on the
+    /// FAILURE branch — Devise's `recoverable.rb:148` restores it exactly
+    /// when the token is still present, so the re-rendered form keeps it.
     ///
     /// # Errors
     /// `DeviseError::Adapter` on lookup/persistence failure.
@@ -806,12 +865,17 @@ pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
             .reset_password(password, confirmation, adapter, config)
             .await?
         {
-            Ok(()) => {
-                // Devise restores the raw token on the returned record.
+            Ok(()) => Ok(ResourceWithErrors::new(record, ValidationErrors::new())),
+            Err(errors) => {
+                // Devise (`recoverable.rb:148`) restores the raw token on the
+                // returned record when the token was still present — the
+                // failure branch (a validation error aborts the save before
+                // `clear_reset_password_token` runs), so the re-rendered form
+                // keeps the user's token instead of the digest. The success
+                // branch does NOT restore: the column is already nil'd.
                 record.set_raw_reset_password_token(Some(original));
-                Ok(ResourceWithErrors::new(record, ValidationErrors::new()))
+                Ok(ResourceWithErrors::new(record, errors))
             }
-            Err(errors) => Ok(ResourceWithErrors::new(record, errors)),
         }
     }
 
@@ -1465,6 +1529,87 @@ mod tests {
         }
     }
 
+    /// Ruby `String#downcase` is Unicode-aware; the single normalization home
+    /// must agree with Devise instead of ASCII-only lowercasing.
+    #[test]
+    fn test_normalize_credential_value_uses_unicode_lowercase() {
+        let ci_keys = ["email".to_string()];
+        assert_eq!(
+            normalize_credential_value("ÜSER@ÉXAMPLE.COM", "email", &ci_keys, &[]),
+            "üser@éxample.com"
+        );
+        // Non-configured keys are untouched.
+        assert_eq!(
+            normalize_credential_value("ÜSER", "name", &ci_keys, &[]),
+            "ÜSER"
+        );
+    }
+
+    /// Write-path map normalization (`before_validation` downcase/strip): the
+    /// same rules the finder path applies must be applied to attributes before
+    /// they land on a record, so `"  Foo@Bar.COM "` is stored as
+    /// `foo@bar.com` and cannot coexist with `foo@bar.com`.
+    #[test]
+    fn test_normalize_attribute_map_normalizes_configured_keys() {
+        let config = test_config();
+        let mut params = serde_json::Map::new();
+        params.insert("email".to_string(), JsonValue::from("  Foo@Bar.COM  "));
+        params.insert("password".to_string(), JsonValue::from("secret123"));
+        let normalized = normalize_attribute_map(&params, &config);
+        assert_eq!(normalized["email"], JsonValue::from("foo@bar.com"));
+        assert_eq!(normalized["password"], JsonValue::from("secret123"));
+    }
+
+    /// REGS-01 + CONCERNS #4: `new_with_session` normalizes configured keys
+    /// before assigning, mirroring Devise's `before_validation` hooks.
+    #[tokio::test]
+    async fn test_new_with_session_normalizes_email() {
+        let config = test_config();
+        let mut params = serde_json::Map::new();
+        params.insert("email".to_string(), JsonValue::from("  Foo@Bar.COM "));
+        params.insert("password".to_string(), JsonValue::from("secret123"));
+        let user = TestUser::new_with_session(&params, &JsonValue::Null, &config);
+        assert_eq!(user.email_value(), Some("foo@bar.com"));
+    }
+
+    /// DBAU-03 + CONCERNS #4: `update_with_password` normalizes the new email
+    /// before assigning it to the record.
+    #[tokio::test]
+    async fn test_update_with_password_normalizes_email() {
+        let config = test_config();
+        let user = TestUser::testing("secret123", &config);
+        let mut record = user.clone();
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "current_password".to_string(),
+            JsonValue::from("secret123".to_string()),
+        );
+        params.insert("email".to_string(), JsonValue::from("  NEW@Example.COM "));
+        DatabaseAuthenticatable::update_with_password(&mut record, &mut params, &config)
+            .expect("valid current password");
+        assert_eq!(record.email_value(), Some("new@example.com"));
+    }
+
+    /// End-to-end parity for CONCERNS #4/#44: a sign-up with a mixed-case,
+    /// whitespace-padded email must be findable by its normalized form and
+    /// must collide with a plain normalized duplicate.
+    #[tokio::test]
+    async fn test_write_path_normalization_matches_finder_path() {
+        let config = test_config();
+        let mut params = serde_json::Map::new();
+        params.insert("email".to_string(), JsonValue::from(" Foo@Bar.COM "));
+        params.insert("password".to_string(), JsonValue::from("secret123"));
+        let user = TestUser::new_with_session(&params, &JsonValue::Null, &config);
+
+        let adapter = MemoryAdapter::<TestUser>::new();
+        adapter.create(user.clone()).await.unwrap();
+
+        let mut conditions = Conditions::new();
+        conditions.insert("email", AdapterValue::String("foo@bar.com".to_string()));
+        let found = TestUser::find_for_authentication(&conditions, &adapter, &config).await;
+        assert!(found.is_some(), "normalized sign-up email must be findable");
+    }
+
     #[tokio::test]
     async fn test_authenticatable_trait() {
         let config = test_config();
@@ -1668,7 +1813,7 @@ mod tests {
             "email".to_string(),
             JsonValue::String("safe@example.com".to_string()),
         );
-        DatabaseAuthenticatable::update_without_password(&mut plain, &mut params);
+        DatabaseAuthenticatable::update_without_password(&mut plain, &mut params, &config);
         assert_eq!(plain.encrypted_password, encrypted_before);
         assert_eq!(plain.email, "safe@example.com");
 
@@ -2320,10 +2465,9 @@ mod tests {
         ));
         assert_eq!(outcome.record.reset_password_token(), None);
         assert_eq!(outcome.record.reset_password_sent_at, None);
-        assert_eq!(
-            outcome.record.raw_reset_password_token(),
-            Some(raw.as_str())
-        );
+        // Devise parity (`recoverable.rb:148`): the raw token is restored on
+        // the FAILURE branch only; a successful reset nil'd the column.
+        assert_eq!(outcome.record.raw_reset_password_token(), None);
 
         // The cleared state persisted.
         let reloaded = adapter.get(&DeviseKey::from_i64(1)).await.unwrap().unwrap();
@@ -2661,12 +2805,13 @@ mod tests {
         .await
         .unwrap();
         assert!(outcome.is_valid(), "in-window reset: {:?}", outcome.errors);
-        assert_eq!(
-            outcome.record.raw_reset_password_token(),
-            Some(raw.as_str())
-        );
+        // Devise parity (`recoverable.rb:148`): success does NOT restore the
+        // raw token (the column is cleared); restoration is failure-branch.
+        assert_eq!(outcome.record.raw_reset_password_token(), None);
 
         // Mismatched confirmation surfaces :confirmation (validation path).
+        // Devise restores the raw token on this failure branch so the
+        // re-rendered form keeps the user's token (`recoverable.rb:148`).
         let raw = issue_reset_token(&adapter, &mailer, &config, &clock).await;
         let outcome = TestUser::reset_password_by_token(
             &reset_attrs(&raw, "freshpass1", "different9"),
@@ -2682,6 +2827,11 @@ mod tests {
                 .get("password_confirmation")
                 .map(Vec::as_slice),
             Some(&[":confirmation".to_string()][..])
+        );
+        assert_eq!(
+            outcome.record.raw_reset_password_token(),
+            Some(raw.as_str()),
+            "failed reset must keep the raw token for the re-rendered form"
         );
 
         // RCV-02 switch: sign_in_after_reset_password reads config (Warden-side

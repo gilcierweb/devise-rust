@@ -8,7 +8,7 @@
 
 use crate::adapter::{Conditions, DeviseKey, Value};
 use crate::config::DeviseConfig;
-use crate::failure::{AuthOutcome, Failure};
+use crate::failure::{AuthOutcome, Failure, FailureReason};
 use crate::model::ModelFinder;
 use crate::request::AuthRequest;
 use crate::scope::Mapping;
@@ -131,6 +131,38 @@ pub fn strategies_for(mapping: &Mapping, config: &DeviseConfig) -> Vec<Box<dyn S
     chain
 }
 
+/// Devise's unknown-account failure branch.
+///
+/// Mirrors `Devise::Strategies::DatabaseAuthenticatable#authenticate!`
+/// (`devise/lib/devise/strategies/database_authenticatable.rb:22-25`):
+/// in paranoid mode a dummy password is hashed so the request takes the same
+/// time as an existing account (enumeration timing mitigation), and the
+/// unified `:invalid` failure is reported; otherwise the account's absence
+/// is reported through the `:not_found_in_database` failure key.
+///
+/// Returns the flash/I18n key the caller must fail with. Single home for the
+/// rule — [`ParanoidStrategy`] and the framework controllers share it.
+#[must_use]
+pub fn unknown_account_failure(config: &DeviseConfig) -> &'static str {
+    if config.paranoid {
+        paranoid_timing_equalize(config);
+        "invalid"
+    } else {
+        FailureReason::NotFoundInDatabase.flash_key()
+    }
+}
+
+/// Hash a dummy password so an unknown-account failure costs the same as a
+/// real bcrypt verification (Devise's paranoid mitigation,
+/// `strategies/database_authenticatable.rb:22`).
+///
+/// The digest is discarded: only the elapsed work matters.
+pub fn paranoid_timing_equalize(config: &DeviseConfig) {
+    if config.paranoid {
+        let _dummy = crate::crypto::encryptor::digest("", config);
+    }
+}
+
 /// Params strategy - form credentials in `params[scope]`.
 ///
 /// Mirrors `DatabaseAuthenticatable`: honors `params_authenticatable`,
@@ -163,7 +195,7 @@ impl ParamsStrategy {
         for key in &self.authentication_keys {
             let raw = extract_param(request, scope, key)?;
             let value = crate::model::normalize_credential_value(
-                raw,
+                &raw,
                 key,
                 &self.case_insensitive_keys,
                 &self.strip_whitespace_keys,
@@ -478,7 +510,7 @@ impl<S: Strategy + Send + Sync> Strategy for ParanoidStrategy<S> {
             .await
         {
             Err(Failure::NotFound) if config.paranoid => {
-                let _dummy = crate::crypto::encryptor::digest("", config);
+                paranoid_timing_equalize(config);
                 Err(Failure::InvalidCredentials { message: "invalid" })
             }
             result => result,
@@ -697,6 +729,32 @@ mod tests {
             .authenticate(&request, &test_mapping(), &finder, &config)
             .await;
         assert!(matches!(result, Err(Failure::InvalidCredentials { .. })));
+    }
+
+    /// Devise parity (`database_authenticatable.rb:22-25`): an unknown
+    /// account fails with the `:not_found_in_database` key when paranoid is
+    /// off, and the unified `:invalid` (after the dummy-hash timing
+    /// equalization) when paranoid is on.
+    #[test]
+    fn test_unknown_account_failure_keys() {
+        assert_eq!(
+            unknown_account_failure(&test_config()),
+            "not_found_in_database"
+        );
+
+        let mut paranoid = test_config();
+        paranoid.paranoid = true;
+        assert_eq!(unknown_account_failure(&paranoid), "invalid");
+    }
+
+    /// The `not_found_in_database` locale key must stay reachable through
+    /// `FailureReason` (the controllers fail with the flash key).
+    #[test]
+    fn test_not_found_reason_flash_key() {
+        assert_eq!(
+            FailureReason::NotFoundInDatabase.flash_key(),
+            "not_found_in_database"
+        );
     }
 
     #[tokio::test]

@@ -18,20 +18,24 @@ impl ParameterFilter {
     /// - Strips whitespace from `strip_whitespace_keys`
     /// - Non-string scalars are left typed (stringify at the query layer if needed)
     ///
+    /// The per-value rules live in
+    /// [`crate::model::normalize_credential_value`] — the single home shared
+    /// with the finder and write paths, so this method only owns the JSON-tree
+    /// walk.
+    ///
     /// Mirrors `ParameterFilter#filter`: downcase `case_insensitive_keys`, strip `strip_whitespace_keys`, and stringify scalar values.
     pub fn filter(value: &mut Value, config: &DeviseConfig) {
         match value {
             Value::Object(map) => {
                 for (key, val) in map.iter_mut() {
-                    if config.case_insensitive_keys.iter().any(|k| k == key) {
-                        if let Value::String(s) = val {
-                            *s = s.to_lowercase();
-                        }
-                    }
-                    if config.strip_whitespace_keys.iter().any(|k| k == key) {
-                        if let Value::String(s) = val {
-                            *s = s.trim().to_string();
-                        }
+                    if let Value::String(text) = val {
+                        let raw = std::mem::take(text);
+                        *text = crate::model::normalize_credential_value(
+                            &raw,
+                            key,
+                            &config.case_insensitive_keys,
+                            &config.strip_whitespace_keys,
+                        );
                     }
                     // Recurse for nested objects
                     Self::filter(val, config);
@@ -213,6 +217,25 @@ mod tests {
         ParameterFilter::filter(&mut params, &config);
 
         assert_eq!(params["user"]["email"], "user@example.com");
+    }
+
+    /// Devise's `String#downcase` is Unicode-aware; the filter must share the
+    /// single normalization home instead of an ASCII-only lowercase.
+    #[test]
+    fn test_parameter_filter_downcase_is_unicode_aware() {
+        let config = DeviseConfig {
+            case_insensitive_keys: vec!["email".to_string()],
+            ..DeviseConfig::default()
+        };
+
+        let mut params = json!({
+            "email": "ÜSER@ÉXAMPLE.COM",
+            "password": "secret"
+        });
+
+        ParameterFilter::filter(&mut params, &config);
+
+        assert_eq!(params["email"], "üser@éxample.com");
     }
 
     #[test]
