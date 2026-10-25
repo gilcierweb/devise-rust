@@ -1703,6 +1703,7 @@ mod tests {
             maximum_attempts: 3,
             unlock_strategy: "time".to_string(),
             stretches: 4,
+            http_authenticatable: true,
             ..test_config()
         }
     }
@@ -1864,5 +1865,71 @@ mod tests {
             matches!(result, Ok(AuthOutcome::Success(_))),
             "correct password authenticates through the chain"
         );
+    }
+
+    fn basic_request(password: &str) -> AuthRequest {
+        use base64::Engine as _;
+        let mut request = AuthRequest::new(crate::request::HttpMethod::Get, "/users/probe");
+        let raw = format!("chain@example.com:{password}");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        request
+            .headers
+            .insert("authorization".to_string(), format!("Basic {encoded}"));
+        request
+    }
+
+    /// Devise parity for the HTTP Basic arm: brute force over
+    /// `Authorization: Basic` runs the very same lockable accounting as the
+    /// params strategy (the sink is registered per scope and both credential
+    /// strategies read it), and a crossed threshold reports `locked`.
+    #[tokio::test]
+    async fn http_basic_chain_counts_and_locks_through_the_sink() {
+        let config = chain_config();
+        let clock = FixedClock::now();
+        let adapter = Arc::new(MemoryAdapter::<TestUser>::new());
+        let seeded = TestUser::fresh(1, "chain@example.com").with_password("secret123", &config);
+        adapter.create(seeded).await.unwrap();
+
+        let finder = AdapterBridge::new((*adapter).clone());
+        let sink = Arc::new(MemorySink {
+            adapter: adapter.clone(),
+            mailer: Arc::new(TestMailer::default()),
+            config: Arc::new(config.clone()),
+            clock: Arc::new(clock),
+        });
+        let strategy = crate::strategy::HttpBasicStrategy::default().with_failed_attempt_sink(sink);
+        let mapping = mapping();
+
+        // Wrong password #1: counted, reported :invalid.
+        let first = strategy
+            .authenticate(&basic_request("wrong"), &mapping, &finder, &config)
+            .await;
+        assert!(matches!(
+            first,
+            Err(Failure::InvalidCredentials { message: "invalid" })
+        ));
+        let stored = adapter.get(&DeviseKey::from_i64(1)).await.unwrap().unwrap();
+        assert_eq!(stored.failed_attempts(), 1, "attempt 1 counted on basic");
+
+        // Attempts 2 and 3: the third crosses maximum_attempts and locks.
+        let _ = strategy
+            .authenticate(&basic_request("wrong"), &mapping, &finder, &config)
+            .await;
+        let third = strategy
+            .authenticate(&basic_request("wrong"), &mapping, &finder, &config)
+            .await;
+        assert!(matches!(
+            third,
+            Err(Failure::InvalidCredentials { message: "locked" })
+        ));
+
+        // A locked record fails with `locked` even for the CORRECT password.
+        let right = strategy
+            .authenticate(&basic_request("secret123"), &mapping, &finder, &config)
+            .await;
+        assert!(matches!(
+            right,
+            Err(Failure::InvalidCredentials { message: "locked" })
+        ));
     }
 }

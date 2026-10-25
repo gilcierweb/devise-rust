@@ -332,6 +332,10 @@ pub struct HttpBasicStrategy {
     pub http_authentication_key: Option<String>,
     /// Whether XHR requests may use Basic auth.
     pub http_authenticatable_on_xhr: bool,
+    /// Failed-attempt persistence (Devise's `valid_for_authentication?`
+    /// side effects over this strategy path); `None` = no accounting,
+    /// matching the params strategy's default.
+    pub failed_attempt_sink: Option<Arc<dyn crate::failed_attempt::FailedAttemptSink>>,
 }
 
 impl Default for HttpBasicStrategy {
@@ -340,7 +344,20 @@ impl Default for HttpBasicStrategy {
             authentication_keys: vec!["email".to_string()],
             http_authentication_key: None,
             http_authenticatable_on_xhr: true,
+            failed_attempt_sink: None,
         }
+    }
+}
+
+impl HttpBasicStrategy {
+    /// Attach the failed-attempt sink (builder).
+    #[must_use]
+    pub fn with_failed_attempt_sink(
+        mut self,
+        sink: Arc<dyn crate::failed_attempt::FailedAttemptSink>,
+    ) -> Self {
+        self.failed_attempt_sink = Some(sink);
+        self
     }
 }
 
@@ -391,7 +408,20 @@ impl Strategy for HttpBasicStrategy {
                 "model does not support password verification".to_string(),
             ));
         };
-        if check.valid_password(&password, config) {
+        let password_ok = check.valid_password(&password, config);
+        // Devise's `Authenticatable#validate(resource) { resource.valid_password?(password) }`
+        // runs the module side effects for BOTH outcomes on this strategy too:
+        // lockable counts an HTTP Basic brute force, releases an expired lock,
+        // locks at the threshold, and rejects an already-locked record even
+        // when the password is correct (closed 2026-10-25).
+        if let Some(sink) = &self.failed_attempt_sink {
+            if let crate::failed_attempt::AttemptVerdict::Failed(message) =
+                sink.record(&user.to_key(), password_ok).await
+            {
+                return Err(Failure::InvalidCredentials { message });
+            }
+        }
+        if password_ok {
             // DBAU-07: after_database_authentication fires here (Devise's
             // database_authenticatable strategy); http_basic is its twin.
             user.after_database_authentication();
@@ -403,6 +433,13 @@ impl Strategy for HttpBasicStrategy {
 
     fn id(&self) -> &'static str {
         "http_basic"
+    }
+
+    fn with_failed_attempt_sink(
+        &mut self,
+        sink: Arc<dyn crate::failed_attempt::FailedAttemptSink>,
+    ) {
+        self.failed_attempt_sink = Some(sink);
     }
 }
 

@@ -974,3 +974,69 @@ async fn flow_account_update_email_change_notifies_both_addresses() {
     );
     assert_eq!(confirmations[0].to, "new-addr@example.com");
 }
+
+/// Devise lockable parity (`lockable.rb:127-131`): the attempt that CROSSES
+/// the threshold and locks the account still reports the paranoid-unified
+/// `invalid` key - lock state must not signal account existence, and a later
+/// correct-password attempt on the locked account reports `invalid` too.
+#[actix_web::test]
+async fn flow_sign_in_lock_under_paranoid_reports_invalid() {
+    let mut config = common::test_config();
+    config.maximum_attempts = 2;
+    config.paranoid = true;
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
+    seed_user(&state, "flow12@example.com", "secret123").await;
+
+    let first = form_sign_in(&app, "flow12@example.com", "wrongpass").await;
+    assert_eq!(first.status(), 302);
+
+    let resp = form_sign_in(&app, "flow12@example.com", "wrongpass").await;
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=invalid")),
+        "threshold lock under paranoid reports invalid: {cookies:?}"
+    );
+    assert!(
+        !cookies.iter().any(|c| c.starts_with("devise.flash=locked")),
+        "paranoid must not leak the lock: {cookies:?}"
+    );
+
+    // The account is now locked; even the correct password stays unified.
+    let resp = form_sign_in(&app, "flow12@example.com", "secret123").await;
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=invalid")),
+        "locked + correct password stays unified: {cookies:?}"
+    );
+}
+
+/// The non-paranoid counterpart: the same threshold lock reports `locked`,
+/// pinning that the unified key above is the paranoid branch and not a
+/// blanket suppression.
+#[actix_web::test]
+async fn flow_sign_in_lock_without_paranoid_reports_locked() {
+    let mut config = common::test_config();
+    config.maximum_attempts = 2;
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
+    seed_user(&state, "flow13@example.com", "secret123").await;
+
+    let _ = form_sign_in(&app, "flow13@example.com", "wrongpass").await;
+    let resp = form_sign_in(&app, "flow13@example.com", "wrongpass").await;
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies.iter().any(|c| c.starts_with("devise.flash=locked")),
+        "threshold lock without paranoid reports locked: {cookies:?}"
+    );
+}

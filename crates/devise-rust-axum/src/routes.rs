@@ -862,7 +862,12 @@ where
     };
     match outcome {
         LockAttemptOutcome::Locked => {
-            return auth_fail(&auth_request, &st, "locked");
+            // Same core rule as the incremented arm: under paranoid Devise
+            // reports :invalid for a lock this attempt just triggered, so the
+            // lock state cannot signal account existence
+            // (`lockable.rb:127-131`).
+            let key = record.lock_unauthenticated_message(&st.config, st.clock.as_ref());
+            return auth_fail(&auth_request, &st, key);
         }
         LockAttemptOutcome::FailedIncremented => {
             // Devise's `unauthenticated_message` (lockable branch,
