@@ -266,9 +266,147 @@ pub fn filter_unsafe_attributes(
         .collect()
 }
 
+/// Debug redaction for OWNED models: the `inspect` half of
+/// [`UNSAFE_ATTRIBUTES_FOR_SERIALIZATION`] for concrete application types.
+///
+/// Core redacts the trait-object path already (`AnyDeviseModel` prints only
+/// the filtered hash wherever core formats a record); a concrete model that
+/// derives `Debug` bypasses that, and Devise's own answer is `inspect` over
+/// `serializable_hash`. Application models therefore delegate: remove
+/// `Debug` from the derive list and write
+/// `impl fmt::Debug for User { fn fmt(&self, f) -> fmt::Result { devise_rust::error::Redacted(self).fmt(f) } }`.
+/// Models whose `serializable_hash` is hand-written already exclude secrets;
+/// the filter runs again here as the second line of defense.
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::error::Redacted;
+/// # use devise_rust::adapter::DeviseKey;
+/// # use devise_rust::failure::AnyDeviseModel;
+/// # struct User { id: i64, email: String, encrypted_password: String }
+/// # impl AnyDeviseModel for User {
+/// #     fn to_key(&self) -> DeviseKey { DeviseKey::from_i64(self.id) }
+/// #     fn redacted_hash(&self) -> serde_json::Value {
+/// #         serde_json::json!({
+/// #             "id": self.id,
+/// #             "email": self.email,
+/// #             "encrypted_password": self.encrypted_password,
+/// #         })
+/// #     }
+/// #     fn as_any(&self) -> &dyn std::any::Any { self }
+/// # }
+/// let user = User {
+///     id: 7,
+///     email: "user@example.com".to_string(),
+///     encrypted_password: "$2b$12$notprintable".to_string(),
+/// };
+/// let printed = format!("{user:?}", user = Redacted(&user));
+/// assert!(printed.contains("user@example.com"), "safe fields still print");
+/// assert!(!printed.contains("encrypted_password"));
+/// assert!(!printed.contains("notprintable"));
+/// ```
+#[derive(Clone, Copy)]
+pub struct Redacted<'a>(pub &'a dyn crate::failure::AnyDeviseModel);
+
+impl std::fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.redacted_hash() {
+            serde_json::Value::Object(map) => {
+                let safe = filter_unsafe_attributes(&map);
+                f.debug_map()
+                    .entries(safe.iter().map(|(k, v)| (k.as_str(), v)))
+                    .finish()
+            }
+            other => write!(f, "{other}"),
+        }
+    }
+}
+
 impl From<crate::failure::Failure> for DeviseError {
     fn from(failure: crate::failure::Failure) -> Self {
         DeviseError::Internal(format!("{failure:?}"))
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    use crate::adapter::DeviseKey;
+
+    #[derive(serde::Serialize)]
+    struct LeakyUser {
+        id: i64,
+        email: String,
+        encrypted_password: String,
+        reset_password_token: Option<String>,
+    }
+
+    impl crate::failure::AnyDeviseModel for LeakyUser {
+        fn to_key(&self) -> DeviseKey {
+            DeviseKey::from_i64(self.id)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn redacted_hash(&self) -> serde_json::Value {
+            let map = serde_json::to_value(self).expect("serializes");
+            match map {
+                serde_json::Value::Object(map) => {
+                    serde_json::Value::Object(filter_unsafe_attributes(&map))
+                }
+                other => other,
+            }
+        }
+    }
+
+    /// CONCERNS #6: the owned-model redaction prints safe fields and never
+    /// the bcrypt digest or the token (the derive(Debug) leak the demos
+    /// carried, closed 2026-10-25).
+    #[test]
+    fn redacted_debug_never_prints_secrets() {
+        let user = LeakyUser {
+            id: 42,
+            email: "user@example.com".to_string(),
+            encrypted_password: "$2b$12$deadbeef".to_string(),
+            reset_password_token: Some("rawtokenvalue".to_string()),
+        };
+        let printed = format!("{:?}", Redacted(&user));
+        assert!(printed.contains("user@example.com"));
+        assert!(printed.contains("42"));
+        assert!(!printed.contains("deadbeef"));
+        assert!(!printed.contains("encrypted_password"));
+        assert!(!printed.contains("rawtokenvalue"));
+        assert!(!printed.contains("reset_password_token"));
+    }
+
+    /// A model that keeps the default (no override) prints nothing.
+    #[test]
+    fn default_redacted_hash_is_empty() {
+        struct PlainUser;
+
+        impl crate::failure::AnyDeviseModel for PlainUser {
+            fn to_key(&self) -> DeviseKey {
+                DeviseKey::from_i64(0)
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let user = PlainUser;
+        assert_eq!(
+            crate::failure::AnyDeviseModel::redacted_hash(&user),
+            serde_json::Value::Object(serde_json::Map::new())
+        );
+        assert_eq!(
+            format!("{:?}", Redacted(&user)),
+            "{}",
+            "the default projection is an empty map"
+        );
     }
 }
 

@@ -94,7 +94,7 @@ diesel::table! {
 type SqliteConn = SyncConnectionWrapper<SqliteConnection>;
 
 /// Devise-facing user model: the diesel row plus the virtual password fields.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct ExampleUser {
     pub id: i64,
     pub email: String,
@@ -476,7 +476,19 @@ fn query_err(e: diesel::result::Error) -> OrmError {
 // Devise module trait bundle on ExampleUser
 // ============================================================================
 
+impl std::fmt::Debug for ExampleUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // CONCERNS #6: Devise's inspect never prints credentials; the
+        // redaction wrapper is the port's single home for that on owned models.
+        devise_rust::error::Redacted(self).fmt(f)
+    }
+}
+
 impl AnyDeviseModel for ExampleUser {
+        fn redacted_hash(&self) -> serde_json::Value {
+            <Self as devise_rust::model::Authenticatable>::serializable_hash(self)
+        }
+
     fn as_activatable(&self) -> Option<&dyn devise_rust::model::Activatable> {
         Some(self)
     }

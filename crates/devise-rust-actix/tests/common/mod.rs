@@ -125,7 +125,7 @@ use serde_json::Value as JsonValue;
 
 /// Full-module fixture user: every Devise module trait implemented so the
 /// route matrix can exercise all five controllers against one model.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct FixtureUser {
     pub id: i64,
     pub email: String,
@@ -184,7 +184,19 @@ impl FixtureUser {
     }
 }
 
+impl std::fmt::Debug for FixtureUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // CONCERNS #6: Devise's inspect never prints credentials; the
+        // redaction wrapper is the port's single home for that on owned models.
+        devise_rust::error::Redacted(self).fmt(f)
+    }
+}
+
 impl AnyDeviseModel for FixtureUser {
+        fn redacted_hash(&self) -> serde_json::Value {
+            <Self as devise_rust::model::Authenticatable>::serializable_hash(self)
+        }
+
     fn as_activatable(&self) -> Option<&dyn devise_rust::model::Activatable> {
         Some(self)
     }

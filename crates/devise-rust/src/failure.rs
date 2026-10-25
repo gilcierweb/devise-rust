@@ -327,6 +327,18 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
 
     /// Downcast to concrete type
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// The model's redaction projection, the object-safe twin of
+    /// [`Authenticatable::serializable_hash`](crate::model::Authenticatable::serializable_hash):
+    /// an empty object by default, so generic Debug/logging paths print
+    /// nothing rather than secrets. Models that own a concrete
+    /// `serializable_hash` override this by delegating to it, and
+    /// [`Redacted`](crate::error::Redacted) reads it. It is a DISTINCT
+    /// method name on purpose: `serializable_hash` already resolves to
+    /// `Authenticatable` on every model implementing both traits.
+    fn redacted_hash(&self) -> serde_json::Value {
+        serde_json::Value::Object(serde_json::Map::new())
+    }
 }
 
 impl From<crate::error::DeviseError> for Failure {
