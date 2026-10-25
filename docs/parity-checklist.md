@@ -1,5 +1,57 @@
 # Parity checklist (ported or waived)
 
+> **Audit corrections (2026-10-24, batch `261024-wva`).** A read-only
+> parity/security audit verified this checklist row by row and found that
+> the evidence citations were frequently overstated: many rows marked
+> `ported` point at test names or file paths that do not exist in the tree
+> (production functions, English descriptions, or pure inventions), and a
+> set of Devise behaviors were claimed ported while the shipped HTTP
+> controllers bypassed the core logic that implements them. The behaviors
+> are now fixed in the code (security batch 1–9 of the remediation); the
+> statistical claims in this document are corrected below. **Until the
+> remaining citations are re-verified individually, treat the
+> "Rust test evidence" column as indicative, not authoritative**; each
+> fix now carries a named test in `crates/devise-rust*/tests/devise_flows.rs`,
+> `session_bridge.rs`, `routes.rs`, or `crates/devise-rust/src/*` module
+> tests, and those are the citable surface. Verified measurements (not
+> claims): 882 Ruby blocks enumerated, ~560 with a verifiable Rust test at
+> audit time; the implemented gaps closed since then are listed in
+> "Behaviors closed by the 2026-10-24 remediation" below.
+
+## Behaviors closed by the 2026-10-24 remediation
+
+| Devise behavior | Where it lives now | Test that proves it |
+|---|---|---|
+| bcrypt cost clamp (`BCrypt::Errors::InvalidCost` → clamp 4..=31, no panic) | `crates/config.rs` `DeviseConfig::bcrypt_cost` | `config::tests::test_bcrypt_cost_clamps_to_valid_range`, `crypto::tests::test_encryptor_clamps_cost_below_minimum` |
+| `:not_found_in_database` failure key + paranoid dummy-hash on the HTTP path | `strategy::unknown_account_failure` / `paranoid_timing_equalize` | `strategy::tests::test_unknown_account_failure_keys`, `tests/devise_flows.rs::flow_sign_in_unknown_email_reports_not_found` (+ paranoid variant) |
+| Write-path `case_insensitive_keys`/`strip_whitespace_keys` normalization | `model::normalize_attribute_map` (single home shared with finders) | `model::tests::test_normalize_attribute_map_normalizes_configured_keys`, `test_new_with_session_normalizes_email`, `test_update_with_password_normalizes_email` |
+| Reconfirmable email postponement (#5783) on `registrations#update` | both bridges' write phase | `flow_account_update_email_postpones_until_confirmation` (actix + axum) |
+| Reset token cleared on password change (`recoverable.rb:32`) | both bridges' write phase | `flow_account_update_clears_reset_token_on_password_change` |
+| `set_flash_message_for_update` 3-way keys | both bridges | same test asserts `update_needs_confirmation`; `flow_account_update_plain_flash` asserts `updated` |
+| `handle_unverified_request` (CSRF failure signs out all scopes) | `bridge::handle_unverified_request` (actix + axum) | `tracer_handle_unverified_request_clears_all_scopes`, `renewal_handle_unverified_request_clears_every_scope` |
+| `send_paranoid_instructions` for confirmations/unlocks controllers | both bridges' create actions | covered by the create-matrix tests; catalog keys now reachable |
+| `verify_signed_out_user` / `already_signed_out` (401 for API) | both bridges' `sessions#destroy` | `flow_sign_out_again_reports_already_signed_out` (actix + axum) |
+| `require_no_authentication` / `already_authenticated` | both bridges' `sessions#create` | `flow_sign_in_while_signed_in_reports_already_authenticated` (actix + axum) |
+| `expire_data_after_sign_in!` on inactive sign-up + cancel redirect | `bridge::expire_devise_data` + cancel handlers | routes tests assert the cancel 303 to sign-up |
+| `reset_password_by_token` raw-token restoration branch (`recoverable.rb:148`) | `model.rs` failure branch | `reset_password_by_token_window`, `reset_flow_tracer` |
+| `:blank` vs `:invalid` for `current_password` | `model::update_with_password` | `database_authenticatable_methods` matrix |
+| `allow_unconfirmed_access_for: nil` / `timeout_in: nil` (never expire) | `Option<TimeDelta>` config fields | `confirmable_allow_window_three_way_table` (nil arm), timeoutable matrix |
+| Remember cookie 5-condition reachable from actix extractors | middleware remember-me arm | `flow_two_cookie_jar_password_change_kills_session_and_remember`, `rememberable_same_second_mint_stays_valid` |
+| Same-second remember mint stays valid | `rememberable::build_cookie_triple_after_created_at` | `rememberable_same_second_mint_stays_valid` |
+| Trackable writes NULL (not `""`) for a missing peer IP | `trackable::update_tracked_fields` | `trackable_matrix_extract_ip_overridable` (asserts `None`) |
+| `sign_out_via: [:get, :post]` arrays emit one row per verb | `scope::SignOutVia::Multiple` + route table | `test_sign_out_via_array_emits_one_row_per_verb` |
+| Unlock routes drop when unlock strategy excludes `:email` | `scope::route_specs_with_config` | `test_unlock_route_guard_follows_unlock_strategy` |
+| Recall re-renders to the scope's sign-in path | both failure renderers | failure renderer tests |
+
+## Known remaining divergences (documented, not silently claimed ported)
+
+- No `devise` macro / `check_fields!` equivalent (missing-column failures are not detected at load time).
+- `active_for_authentication?` gating is composed by the application (core exposes the confirmable/lockable gate slices), not enforced by the proxy.
+- Lockable failed-attempt counting runs in the controllers (not inside the core strategy chain).
+- `confirmation_token` stores an HMAC digest where Devise stores the raw token (dual lookup preserves compatibility; documented in CONCERNS #3).
+- `email_changed` notification recipient is app-supplied (no automatic `email_was`).
+- The full suite at remediation time: `cargo test --workspace` green (517 tests); Postgres legs run under testcontainers.
+
 This is the exhaustive per-test-block accounting of the vendored Devise v5.0.4 suite (`devise/test/`, untracked upstream reference) against the devise-rust test suite, per decision D-11: every block is either `ported` with the Rust test path that proves it, or `waived` (or `deviated`) with a per-case written reason and v1 impact, per D-12. No block is silently dropped. The guides, the CHANGELOG, and [rails-mapping.md](rails-mapping.md) cite these rows as the single source of truth; the method-by-method API view of the same audit lives in [rails-parity.md](rails-parity.md).
 
 ## Method
@@ -1294,5 +1346,9 @@ Both harnesses exist on the current tree: the Phase 8 actix harness (`actix_web:
 | actix session bridge | `cargo test -p devise-rust-actix --test session_bridge` | green: 3 passed, 0 failed |
 | actix omniauth flows | `cargo test -p devise-rust-actix --test omniauth_flows` | green: 10 passed, 0 failed |
 
-Supporting TEST-01 and gate runs on the same tree: `cargo test -p devise-rust` green (241 lib, 5 model_validation, 4 notifications, 44 doctests), `cargo test -p devise-rust-migrations` green (43 tests across the lib and snapshot matrix), `cargo test -p devise-rust --lib scope` green (23 passed), `cargo test -p devise-rust --lib omniauthable` green (17 passed), `cargo clippy --all-targets --all-features -- -D warnings` green (exit 0, no warnings), `cargo fmt --all -- --check` green (exit 0).
+Supporting TEST-01 and gate runs on the same tree: `cargo test -p devise-rust` green (305 lib, 5 model_validation, 4 notifications, 45 doctests), `cargo test -p devise-rust-migrations` green (26 tests: 5 lib + 5 bin + 16 snapshots), `cargo test -p devise-rust --lib scope` green (25 passed), `cargo test -p devise-rust --lib omniauthable` green (17 passed), `cargo clippy --all-targets --all-features -- -D warnings` green (exit 0, no warnings), `cargo fmt --all -- --check` green (exit 0).
+
+Measured 2026-10-24 (batch 261024-wva): `cargo test --workspace` green with 517 tests total (core 305, actix+axum 120, adapter-tests oracle, migrations 26, ORM backends 38 on sqlite legs and 37 on the testcontainers Postgres legs), 0 clippy warnings across all targets.
+
+Corrected counts from the 2026-10-24 audit: the earlier claims of "241 lib" and "43 migrations tests" were stale/incorrect (measured: 305 lib, 26 migrations). The earlier claim of "770/882 (87%) ported" is not substantiated; the auditable figure is ~560/882 (~63%) with a named test, and the remediation above closes the verified behavioral gaps that the checklist claimed without evidence.
 
