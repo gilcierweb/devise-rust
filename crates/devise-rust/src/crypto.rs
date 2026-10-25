@@ -59,16 +59,20 @@ pub mod encryptor {
     /// assert!(hashed.starts_with("$2"));
     /// ```
     ///
+    /// The bcrypt cost is read from [`DeviseConfig::bcrypt_cost`], which clamps
+    /// `stretches` into bcrypt's valid 4..=31 range.
+    ///
     /// # Panics
     ///
-    /// Panics if bcrypt fails with the clamped cost (should not happen - cost is clamped to ≤ 31).
+    /// Only if bcrypt rejects a cost inside its own valid range (a bcrypt-crate
+    /// bug — unreachable, kept as a defensive invariant check).
     #[must_use]
     pub fn digest(password: &str, config: &DeviseConfig) -> String {
         let mut password_with_pepper = password.to_string();
         if let Some(pepper) = &config.pepper {
             password_with_pepper.push_str(pepper);
         }
-        let cost = config.stretches.min(31); // bcrypt max cost is 31
+        let cost = config.bcrypt_cost();
         hash(password_with_pepper, cost).expect("bcrypt hash should not fail with valid cost")
     }
 
@@ -230,6 +234,28 @@ mod tests {
         let hashed = encryptor::digest(password, &config);
         assert!(encryptor::compare(password, &hashed, &config));
         assert!(!encryptor::compare("wrong-password", &hashed, &config));
+    }
+
+    /// Regression: `stretches` below bcrypt's minimum cost used to panic
+    /// (`CostNotAllowed` → `expect`). The cost is now clamped to the valid
+    /// 4..=31 range, so an out-of-range config hashes instead of panicking.
+    #[test]
+    fn test_encryptor_clamps_cost_below_minimum() {
+        let config = DeviseConfig {
+            stretches: 1,
+            ..DeviseConfig::default()
+        };
+        let password = "test-password";
+        let hashed = encryptor::digest(password, &config);
+        assert!(hashed.starts_with("$2"));
+        assert!(encryptor::compare(password, &hashed, &config));
+
+        let zero_config = DeviseConfig {
+            stretches: 0,
+            ..DeviseConfig::default()
+        };
+        let zero_hashed = encryptor::digest(password, &zero_config);
+        assert!(encryptor::compare(password, &zero_hashed, &zero_config));
     }
 
     #[test]

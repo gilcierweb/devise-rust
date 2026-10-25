@@ -57,6 +57,9 @@ mod serde_time_delta_option {
     }
 }
 
+/// Bcrypt's inclusive valid cost range (bcrypt crate `MIN_COST`/`MAX_COST`).
+const BCRYPT_COST_RANGE: std::ops::RangeInclusive<u32> = 4..=31;
+
 /// Global Devise configuration with all options matching Devise 5.0.4
 // The Devise surface has many independent boolean flags by design (parity requirement);
 // grouping them into bitflags/enums would deviate from Devise's documented option names.
@@ -77,7 +80,7 @@ mod serde_time_delta_option {
 ///
 /// assert_eq!(config.stretches, 12);
 /// assert_eq!(config.remember_for, chrono::TimeDelta::weeks(2));
-/// assert_eq!(config.timeout_in, chrono::TimeDelta::minutes(30));
+/// assert_eq!(config.timeout_in, Some(chrono::TimeDelta::minutes(30)));
 /// assert_eq!(config.reset_password_within, chrono::TimeDelta::hours(6));
 /// assert!(!config.paranoid);
 /// ```
@@ -89,7 +92,8 @@ pub struct DeviseConfig {
     pub secret_key: String,
     /// Pepper string appended to password before bcrypt (optional)
     pub pepper: Option<String>,
-    /// Bcrypt cost factor (default: 12)
+    /// Bcrypt cost factor (default: 12; bcrypt's valid range is 4..=31 —
+    /// see [`DeviseConfig::bcrypt_cost`] for the clamping rule)
     pub stretches: u32,
 
     // Auth keys
@@ -130,9 +134,10 @@ pub struct DeviseConfig {
     pub expire_all_remember_me_on_sign_out: bool,
 
     // Confirmable
-    /// Time allowed for unconfirmed access (default: 0.days)
-    #[serde(with = "serde_time_delta")]
-    pub allow_unconfirmed_access_for: TimeDelta,
+    /// Time allowed for unconfirmed access (default: 0.days; `None` = nil =
+    /// unconfirmed access never expires, Devise's `allow_unconfirmed_access_for: nil`)
+    #[serde(with = "serde_time_delta_option")]
+    pub allow_unconfirmed_access_for: Option<TimeDelta>,
     /// Confirmation token validity (default: nil = no expiry)
     #[serde(with = "serde_time_delta_option")]
     pub confirm_within: Option<TimeDelta>,
@@ -166,9 +171,10 @@ pub struct DeviseConfig {
     pub sign_in_after_reset_password: bool,
 
     // Timeoutable
-    /// Session timeout (default: 30.minutes)
-    #[serde(with = "serde_time_delta")]
-    pub timeout_in: TimeDelta,
+    /// Session timeout (default: 30.minutes; `None` = nil = sessions never
+    /// time out, Devise's `timeout_in: nil`)
+    #[serde(with = "serde_time_delta_option")]
+    pub timeout_in: Option<TimeDelta>,
 
     // Sessions / scopes
     /// Default scope (default: nil - Devise has no implicit default scope)
@@ -237,7 +243,7 @@ impl Default for DeviseConfig {
             extend_remember_period: false,
             rememberable_options: HashMap::new(),
             expire_all_remember_me_on_sign_out: true,
-            allow_unconfirmed_access_for: TimeDelta::zero(),
+            allow_unconfirmed_access_for: Some(TimeDelta::zero()),
             confirm_within: None,
             confirmation_keys: vec!["email".to_string()],
             reconfirmable: true,
@@ -250,7 +256,7 @@ impl Default for DeviseConfig {
             reset_password_keys: vec!["email".to_string()],
             reset_password_within: TimeDelta::hours(6),
             sign_in_after_reset_password: true,
-            timeout_in: TimeDelta::minutes(30),
+            timeout_in: Some(TimeDelta::minutes(30)),
             default_scope: None,
             sign_out_all_scopes: true,
             sign_out_via: "delete".to_string(),
@@ -275,6 +281,22 @@ impl Default for DeviseConfig {
             send_password_change_notification: false,
             sign_in_after_change_password: true,
         }
+    }
+}
+
+impl DeviseConfig {
+    /// Bcrypt cost actually used for hashing.
+    ///
+    /// [`DeviseConfig::stretches`] is clamped into bcrypt's valid `4..=31`
+    /// range. Devise raises `BCrypt::Errors::InvalidCost` when `stretches` is
+    /// outside that range (`devise/lib/devise/encryptor.rb`); the port clamps
+    /// instead so a misconfiguration degrades to the nearest valid cost rather
+    /// than panicking on a request path. Single home for the rule — every
+    /// hashing site reads the cost from here.
+    #[must_use]
+    pub fn bcrypt_cost(&self) -> u32 {
+        self.stretches
+            .clamp(*BCRYPT_COST_RANGE.start(), *BCRYPT_COST_RANGE.end())
     }
 }
 
@@ -371,6 +393,17 @@ macro_rules! apply_override {
             }
         )*
     };
+    // Pattern: config field is Option<T> (Copy), override is Option<T> ->
+    // `override.or(global)` on the already-cloned global: an explicit override
+    // (Some) wins; an absent override keeps the global value, including the
+    // global's nil-means-never semantics.
+    ($resolved:ident, $self:ident, OptionCopy: $($field:ident),*) => {
+        $(
+            if let Some(v) = $self.$field {
+                $resolved.$field = Some(v);
+            }
+        )*
+    };
 }
 
 impl DeviseConfigOverride {
@@ -447,7 +480,6 @@ impl DeviseConfigOverride {
             params_authenticatable,
             extend_remember_period,
             expire_all_remember_me_on_sign_out,
-            allow_unconfirmed_access_for,
             reconfirmable,
             maximum_attempts,
             last_attempt_warning,
@@ -467,8 +499,14 @@ impl DeviseConfigOverride {
         apply_override!(resolved, self, Copy:
             remember_for,
             unlock_in,
-            reset_password_within,
-            timeout_in
+            reset_password_within
+        );
+
+        // Nil-capable windows: override.or(global) keeps Devise's
+        // nil-means-never semantics (None = never expires / never times out).
+        apply_override!(resolved, self, OptionCopy:
+            timeout_in,
+            allow_unconfirmed_access_for
         );
 
         resolved
@@ -507,6 +545,39 @@ mod tests {
         for email in invalid {
             assert!(!re.is_match(email), "expected invalid: {email}");
         }
+    }
+
+    /// Ported from `Devise::Encryptor` (`devise/lib/devise/encryptor.rb`): bcrypt
+    /// accepts cost 4..=31; Devise raises `BCrypt::Errors::InvalidCost` outside
+    /// that range. The port clamps so hashing stays functional instead of
+    /// panicking on a misconfigured `stretches`.
+    #[test]
+    fn test_bcrypt_cost_clamps_to_valid_range() {
+        let too_low = DeviseConfig {
+            stretches: 0,
+            ..DeviseConfig::default()
+        };
+        assert_eq!(too_low.bcrypt_cost(), 4);
+
+        let just_below = DeviseConfig {
+            stretches: 3,
+            ..DeviseConfig::default()
+        };
+        assert_eq!(just_below.bcrypt_cost(), 4);
+
+        assert_eq!(DeviseConfig::default().bcrypt_cost(), 12);
+
+        let at_max = DeviseConfig {
+            stretches: 31,
+            ..DeviseConfig::default()
+        };
+        assert_eq!(at_max.bcrypt_cost(), 31);
+
+        let too_high = DeviseConfig {
+            stretches: 99,
+            ..DeviseConfig::default()
+        };
+        assert_eq!(too_high.bcrypt_cost(), 31);
     }
 
     #[test]
