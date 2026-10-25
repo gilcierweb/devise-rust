@@ -1768,4 +1768,93 @@ mod tests {
             "30 minutes"
         );
     }
+
+    /// CONCERNS #3 / divergence closure: the port stores the HMAC DIGEST in
+    /// `confirmation_token` (Devise stores the raw token and carries an open
+    /// TODO to converge to digest-only). Behavioral parity is what matters —
+    /// a confirmation link works in both worlds:
+    ///
+    /// 1. a row the PORT minted (digest stored) confirms through the emailed
+    ///    RAW token;
+    /// 2. a row a DEVISE deployment minted (raw stored) confirms through the
+    ///    legacy raw-first lookup.
+    ///
+    /// The port keeps the hardened storage and both lookup directions, which
+    /// is the compatibility Devise's own TODO describes.
+    #[tokio::test]
+    async fn confirmable_token_storage_is_digest_and_both_lookups_work() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+
+        // 1. Port-minted row: the column holds the DIGEST, never the raw token.
+        let mut user = TestUser::fresh(1, "port@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        let raw = user
+            .ensure_confirmation_token(&adapter, &config, &clock)
+            .await
+            .unwrap();
+        let stored = adapter
+            .get(&user.to_key())
+            .await
+            .unwrap()
+            .unwrap()
+            .confirmation_token()
+            .map(str::to_string);
+        let expected_digest = crate::crypto::token_generator::digest(
+            &config.secret_key,
+            CONFIRMATION_TOKEN_COLUMN,
+            &raw,
+        );
+        assert_eq!(
+            stored.as_deref(),
+            Some(expected_digest.as_str()),
+            "the port stores only the digest (CONCERNS #3)"
+        );
+        assert_ne!(
+            stored.as_deref(),
+            Some(raw.as_str()),
+            "the raw token never reaches the database"
+        );
+
+        // The emailed raw token confirms the port-minted row.
+        let outcome = TestUser::confirm_by_token(Some(&raw), &adapter, &config, &clock, &valid)
+            .await
+            .unwrap();
+        assert!(
+            outcome.is_valid(),
+            "digest row confirms through the raw token"
+        );
+        assert!(outcome.record.confirmed());
+
+        // 2. Legacy Devise row: the column holds the RAW token and still
+        // confirms (the raw-first lookup).
+        let mut legacy = TestUser::fresh(2, "legacy@example.com");
+        let legacy_raw = "legacyrawtoken123456";
+        legacy.set_confirmation_token(Some(legacy_raw.to_string()));
+        legacy.set_confirmation_sent_at(Some(clock.now()));
+        adapter.create(legacy).await.unwrap();
+        let outcome =
+            TestUser::confirm_by_token(Some(legacy_raw), &adapter, &config, &clock, &valid)
+                .await
+                .unwrap();
+        assert!(outcome.is_valid(), "legacy raw row still confirms");
+        assert!(outcome.record.confirmed());
+
+        // A token that matches neither shape fails with :invalid — never :blank.
+        let outcome = TestUser::confirm_by_token(
+            Some("unknown-token-value-000000"),
+            &adapter,
+            &config,
+            &clock,
+            &valid,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_valid());
+        assert_eq!(
+            outcome.errors.get("confirmation_token").map(Vec::as_slice),
+            Some(&[":invalid".to_string()][..])
+        );
+    }
 }

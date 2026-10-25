@@ -232,6 +232,18 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
         None
     }
 
+    /// Object-safe view over this model's activatable gate pair
+    /// (`active_for_authentication?` / `inactive_message`).
+    ///
+    /// Default `None` (nothing to gate); models that implement
+    /// [`Authenticatable`](crate::model::Authenticatable) return
+    /// `Some(self)` — the blanket [`Activatable`](crate::model::Activatable)
+    /// impl then reads the very same composition the typed side calls, so
+    /// hooks and controllers can never disagree.
+    fn as_activatable(&self) -> Option<&dyn crate::model::Activatable> {
+        None
+    }
+
     /// Devise `after_database_authentication` entrypoint (DBAU-07).
     ///
     /// Default no-op; `DatabaseAuthenticatable` models wire it to the trait

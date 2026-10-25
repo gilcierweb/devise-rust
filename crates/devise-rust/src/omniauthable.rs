@@ -70,8 +70,10 @@
 //! ```
 
 use crate::adapter::{Conditions, OrmAdapter, OrmError, Value};
+use crate::confirmable::Confirmable;
 use crate::crypto::secure_compare;
 use crate::error::{DeviseError, ResourceWithErrors, ValidationErrors};
+use crate::failure::AnyDeviseModel;
 use crate::model::Authenticatable;
 use crate::time::Clock;
 use async_trait::async_trait;
@@ -566,6 +568,47 @@ where
             ResourceWithErrors::new(M::default(), errors)
         }
     }
+}
+
+/// Devise's canonical `from_omniauth` pattern for provider-verified
+/// identities: `skip_confirmation!` when the provider asserts the email is
+/// verified.
+///
+/// The port's default policy links an identity onto an existing row ONLY
+/// for verified emails (`default_from_omniauth` step 2), and the same
+/// trust level must apply to NEW rows: a verified new identity is
+/// confirmed on creation, an unverified one stays pending (the core
+/// activatable gate then blocks its sign-in until the user confirms).
+/// Applications call this from their own `from_omniauth` right after
+/// [`default_from_omniauth`] — one home for the rule, so fixtures and the
+/// example apps never hand-roll it.
+///
+/// Returns `true` when the record was confirmed (and persisted).
+///
+/// # Errors
+///
+/// `DeviseError::Adapter` when the confirmation write fails.
+pub async fn confirm_verified_identity<A, M>(
+    record: &mut M,
+    profile: &ProviderProfile,
+    adapter: &A,
+    clock: &dyn Clock,
+) -> Result<bool, DeviseError>
+where
+    A: OrmAdapter<M> + Send + Sync,
+    M: Confirmable + AnyDeviseModel + Sync,
+{
+    if !profile.email_verified || record.confirmed() {
+        return Ok(false);
+    }
+    let now = clock.now();
+    record.set_confirmed_at(Some(now));
+    let fields = HashMap::from([("confirmed_at".to_string(), Value::String(now.to_rfc3339()))]);
+    adapter
+        .update_columns(&record.to_key(), &fields)
+        .await
+        .map_err(DeviseError::Adapter)?;
+    Ok(true)
 }
 
 /// `devise.omniauth_callbacks.failure` flash text.

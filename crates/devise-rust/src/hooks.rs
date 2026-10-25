@@ -325,11 +325,20 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
         HookFilter::new().only(vec![Event::SetUser, Event::Authentication]),
         Box::new(|ctx| {
             Box::pin(async move {
+                // Devise `hooks/activatable.rb` (after_set_user except: :fetch):
+                // a record that fails `active_for_authentication?` fails the
+                // transition with its `inactive_message` (`unconfirmed` /
+                // `locked` / `inactive`). The gate pair is read through the
+                // object-safe Activatable view, so the hook enforces the very
+                // same composition the typed controllers check — no app-side
+                // wiring required (divergence closed 2026-10-25).
                 if let Some(record) = ctx.record {
-                    if !record.valid_for_authentication(None) {
-                        return Err(Failure::Unauthenticated {
-                            message: record.unauthenticated_message(),
-                        });
+                    if let Some(gate) = record.as_activatable() {
+                        if !gate.active_for_authentication() {
+                            return Err(Failure::Unauthenticated {
+                                message: gate.inactive_message(),
+                            });
+                        }
                     }
                 }
                 Ok(())
@@ -697,6 +706,7 @@ pub trait RememberableBridge: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::{SetUserEvent, SetUserOpts};
     use crate::scope::{Mapping, Module, PathNames, SignOutVia};
     use crate::session::SessionStore;
     use std::collections::HashMap;
@@ -735,8 +745,154 @@ mod tests {
             self.valid
         }
 
+        fn as_activatable(&self) -> Option<&dyn crate::model::Activatable> {
+            Some(self)
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model::Authenticatable for HookUser {
+        fn active_for_authentication(&self) -> bool {
+            self.valid
+        }
+
+        fn inactive_message(&self) -> &'static str {
+            "inactive"
+        }
+    }
+
+    /// Full-module gate model for the activatable hook and the composers.
+    #[derive(Debug, Clone, Default)]
+    struct GateUser {
+        id: i64,
+        confirmed: bool,
+        locked_at: Option<chrono::DateTime<chrono::Utc>>,
+        failed_attempts: i64,
+        confirmation_sent_at: Option<chrono::DateTime<chrono::Utc>>,
+        confirmation_required: bool,
+    }
+
+    impl GateUser {
+        fn gate(id: i64, confirmed: bool, locked: bool) -> Self {
+            Self {
+                id,
+                confirmed,
+                locked_at: locked.then(chrono::Utc::now),
+                failed_attempts: if locked { 99 } else { 0 },
+                confirmation_sent_at: Some(chrono::Utc::now()),
+                confirmation_required: true,
+            }
+        }
+    }
+
+    impl AnyDeviseModel for GateUser {
+        fn to_key(&self) -> crate::adapter::DeviseKey {
+            crate::adapter::DeviseKey::from_i64(self.id)
+        }
+
+        fn as_activatable(&self) -> Option<&dyn crate::model::Activatable> {
+            Some(self)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl crate::mailer::HasEmail for GateUser {
+        fn email(&self) -> &'static str {
+            "gate@example.com"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model::Authenticatable for GateUser {
+        fn active_for_authentication(&self) -> bool {
+            crate::model::compose_active_for_authentication(
+                self,
+                &crate::config::DeviseConfig::default(),
+                &SystemClock,
+            )
+        }
+
+        fn inactive_message(&self) -> &'static str {
+            crate::model::compose_inactive_message(
+                self,
+                &crate::config::DeviseConfig::default(),
+                &SystemClock,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::confirmable::Confirmable for GateUser {
+        fn confirmation_token(&self) -> Option<&str> {
+            None
+        }
+
+        fn set_confirmation_token(&mut self, _token: Option<String>) {}
+
+        fn confirmed_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+            self.confirmed.then(chrono::Utc::now)
+        }
+
+        fn set_confirmed_at(&mut self, _at: Option<chrono::DateTime<chrono::Utc>>) {}
+
+        fn confirmation_sent_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+            self.confirmation_sent_at
+        }
+
+        fn set_confirmation_sent_at(&mut self, at: Option<chrono::DateTime<chrono::Utc>>) {
+            self.confirmation_sent_at = at;
+        }
+
+        fn unconfirmed_email(&self) -> Option<&str> {
+            None
+        }
+
+        fn set_unconfirmed_email(&mut self, _email: Option<String>) {}
+
+        fn set_email_address(&mut self, _email: String) {}
+
+        fn confirmed(&self) -> bool {
+            self.confirmed
+        }
+
+        fn confirmation_required(&self) -> bool {
+            self.confirmation_required
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::lockable::Lockable for GateUser {
+        fn failed_attempts(&self) -> u32 {
+            u32::try_from(self.failed_attempts).unwrap_or(u32::MAX)
+        }
+
+        fn set_failed_attempts(&mut self, count: u32) {
+            self.failed_attempts = i64::from(count);
+        }
+
+        fn locked_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+            self.locked_at
+        }
+
+        fn set_locked_at(&mut self, at: Option<chrono::DateTime<chrono::Utc>>) {
+            self.locked_at = at;
+        }
+
+        fn unlock_token(&self) -> Option<&str> {
+            None
+        }
+
+        fn set_unlock_token(&mut self, _token: Option<String>) {}
+
+        fn persisted(&self) -> bool {
+            true
         }
     }
 
@@ -1317,5 +1473,143 @@ mod tests {
             .await
             .expect("skipped check passes");
         assert!(proxy.authenticated("user"));
+    }
+
+    fn gate_mapping() -> Mapping {
+        let mut mapping = Mapping {
+            name: "user".to_string(),
+            class_name: "GateUser".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![
+                Module::DatabaseAuthenticatable,
+                Module::Confirmable,
+                Module::Lockable,
+            ],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: SignOutVia::Delete,
+            failure_app: None,
+        };
+        mapping.modules.sort();
+        mapping
+    }
+
+    /// The core composers must agree with the chain arithmetic on the same
+    /// record, for both the gate and the message (single home).
+    #[tokio::test]
+    async fn compose_gate_and_message_match_the_chain() {
+        let config = crate::config::DeviseConfig::default();
+        let clock = SystemClock;
+
+        let ok = GateUser::gate(1, true, false);
+        assert!(crate::model::compose_active_for_authentication(
+            &ok, &config, &clock
+        ));
+        assert_eq!(
+            crate::model::compose_inactive_message(&ok, &config, &clock),
+            "inactive"
+        );
+
+        let unconfirmed = GateUser::gate(2, false, false);
+        assert!(!crate::model::compose_active_for_authentication(
+            &unconfirmed,
+            &config,
+            &clock
+        ));
+        assert_eq!(
+            crate::model::compose_inactive_message(&unconfirmed, &config, &clock),
+            "unconfirmed"
+        );
+
+        let locked = GateUser::gate(3, true, true);
+        assert!(!crate::model::compose_active_for_authentication(
+            &locked, &config, &clock
+        ));
+        assert_eq!(
+            crate::model::compose_inactive_message(&locked, &config, &clock),
+            "locked"
+        );
+
+        // Confirmable before lockable: an unconfirmed-plus-locked record
+        // reports `unconfirmed` (Devise's super-chain order).
+        let both = GateUser::gate(4, false, true);
+        assert_eq!(
+            crate::model::compose_inactive_message(&both, &config, &clock),
+            "unconfirmed"
+        );
+    }
+
+    /// Devise `hooks/activatable.rb` parity end-to-end: the core hook
+    /// pipeline rejects a gated record on the sign-in transition with its
+    /// `inactive_message` — the app no longer composes the gates by hand.
+    #[tokio::test]
+    async fn activatable_hook_rejects_gated_record() {
+        let store = Arc::new(TrackingStore {
+            data: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            renewed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let mapping = gate_mapping();
+        let mut registry = crate::scope::ScopeRegistry::new();
+        registry.register(mapping.clone());
+        let mut hooks = crate::hooks::HookRegistry::new();
+        crate::hooks::register_devise_hooks(&mut hooks, &mapping);
+        let store_trait: Arc<dyn crate::session::SessionStore> = store.clone();
+        let mut proxy = crate::proxy::AuthProxy::new(
+            store_trait,
+            Arc::new(registry),
+            Arc::new(hooks),
+            Arc::new(crate::config::DeviseConfig::default()),
+        );
+
+        let unconfirmed = GateUser::gate(7, false, false);
+        let rejected = proxy
+            .set_user(
+                "user",
+                Some(Box::new(unconfirmed)),
+                SetUserOpts {
+                    event: SetUserEvent::Authentication,
+                    store: true,
+                    run_callbacks: true,
+                    force: false,
+                },
+            )
+            .await;
+        assert!(
+            matches!(&rejected, Err(crate::error::DeviseError::Internal(message)) if message.contains("unconfirmed")),
+            "hook must reject with the inactive message: {rejected:?}"
+        );
+        let session_key = crate::session::keys::scope_session_key("user");
+        assert!(
+            store.get_value(&session_key).await.is_none(),
+            "no session is persisted for a gated record"
+        );
+
+        // A gated record must not authenticate through the strategy path
+        // either (the Authentication event runs the same hook).
+        let locked = GateUser::gate(8, true, true);
+        let rejected_locked = proxy
+            .set_user(
+                "user",
+                Some(Box::new(locked)),
+                SetUserOpts {
+                    event: SetUserEvent::Authentication,
+                    store: true,
+                    run_callbacks: true,
+                    force: true,
+                },
+            )
+            .await;
+        assert!(
+            matches!(&rejected_locked, Err(crate::error::DeviseError::Internal(message)) if message.contains("locked")),
+            "locked record must be rejected with `locked`: {rejected_locked:?}"
+        );
     }
 }

@@ -468,6 +468,9 @@ use diesel::OptionalExtension;
 // ============================================================================
 
 impl AnyDeviseModel for ExampleUser {
+    fn as_activatable(&self) -> Option<&dyn devise_rust::model::Activatable> {
+        Some(self)
+    }
     fn to_key(&self) -> DeviseKey {
         DeviseKey::from_i64(self.id)
     }
@@ -505,22 +508,11 @@ impl devise_rust::model::PasswordVerifiable for ExampleUser {
 #[async_trait::async_trait]
 impl devise_rust::model::Authenticatable for ExampleUser {
     fn active_for_authentication(&self) -> bool {
-        use devise_rust::confirmable::Confirmable;
-        devise_rust::model::chain_active_for_authentication(
-            self.confirmed() || !self.confirmation_required(),
-            self.locked_at.is_none(),
-        )
+        devise_rust::model::compose_active_for_authentication(self, &example_config(), &SystemClock)
     }
 
     fn inactive_message(&self) -> &'static str {
-        use devise_rust::confirmable::Confirmable;
-        if self.locked_at.is_some() {
-            "locked"
-        } else if !self.confirmed() {
-            "unconfirmed"
-        } else {
-            "inactive"
-        }
+        devise_rust::model::compose_inactive_message(self, &example_config(), &SystemClock)
     }
 
     fn serializable_hash(&self) -> serde_json::Value {
@@ -864,6 +856,25 @@ fn app_factory(
     let admin_mapping = mapping("admin", "admins");
 
     let adapter = ExampleAdapter::new(pool.clone());
+    // Devise `check_fields!` parity: fail loudly at startup when a model's
+    // required columns are missing from the database. `app_factory` is sync,
+    // so each probe runs on the current runtime handle.
+    for mapping in [&user_mapping, &admin_mapping] {
+        let adapter = adapter.clone();
+        let mapping = mapping.clone();
+        let config = config.clone();
+        let outcome = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                devise_rust_actix::schema::assert_model_schema(&adapter, &mapping, &config).await
+            })
+        });
+        if let Err(error) = outcome {
+            panic!(
+                "{scope} model schema check failed: {error}",
+                scope = mapping.name
+            );
+        }
+    }
     let mut user_state = example_state(user_mapping.clone(), config.clone(), adapter.clone());
     user_state.mailer = mailer.clone();
     let mut admin_state = example_state(admin_mapping.clone(), config.clone(), adapter.clone());

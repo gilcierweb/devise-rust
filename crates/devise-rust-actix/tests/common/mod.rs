@@ -185,6 +185,9 @@ impl FixtureUser {
 }
 
 impl AnyDeviseModel for FixtureUser {
+    fn as_activatable(&self) -> Option<&dyn devise_rust::model::Activatable> {
+        Some(self)
+    }
     fn to_key(&self) -> DeviseKey {
         DeviseKey::from_i64(self.id)
     }
@@ -233,24 +236,19 @@ impl PasswordVerifiable for FixtureUser {
 #[async_trait::async_trait]
 impl devise_rust::model::Authenticatable for FixtureUser {
     fn active_for_authentication(&self) -> bool {
-        use devise_rust::confirmable::Confirmable;
-        // Devise super-chain: base(true) → confirmable → lockable order.
-        let config = &test_config();
-        let clock = SystemClock;
-        let base = self.locked_at.is_none() || !self.access_locked_now(config, &clock);
-        let confirmable_active = self.confirmed() || !self.confirmation_required();
-        devise_rust::model::chain_active_for_authentication(confirmable_active, base)
+        devise_rust::model::compose_active_for_authentication(
+            self,
+            &test_config(),
+            &devise_rust::time::SystemClock,
+        )
     }
 
     fn inactive_message(&self) -> &'static str {
-        use devise_rust::confirmable::Confirmable;
-        if self.locked_at.is_some() {
-            "locked"
-        } else if !self.confirmed() {
-            "unconfirmed"
-        } else {
-            "inactive"
-        }
+        devise_rust::model::compose_inactive_message(
+            self,
+            &test_config(),
+            &devise_rust::time::SystemClock,
+        )
     }
 
     fn serializable_hash(&self) -> JsonValue {
@@ -526,7 +524,20 @@ impl devise_rust::omniauthable::Omniauthable for FixtureUser {
         Self: Sized,
         A: devise_rust::adapter::OrmAdapter<Self, New = Self::New> + Send + Sync,
     {
-        devise_rust::omniauthable::default_from_omniauth(adapter, &profile, clock).await
+        let mut outcome =
+            devise_rust::omniauthable::default_from_omniauth(adapter, &profile, clock).await;
+        // Devise's canonical from_omniauth pattern: a provider-verified
+        // identity is confirmed on creation (one home: core helper).
+        if outcome.is_valid() {
+            let _ = devise_rust::omniauthable::confirm_verified_identity(
+                &mut outcome.record,
+                &profile,
+                adapter,
+                clock,
+            )
+            .await;
+        }
+        outcome
     }
 
     fn new_from_profile(

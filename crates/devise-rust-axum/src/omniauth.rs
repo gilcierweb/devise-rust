@@ -60,6 +60,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::MethodRouter;
 use devise_rust::adapter::OrmAdapter;
 use devise_rust::error::DeviseError;
+use devise_rust::failure::{FailureReason, FailureRenderer, build_failure};
 use devise_rust::omniauthable::{
     OAuthProviderConfig, Omniauthable, ProviderProfile, authorize_start, basic_client,
     failure_message, http_client, success_message, verify_state,
@@ -74,6 +75,7 @@ use tower_sessions::Session;
 
 use crate::bridge::{self, TowerSessionStore};
 use crate::callbacks::rotate_csrf_token;
+use crate::failure::AxumFailureRenderer;
 use crate::layer::AuthProxyHandle;
 use crate::routes::{DeviseParams, DeviseWebState, FullDeviseModel, sign_in_bookkeeping};
 
@@ -205,6 +207,23 @@ fn passthru_not_found() -> Response {
         "Not found. Authentication passthru.",
     )
         .into_response()
+}
+
+/// Render a gate rejection as a Devise failure response (the omniauth
+/// sign-in path): navigational callers get the 302 + inactive flash, API
+/// callers the status code.
+fn render_gate_failure<M, A, L>(
+    auth_request: &AuthRequest,
+    st: &OmniauthWebState<M, A, L>,
+    reason: FailureReason,
+) -> Response
+where
+    M: FullDeviseModel,
+    A: OrmAdapter<M> + Send + Sync + 'static,
+    L: Send + Sync + 'static,
+{
+    let failure = build_failure(auth_request, &st.devise.mapping, &st.devise.config, reason);
+    AxumFailureRenderer::new().render(&failure, &st.devise.mapping)
 }
 
 fn internal_error() -> Response {
@@ -562,12 +581,23 @@ where
             run_callbacks: true,
             force: false,
         };
+        // The core activatable gate can reject the sign-in (unconfirmed /
+        // locked — Devise's `after_set_user` semantics): read the gate BEFORE
+        // moving the record into the proxy and render the Devise failure
+        // response (302 + flash / 401), never a bare 500.
+        let gate_message = record.as_activatable().and_then(|gate| {
+            (!gate.active_for_authentication()).then_some(gate.inactive_message())
+        });
         if proxy
             .set_user(&scope, Some(Box::new(record)), opts)
             .await
             .is_err()
         {
-            return internal_error();
+            return match gate_message {
+                Some("locked") => render_gate_failure(&auth_request, &st, FailureReason::Locked),
+                Some(_) => render_gate_failure(&auth_request, &st, FailureReason::Unconfirmed),
+                None => internal_error(),
+            };
         }
         devise_rust::helpers::after_sign_in_path_for(&scope, &proxy, &auth_request).await
     };

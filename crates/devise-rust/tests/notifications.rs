@@ -38,6 +38,10 @@ impl AnyDeviseModel for User {
         DeviseKey::from_i64(self.id)
     }
 
+    fn as_activatable(&self) -> Option<&dyn devise_rust::model::Activatable> {
+        Some(self)
+    }
+
     fn authenticatable_salt(&self) -> Option<String> {
         DatabaseAuthenticatable::database_authenticatable_salt(self)
     }

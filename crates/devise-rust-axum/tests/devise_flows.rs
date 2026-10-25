@@ -1108,3 +1108,56 @@ async fn flow_sign_in_while_signed_in_reports_already_authenticated() {
         "already_authenticated flash expected: {cookies:?}"
     );
 }
+
+/// Devise parity (`database_authenticatable.rb:163-168`): the reconfirmation
+/// flow notifies `email_changed` to the ORIGINAL address and the
+/// confirmation instructions to the new one.
+#[tokio::test]
+async fn flow_account_update_email_change_notifies_both_addresses() {
+    let mut config = common::test_config();
+    // Devise's default is `false`; this test opts in to prove the split.
+    config.send_email_changed_notification = true;
+    let (state, app) = common::build_app(common::test_state_with_config(default_mapping(), config));
+    seed_user(&state, "flow11@example.com", "secret123").await;
+    let mut jar = Jar::new();
+    let resp = form_sign_in(&app, "flow11@example.com", "secret123").await;
+    jar.merge(&resp);
+
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::PATCH)
+            .uri("/users/")
+            .header(header::COOKIE, jar.header())
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "user[current_password]=secret123&user[email]=new-addr@example.com",
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+
+    let sent = state.mailer.sent_mails();
+    let changed: Vec<_> = sent
+        .iter()
+        .filter(|mail| mail.subject == "Email Changed")
+        .collect();
+    assert_eq!(
+        changed.len(),
+        1,
+        "exactly one email_changed delivery: {:?}",
+        sent.iter().map(|m| (&m.to, &m.subject)).collect::<Vec<_>>()
+    );
+    assert_eq!(changed[0].to, "flow11@example.com", "original recipient");
+    let confirmations: Vec<_> = sent
+        .iter()
+        .filter(|mail| mail.subject == "Confirmation instructions")
+        .collect();
+    assert_eq!(
+        confirmations.len(),
+        1,
+        "confirmation mailed to the new address"
+    );
+    assert_eq!(confirmations[0].to, "new-addr@example.com");
+}

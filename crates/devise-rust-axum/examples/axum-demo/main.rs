@@ -477,6 +477,9 @@ fn query_err(e: diesel::result::Error) -> OrmError {
 // ============================================================================
 
 impl AnyDeviseModel for ExampleUser {
+    fn as_activatable(&self) -> Option<&dyn devise_rust::model::Activatable> {
+        Some(self)
+    }
     fn to_key(&self) -> DeviseKey {
         DeviseKey::from_i64(self.id)
     }
@@ -522,22 +525,11 @@ impl devise_rust::model::PasswordVerifiable for ExampleUser {
 #[async_trait::async_trait]
 impl devise_rust::model::Authenticatable for ExampleUser {
     fn active_for_authentication(&self) -> bool {
-        use devise_rust::confirmable::Confirmable;
-        devise_rust::model::chain_active_for_authentication(
-            self.confirmed() || !self.confirmation_required(),
-            self.locked_at.is_none(),
-        )
+        devise_rust::model::compose_active_for_authentication(self, &example_config(), &SystemClock)
     }
 
     fn inactive_message(&self) -> &'static str {
-        use devise_rust::confirmable::Confirmable;
-        if self.locked_at.is_some() {
-            "locked"
-        } else if !self.confirmed() {
-            "unconfirmed"
-        } else {
-            "inactive"
-        }
+        devise_rust::model::compose_inactive_message(self, &example_config(), &SystemClock)
     }
 
     fn serializable_hash(&self) -> serde_json::Value {
@@ -878,14 +870,53 @@ fn app_factory(pool: SqlitePool, config: &Arc<DeviseConfig>, mailer: Arc<TestMai
     let admin_mapping = mapping("admin", "admins");
 
     let adapter = ExampleAdapter::new(pool);
+    // Devise `check_fields!` parity: fail loudly at startup when a model's
+    // required columns are missing from the database. `app_factory` is sync,
+    // so the probe runs on the current runtime handle (same as the demo's
+    // other startup work).
+    for mapping in [&user_mapping, &admin_mapping] {
+        let adapter = adapter.clone();
+        let mapping = mapping.clone();
+        let config = config.clone();
+        let outcome = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                devise_rust_axum::schema::assert_model_schema(&adapter, &mapping, &config).await
+            })
+        });
+        if let Err(error) = outcome {
+            panic!(
+                "{scope} model schema check failed: {error}",
+                scope = mapping.name
+            );
+        }
+    }
     let all_scopes = vec!["user".to_string(), "admin".to_string()];
 
+    // Devise's strategy-chain lockable accounting: both scopes register the
+    // shared core sink, so a crossed threshold locks the account on ANY
+    // authenticated request, not only the sign-in POST.
+    let user_sink: Arc<dyn devise_rust::failed_attempt::FailedAttemptSink> =
+        Arc::new(devise_rust::failed_attempt::LockableFailedAttemptSink::new(
+            Arc::new(adapter.clone()),
+            mailer.clone(),
+            config.clone(),
+            Arc::new(SystemClock),
+        ));
+    let admin_sink: Arc<dyn devise_rust::failed_attempt::FailedAttemptSink> =
+        Arc::new(devise_rust::failed_attempt::LockableFailedAttemptSink::new(
+            Arc::new(adapter.clone()),
+            mailer.clone(),
+            config.clone(),
+            Arc::new(SystemClock),
+        ));
+
+    let clock = Arc::new(SystemClock);
     let user_state = DeviseWebState::<ExampleUser, ExampleAdapter, ExampleMailer>::new(
         user_mapping.clone(),
         config.clone(),
         Arc::new(adapter.clone()),
         mailer.clone(),
-        Arc::new(SystemClock),
+        clock.clone(),
     )
     .expect("user state builds")
     .with_all_scopes(all_scopes.clone());
@@ -894,7 +925,7 @@ fn app_factory(pool: SqlitePool, config: &Arc<DeviseConfig>, mailer: Arc<TestMai
         config.clone(),
         Arc::new(adapter.clone()),
         mailer,
-        Arc::new(SystemClock),
+        clock.clone(),
     )
     .expect("admin state builds")
     .with_all_scopes(all_scopes);
@@ -913,7 +944,9 @@ fn app_factory(pool: SqlitePool, config: &Arc<DeviseConfig>, mailer: Arc<TestMai
     let devise_layer = DeviseLayer::new(Arc::new(registry), config.clone())
         .with_hooks(Arc::new(hooks))
         .with_finder("user", user_finder)
-        .with_finder("admin", admin_finder);
+        .with_finder("admin", admin_finder)
+        .with_failed_attempt_sink("user", user_sink)
+        .with_failed_attempt_sink("admin", admin_sink);
 
     // PLAIN-HTTP LOCAL-DEV OPT-OUT ONLY (Pitfall 4): `secure(false)` so
     // localhost returns the session cookie. **Production keeps the

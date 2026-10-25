@@ -11,9 +11,11 @@
 
 use crate::adapter::{Conditions, DeviseKey, OrmAdapter, Value};
 use crate::config::DeviseConfig;
+use crate::confirmable::Confirmable;
 use crate::error::ResourceWithErrors;
 use crate::error::ValidationErrors;
 use crate::failure::{AnyDeviseModel, AuthRules};
+use crate::lockable::Lockable;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use std::marker::PhantomData;
@@ -1241,6 +1243,170 @@ pub fn chain_inactive_message(
         .unwrap_or("inactive")
 }
 
+/// Compose `active_for_authentication?` over a record's module gates.
+///
+/// The single home for the composition Devise's `super`-chain produces: the
+/// base `true`, then the confirmable gate, then the lockable gate
+/// (`modules.rb` order). Application models delegate their
+/// [`Authenticatable::active_for_authentication`] impl here instead of
+/// hand-rolling the gate arithmetic; the object-safe
+/// [`Activatable`] view exposes the same result to the hook pipeline.
+///
+/// == Examples
+///
+/// ```ignore
+/// use devise_rust::model::compose_active_for_authentication;
+/// # use devise_rust::confirmable::Confirmable;
+/// # use devise_rust::lockable::Lockable;
+/// # use devise_rust::time::SystemClock;
+/// # use devise_rust::config::DeviseConfig;
+/// # use chrono::{DateTime, Utc};
+/// # struct Record {
+/// #     confirmed: bool,
+/// #     confirmed_at: Option<DateTime<Utc>>,
+/// #     confirmation_sent_at: Option<DateTime<Utc>>,
+/// #     locked_at: Option<DateTime<Utc>>,
+/// # }
+/// # #[async_trait::async_trait]
+/// # impl Confirmable for Record {
+/// #     fn confirmation_token(&self) -> Option<&str> { None }
+/// #     fn set_confirmation_token(&mut self, _t: Option<String>) {}
+/// #     fn confirmed_at(&self) -> Option<DateTime<Utc>> { self.confirmed_at }
+/// #     fn set_confirmed_at(&mut self, _a: Option<DateTime<Utc>>) {}
+/// #     fn confirmation_sent_at(&self) -> Option<DateTime<Utc>> { self.confirmation_sent_at }
+/// #     fn set_confirmation_sent_at(&mut self, _a: Option<DateTime<Utc>>) {}
+/// #     fn unconfirmed_email(&self) -> Option<&str> { None }
+/// #     fn set_unconfirmed_email(&mut self, _e: Option<String>) {}
+/// #     fn set_email_address(&mut self, _e: String) {}
+/// #     fn confirmed(&self) -> bool { self.confirmed }
+/// # }
+/// # #[async_trait::async_trait]
+/// # impl Lockable for Record {
+/// #     fn failed_attempts(&self) -> u32 { 0 }
+/// #     fn set_failed_attempts(&mut self, _c: u32) {}
+/// #     fn locked_at(&self) -> Option<DateTime<Utc>> { self.locked_at }
+/// #     fn set_locked_at(&mut self, _a: Option<DateTime<Utc>>) {}
+/// #     fn unlock_token(&self) -> Option<&str> { None }
+/// #     fn set_unlock_token(&mut self, _t: Option<String>) {}
+/// #     fn persisted(&self) -> bool { true }
+/// # }
+/// # let record = Record {
+/// #     confirmed: true,
+/// #     confirmed_at: Some(Utc::now()),
+/// #     confirmation_sent_at: Some(Utc::now()),
+/// #     locked_at: None,
+/// # };
+/// let config = DeviseConfig::default();
+/// assert!(compose_active_for_authentication(&record, &config, &SystemClock));
+/// ```
+///
+/// ```ignore
+/// use devise_rust::model::{compose_active_for_authentication, compose_inactive_message};
+/// # use devise_rust::confirmable::Confirmable;
+/// # use devise_rust::lockable::Lockable;
+/// # use devise_rust::time::SystemClock;
+/// # use devise_rust::config::DeviseConfig;
+/// # use chrono::{DateTime, Utc};
+/// # struct Record {
+/// #     confirmed: bool,
+/// #     confirmed_at: Option<DateTime<Utc>>,
+/// #     confirmation_sent_at: Option<DateTime<Utc>>,
+/// #     locked_at: Option<DateTime<Utc>>,
+/// # }
+/// # #[async_trait::async_trait]
+/// # impl Confirmable for Record {
+/// #     fn confirmation_token(&self) -> Option<&str> { None }
+/// #     fn set_confirmation_token(&mut self, _t: Option<String>) {}
+/// #     fn confirmed_at(&self) -> Option<DateTime<Utc>> { self.confirmed_at }
+/// #     fn set_confirmed_at(&mut self, _a: Option<DateTime<Utc>>) {}
+/// #     fn confirmation_sent_at(&self) -> Option<DateTime<Utc>> { self.confirmation_sent_at }
+/// #     fn set_confirmation_sent_at(&mut self, _a: Option<DateTime<Utc>>) {}
+/// #     fn unconfirmed_email(&self) -> Option<&str> { None }
+/// #     fn set_unconfirmed_email(&mut self, _e: Option<String>) {}
+/// #     fn set_email_address(&mut self, _e: String) {}
+/// #     fn confirmed(&self) -> bool { self.confirmed }
+/// # }
+/// # #[async_trait::async_trait]
+/// # impl Lockable for Record {
+/// #     fn failed_attempts(&self) -> u32 { 0 }
+/// #     fn set_failed_attempts(&mut self, _c: u32) {}
+/// #     fn locked_at(&self) -> Option<DateTime<Utc>> { self.locked_at }
+/// #     fn set_locked_at(&mut self, _a: Option<DateTime<Utc>>) {}
+/// #     fn unlock_token(&self) -> Option<&str> { None }
+/// #     fn set_unlock_token(&mut self, _t: Option<String>) {}
+/// #     fn persisted(&self) -> bool { true }
+/// # }
+/// # let pending = Record {
+/// #     confirmed: false,
+/// #     confirmed_at: None,
+/// #     confirmation_sent_at: Some(Utc::now()),
+/// #     locked_at: None,
+/// # };
+/// let config = DeviseConfig::default();
+/// assert!(!compose_active_for_authentication(&pending, &config, &SystemClock));
+/// assert_eq!(
+///     compose_inactive_message(&pending, &config, &SystemClock),
+///     "unconfirmed"
+/// );
+/// ```
+#[must_use]
+pub fn compose_active_for_authentication<M>(
+    record: &M,
+    config: &DeviseConfig,
+    clock: &dyn crate::time::Clock,
+) -> bool
+where
+    M: Confirmable + Lockable,
+{
+    chain_active_for_authentication(
+        record.confirmation_gate_active(true, config, clock),
+        record.lock_gate_active(true, config, clock),
+    )
+}
+
+/// Compose `inactive_message` over a record's module gates (the
+/// first-failing gate's I18n key, Devise's `super`-chain order).
+///
+/// Companion of [`compose_active_for_authentication`]: the same single home
+/// for the message selection (`unconfirmed` before `locked`).
+#[must_use]
+pub fn compose_inactive_message<M>(
+    record: &M,
+    config: &DeviseConfig,
+    clock: &dyn crate::time::Clock,
+) -> &'static str
+where
+    M: Confirmable + Lockable,
+{
+    chain_inactive_message(
+        record.confirmation_inactive_message(),
+        record.lock_inactive_message(config, clock),
+    )
+}
+
+/// Object-safe view over the activatable gate pair.
+///
+/// Blanket-implemented for every [`Authenticatable`] model, so the hook
+/// pipeline (which only sees `dyn AnyDeviseModel`) reads the very same
+/// implementation the typed controllers call — no second composition to
+/// drift. Devise's `active_for_authentication?` / `inactive_message` pair.
+pub trait Activatable: Send + Sync {
+    /// Devise `active_for_authentication?`.
+    fn active_for_authentication(&self) -> bool;
+    /// Devise `inactive_message` (I18n key).
+    fn inactive_message(&self) -> &'static str;
+}
+
+impl<T: Authenticatable> Activatable for T {
+    fn active_for_authentication(&self) -> bool {
+        Authenticatable::active_for_authentication(self)
+    }
+
+    fn inactive_message(&self) -> &'static str {
+        Authenticatable::inactive_message(self)
+    }
+}
+
 /// Object-safe read bridge over any typed adapter.
 ///
 /// `OrmAdapter<M>` cannot be turned into a trait object over heterogeneous
@@ -1366,6 +1532,9 @@ mod tests {
     }
 
     impl AnyDeviseModel for TestUser {
+        fn as_activatable(&self) -> Option<&dyn crate::model::Activatable> {
+            Some(self)
+        }
         fn to_key(&self) -> DeviseKey {
             DeviseKey::from_i64(self.id)
         }
