@@ -46,6 +46,7 @@ pub mod bridge;
 pub mod counter;
 pub mod error;
 pub mod finder;
+pub mod schema;
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -172,6 +173,10 @@ where
             .await
             .map_err(map_sea_orm_error)?;
         Ok(())
+    }
+
+    async fn column_exists(&self, column: &str) -> Result<bool, OrmError> {
+        schema::column_exists::<E>(&self.db, column).await
     }
 }
 

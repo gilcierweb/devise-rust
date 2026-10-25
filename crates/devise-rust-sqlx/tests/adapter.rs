@@ -223,3 +223,72 @@ fn sqlite_fixture_glue_surface() {
     assert!(FixtureUser::columns().contains(&"encrypted_password"));
     assert!(FixtureUser::finder_columns().contains(&"unconfirmed_email"));
 }
+
+/// Devise `check_fields!` parity: the sqlite catalog probe reports every
+/// emitted column and refuses an absent one (the loud startup failure a
+/// stale schema deserves).
+#[tokio::test]
+async fn sqlite_column_exists_probe() {
+    let rig = bootstrap_sqlite_memory().await;
+    let adapter = &rig.users;
+    assert!(
+        adapter
+            .column_exists("encrypted_password")
+            .await
+            .expect("probe works")
+    );
+    assert!(
+        adapter
+            .column_exists("confirmation_token")
+            .await
+            .expect("probe works")
+    );
+    assert!(
+        !adapter
+            .column_exists("not_a_devise_column")
+            .await
+            .expect("probe works")
+    );
+
+    // The core check_fields then reports the missing column with Devise's
+    // exact message shape.
+    let mapping = full_module_mapping();
+    let config = devise_rust::config::DeviseConfig::default();
+    devise_rust::schema::check_fields(adapter, &mapping, &config)
+        .await
+        .expect("emitted schema satisfies every module");
+}
+
+/// Full-module mapping over the fixture users table (shared by the
+/// check_fields legs of every backend crate's sqlite suite).
+fn full_module_mapping() -> devise_rust::scope::Mapping {
+    use devise_rust::scope::{Mapping, Module, PathNames, SignOutVia};
+    let mut mapping = Mapping {
+        name: "user".to_string(),
+        class_name: "User".to_string(),
+        path: "users".to_string(),
+        path_prefix: None,
+        singular: "user".to_string(),
+        path_names: PathNames::default(),
+        controllers: std::collections::HashMap::new(),
+        modules: vec![
+            Module::DatabaseAuthenticatable,
+            Module::Recoverable,
+            Module::Confirmable,
+            Module::Lockable,
+            Module::Rememberable,
+            Module::Trackable,
+            Module::Omniauthable,
+        ],
+        only: vec![],
+        skip: vec![],
+        constraints: std::collections::HashMap::new(),
+        defaults: std::collections::HashMap::new(),
+        format: None,
+        router_name: None,
+        sign_out_via: SignOutVia::Delete,
+        failure_app: None,
+    };
+    mapping.modules.sort();
+    mapping
+}

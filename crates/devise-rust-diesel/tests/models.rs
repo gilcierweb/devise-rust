@@ -390,6 +390,10 @@ impl DieselModel for FixtureUser {
         users::table
     }
 
+    fn table_name() -> &'static str {
+        "users"
+    }
+
     fn key_of(model: &Self) -> DeviseKey {
         DeviseKey::from_i64(model.id)
     }
@@ -750,6 +754,10 @@ impl DieselModel for UuidUser {
 
     fn table() -> Self::Table {
         uuid_users::table
+    }
+
+    fn table_name() -> &'static str {
+        "uuid_users"
     }
 
     /// Parses the hyphenated `TEXT` id back into a [`DeviseKey::Uuid`].

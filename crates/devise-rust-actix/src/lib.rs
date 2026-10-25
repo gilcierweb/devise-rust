@@ -32,6 +32,7 @@ pub mod middleware;
 pub mod omniauth;
 pub mod remember;
 pub mod routes;
+pub mod schema;
 pub mod test_helpers;
 
 pub use bridge::ActixSessionStore;

@@ -83,6 +83,7 @@ pub mod layer;
 pub mod omniauth;
 pub mod remember;
 pub mod routes;
+pub mod schema;
 /// Generic `OAuth2` stub provider — test support only (D-06). Gated
 /// behind the `test-support` cargo feature: never compiled into
 /// non-test builds; consumed by this crate's omniauth flow tests and

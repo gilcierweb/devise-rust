@@ -60,6 +60,8 @@ pub mod create;
 pub mod pool;
 #[cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql"))]
 pub mod query;
+#[cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql"))]
+mod schema;
 
 pub use glue::{Bind, KeyShape, SqlxModel, WriteValue};
 
@@ -199,6 +201,10 @@ where
             .await
             .map_err(crate::error::map_pool_error)?;
         query::delete_row::<M, DB>(&mut conn, id).await
+    }
+
+    async fn column_exists(&self, column: &str) -> Result<bool, OrmError> {
+        schema::column_exists::<M, DB>(&self.pool, column).await
     }
 }
 

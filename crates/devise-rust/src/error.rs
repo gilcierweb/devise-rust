@@ -18,6 +18,10 @@ pub enum DeviseError {
     /// Configuration error (missing `secret_key`, invalid config combination)
     #[error("Configuration error: {0}")]
     Config(String),
+    /// Devise's `Devise::Models::MissingAttribute`: the model is missing
+    /// columns a selected module requires (comma-joined names).
+    #[error("The following attribute(s) is (are) missing on your model: {0}")]
+    MissingAttribute(String),
     /// Adapter/backend error
     #[error("Adapter error: {0}")]
     Adapter(#[from] OrmError),
