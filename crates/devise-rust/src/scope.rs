@@ -123,13 +123,31 @@ impl Default for PathNames {
 
 /// Sign-out HTTP method
 ///
-/// Mirrors the `sign_out_via` option of `devise_for`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Mirrors the `sign_out_via` option of `devise_for`: Rails accepts a single
+/// verb or an array (`sign_out_via: [:get, :post]` emits one route row per
+/// verb), which the `Multiple` arm carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SignOutVia {
     #[default]
     Delete,
     Get,
     Post,
+    /// `sign_out_via: [:get, :post]`-style arrays — one route row per verb.
+    Multiple(Vec<String>),
+}
+
+impl SignOutVia {
+    /// HTTP verbs this configuration signs out through (Rails emits one
+    /// route row per verb; the first verb fills `RouteSpec::method`).
+    #[must_use]
+    pub fn verbs(&self) -> Vec<String> {
+        match self {
+            SignOutVia::Delete => vec!["DELETE".to_string()],
+            SignOutVia::Get => vec!["GET".to_string()],
+            SignOutVia::Post => vec!["POST".to_string()],
+            SignOutVia::Multiple(verbs) => verbs.iter().map(|v| v.trim().to_uppercase()).collect(),
+        }
+    }
 }
 
 impl std::fmt::Display for SignOutVia {
@@ -138,6 +156,10 @@ impl std::fmt::Display for SignOutVia {
             SignOutVia::Delete => write!(f, "DELETE"),
             SignOutVia::Get => write!(f, "GET"),
             SignOutVia::Post => write!(f, "POST"),
+            SignOutVia::Multiple(verbs) => {
+                let upper: Vec<String> = verbs.iter().map(|v| v.to_uppercase()).collect();
+                write!(f, "{}", upper.join(","))
+            }
         }
     }
 }
@@ -285,6 +307,19 @@ impl Mapping {
     /// the full `devise_for` route table with only/skip filtering.
     #[must_use]
     pub fn route_specs(&self) -> Vec<RouteSpec> {
+        self.route_specs_with_config(None)
+    }
+
+    /// Generate the `RouteSpec` table, applying the config-gated guards the
+    /// same way Devise's generator does.
+    ///
+    /// With `config = Some(...)`, unlock routes drop when the configured
+    /// unlock strategy excludes `:email` (`routes.rb:394-399`). With `None`,
+    /// the table is the config-free ceiling (the Phase 8 posture):
+    /// the per-request guard still lives in `route_specs_for` and the
+    /// framework crates read whichever variant matches their call shape.
+    #[must_use]
+    pub fn route_specs_with_config(&self, config: Option<&DeviseConfig>) -> Vec<RouteSpec> {
         let mut specs = Vec::new();
         for module in self.effective_modules() {
             match module {
@@ -292,7 +327,17 @@ impl Mapping {
                 Module::Registerable => self.push_registration_routes(&mut specs),
                 Module::Recoverable => self.push_password_routes(&mut specs),
                 Module::Confirmable => self.push_confirmation_routes(&mut specs),
-                Module::Lockable => self.push_unlock_routes(&mut specs),
+                Module::Lockable => {
+                    // Devise `routes.rb:394-399`: unlock routes only exist
+                    // when the unlock strategy includes `:email`. Without a
+                    // config (the legacy config-free table) the rows stay.
+                    let email_routes = config.is_none_or(|cfg| {
+                        crate::lockable::unlock_strategy_enabled_for("email", cfg)
+                    });
+                    if email_routes {
+                        self.push_unlock_routes(&mut specs);
+                    }
+                }
                 Module::Omniauthable => self.push_omniauth_routes(&mut specs),
                 // Validatable, Trackable, Timeoutable, Rememberable don't add routes
                 Module::Validatable
@@ -326,12 +371,22 @@ impl Mapping {
             "create",
             self.named("session"),
         ));
-        specs.push(RouteSpec::new(
-            self.scoped(&self.path_names.sign_out),
-            self.sign_out_via.to_string(),
-            "destroy",
-            format!("destroy_{}", self.named("session")),
-        ));
+        // Rails `via: mapping.sign_out_via` accepts an array — one route row
+        // per verb (`sign_out_via: [:get, :post]`).
+        let sign_out = self.scoped(&self.path_names.sign_out);
+        let sign_out_name = format!("destroy_{}", self.named("session"));
+        let mut verbs = self.sign_out_via.verbs();
+        if verbs.is_empty() {
+            verbs.push(SignOutVia::default().to_string());
+        }
+        for verb in verbs {
+            specs.push(RouteSpec::new(
+                sign_out.clone(),
+                verb,
+                "destroy",
+                sign_out_name.clone(),
+            ));
+        }
     }
 
     fn push_registration_routes(&self, specs: &mut Vec<RouteSpec>) {
@@ -544,7 +599,7 @@ impl Mapping {
     #[must_use]
     pub fn route_specs_for(&self, config: &DeviseConfig) -> Vec<RouteSpec> {
         let mut specs: Vec<RouteSpec> = self
-            .route_specs()
+            .route_specs_with_config(Some(config))
             .into_iter()
             .filter(|spec| !spec.name.contains("omniauth"))
             .collect();
@@ -866,6 +921,114 @@ mod tests {
         assert_eq!(SignOutVia::Delete.to_string(), "DELETE");
         assert_eq!(SignOutVia::Get.to_string(), "GET");
         assert_eq!(SignOutVia::Post.to_string(), "POST");
+        // Rails' `sign_out_via` accepts an array: one route row per verb.
+        let multi = SignOutVia::Multiple(vec!["get".to_string(), "post".to_string()]);
+        assert_eq!(multi.verbs(), vec!["GET", "POST"]);
+        assert_eq!(multi.to_string(), "GET,POST");
+    }
+
+    /// Rails parity (`routes.rb:380`): `sign_out_via: [:get, :post]` emits
+    /// one destroy route per verb, same name/path.
+    #[test]
+    fn test_sign_out_via_array_emits_one_row_per_verb() {
+        let mapping = Mapping {
+            name: "user".to_string(),
+            class_name: "User".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![Module::DatabaseAuthenticatable],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: SignOutVia::Multiple(vec!["get".to_string(), "post".to_string()]),
+            failure_app: None,
+        };
+        let sign_out_rows: Vec<_> = mapping
+            .route_specs()
+            .into_iter()
+            .filter(|spec| spec.action == "destroy")
+            .collect();
+        assert_eq!(
+            sign_out_rows.len(),
+            2,
+            "one row per verb: {sign_out_rows:?}"
+        );
+        assert!(
+            sign_out_rows
+                .iter()
+                .all(|s| s.path == "/users/sign_out" && s.name == "destroy_user_session"),
+            "same path and name across verbs: {sign_out_rows:?}"
+        );
+        assert_eq!(sign_out_rows[0].method, "GET");
+        assert_eq!(sign_out_rows[1].method, "POST");
+    }
+
+    /// Rails parity (`routes.rb:394-399`): the config-gated table drops the
+    /// unlock routes when the unlock strategy excludes `:email`; the
+    /// config-free table (legacy shape) keeps them.
+    #[test]
+    fn test_unlock_route_guard_follows_unlock_strategy() {
+        let mapping = Mapping {
+            name: "user".to_string(),
+            class_name: "User".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![Module::Lockable],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: SignOutVia::Delete,
+            failure_app: None,
+        };
+
+        // Config-free table keeps the rows (the Phase 8 posture).
+        assert!(
+            mapping
+                .route_specs()
+                .iter()
+                .any(|spec| spec.action == "new" && spec.path.ends_with("/unlock/new")),
+            "config-free table keeps unlock rows"
+        );
+
+        let email_config = DeviseConfig {
+            unlock_strategy: "email".to_string(),
+            ..DeviseConfig::default()
+        };
+        assert_eq!(
+            mapping
+                .route_specs_with_config(Some(&email_config))
+                .iter()
+                .filter(|spec| spec.path.contains("/unlock"))
+                .count(),
+            3,
+            "email/both strategies keep the unlock routes"
+        );
+
+        let time_config = DeviseConfig {
+            unlock_strategy: "time".to_string(),
+            ..DeviseConfig::default()
+        };
+        assert_eq!(
+            mapping
+                .route_specs_with_config(Some(&time_config))
+                .iter()
+                .filter(|spec| spec.path.contains("/unlock"))
+                .count(),
+            0,
+            "time-only strategy drops the unlock routes"
+        );
     }
 
     #[test]
