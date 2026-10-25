@@ -476,9 +476,9 @@ impl std::fmt::Debug for ExampleUser {
 }
 
 impl AnyDeviseModel for ExampleUser {
-        fn redacted_hash(&self) -> serde_json::Value {
-            <Self as devise_rust::model::Authenticatable>::serializable_hash(self)
-        }
+    fn redacted_hash(&self) -> serde_json::Value {
+        <Self as devise_rust::model::Authenticatable>::serializable_hash(self)
+    }
 
     fn as_activatable(&self) -> Option<&dyn devise_rust::model::Activatable> {
         Some(self)

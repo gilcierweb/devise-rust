@@ -87,6 +87,11 @@ pub struct ResolvedAuth {
     pub payloads: HashMap<String, Value>,
     /// Devise configuration shared with the failure renderer path.
     pub config: Option<Arc<DeviseConfig>>,
+    /// Scope whose session expired this request (Devise `:timeout`), staged
+    /// by the synchronous fetch-path timeout pass; extractors render the
+    /// Devise timeout failure for it instead of the plain unauthenticated
+    /// one.
+    pub timed_out: Option<String>,
 }
 
 /// Handle staged in request extensions: `Arc<Mutex<_>>` so the middleware
@@ -197,6 +202,44 @@ where
                 payloads.insert(finder_scope.clone(), value);
             }
         }
+        // Timeoutable parity for the actix fetch path (Devise
+        // `hooks/timeoutable.rb`). The axum layer dispatches the same core
+        // rule through the async hook registry over a live tower store; the
+        // actix `Session` is `!Send` (D-04: read once, drop before any
+        // await), so the decision runs HERE, synchronously, over the live
+        // handle. Core owns the rule (`check_timeout`); this pass is only
+        // the session I/O: tick on Live, or drop the expired scope's payload
+        // so the request resolves anonymous and the remember arm below
+        // provides Devise's remember-me exemption.
+        let mut timed_out: Option<String> = None;
+        if let Some(scope_name) = scope.as_deref() {
+            if payloads.contains_key(scope_name) {
+                let flags = &auth_request_for_resolution.flags;
+                let stored = crate::bridge::read_last_request_at_value(&session, scope_name);
+                match devise_rust::timeoutable::check_timeout(
+                    stored.as_ref(),
+                    flags,
+                    config.config.timeout_in,
+                    &devise_rust::time::SystemClock,
+                ) {
+                    devise_rust::timeoutable::TimeoutDecision::Live => {
+                        if !flags.skip_trackable {
+                            crate::bridge::tick_last_request_at(
+                                &session,
+                                scope_name,
+                                &devise_rust::time::SystemClock,
+                            );
+                        }
+                    }
+                    devise_rust::timeoutable::TimeoutDecision::Expired => {
+                        payloads.remove(scope_name);
+                        timed_out = Some(scope_name.to_string());
+                    }
+                    devise_rust::timeoutable::TimeoutDecision::Skipped => {}
+                }
+            }
+        }
+
         drop(session);
 
         // Attach the AuthRequest and the shared resolved-auth handle. The
@@ -211,6 +254,7 @@ where
             users: HashMap::new(),
             payloads: payloads.clone(),
             config: Some(config.config.clone()),
+            timed_out,
         }));
         req.extensions_mut().insert(auth_request);
         req.extensions_mut().insert(handle.clone());

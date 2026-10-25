@@ -327,6 +327,21 @@ where
     Some(key)
 }
 
+/// Raw JSON shape of the stored `last_request_at` tick for a scope: the
+/// input the core timeout decision consumes (integer epoch or legacy
+/// string). The actix middleware runs that decision synchronously with the
+/// live `Session` handle (D-04), so it reads this raw shape instead of the
+/// async store API.
+#[must_use]
+pub fn read_last_request_at_value(session: &Session, scope: &str) -> Option<serde_json::Value> {
+    let key = devise_rust::timeoutable::last_request_at_key(scope);
+    // The raw stored JSON value: the tick writes an integer epoch (JSON
+    // number) and the core parser accepts the legacy string form too, so the
+    // read must not pre-type it as `String` (a number read as String fails
+    // and would make every session live forever).
+    session.get::<serde_json::Value>(&key).ok().flatten()
+}
+
 /// Read the integer-epoch `last_request_at` tick for a scope (D-06).
 ///
 /// Returns `None` when missing or malformed (fail-closed per T-05-09).

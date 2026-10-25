@@ -205,6 +205,13 @@ impl<M: AnyDeviseModel + Send + Sync + 'static> FromRequest for RequireAuth<M> {
         let resolved = resolved_auth(req);
         let mapping = resolved.as_ref().and_then(|r| r.mapping.clone());
         let config = resolved.as_ref().and_then(|r| r.config.clone());
+        // Devise `devise.failure.timeout`: a session the fetch-path timeout
+        // pass expired fails closed with the timeout reason (the redirect
+        // keeps the `timedout` flash), not the plain unauthenticated key.
+        let timed_out = resolved
+            .as_ref()
+            .and_then(|r| r.timed_out.clone())
+            .filter(|timed| timed == &scope);
         // Devise `store_location!`: GET navigational non-XHR requests are
         // remembered in the session so post-sign-in can return here
         // (T-08-08: same-host-only parse; POST/absolute/relative-foreign
@@ -225,9 +232,30 @@ impl<M: AnyDeviseModel + Send + Sync + 'static> FromRequest for RequireAuth<M> {
             }
         }
         Box::pin(async move {
-            let response = build_unauthenticated_send_safe(&request, mapping, config);
+            let response = if timed_out.is_some() {
+                build_timeout_send_safe(&request, mapping, config)
+            } else {
+                build_unauthenticated_send_safe(&request, mapping, config)
+            };
             Err(error::InternalError::from_response("", response).into())
         })
+    }
+}
+
+/// Construct the timeout failure response inside the extractor future -
+/// the same send-safe shape as [`build_unauthenticated_send_safe`] with the
+/// Devise `:timeout` reason.
+fn build_timeout_send_safe(
+    request: &AuthRequest,
+    mapping: Option<Mapping>,
+    config: Option<Arc<DeviseConfig>>,
+) -> HttpResponse {
+    match (mapping, config) {
+        (Some(mapping), Some(config)) => {
+            let failure = build_failure(request, &mapping, &config, FailureReason::Timeout);
+            ActixFailureRenderer::new().render(&failure, &mapping)
+        }
+        _ => HttpResponse::Unauthorized().finish(),
     }
 }
 
