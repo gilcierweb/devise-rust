@@ -99,6 +99,26 @@ async fn form_sign_in_with(
     test::call_service(app, request.to_request()).await
 }
 
+/// `DELETE /users/sign_out` with the given session cookie (Devise's default
+/// `sign_out_via: :delete`).
+async fn sign_out_request(
+    app: &impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse,
+        Error = actix_web::Error,
+    >,
+    cookie: &str,
+) -> actix_web::dev::ServiceResponse {
+    test::call_service(
+        app,
+        test::TestRequest::delete()
+            .uri("/users/sign_out")
+            .insert_header(("cookie", cookie))
+            .to_request(),
+    )
+    .await
+}
+
 /// Devise `authentication_test.rb`: sign in → 302 + `signed_in` flash +
 /// renewed session; sign out → 302 + `signed_out` flash.
 #[actix_web::test]
@@ -167,6 +187,62 @@ async fn flow_sign_in_and_sign_out_with_flashes() {
     )
     .await;
     assert_eq!(resp.status(), 302);
+}
+
+/// Devise parity (`strategies/database_authenticatable.rb:24-25`): an unknown
+/// account fails with `not_found_in_database` outside paranoid mode — the
+/// shipped locale key must stay reachable and distinguishable from a wrong
+/// password on an existing account.
+#[actix_web::test]
+async fn flow_sign_in_unknown_email_reports_not_found() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    seed_user(&state, "known@example.com", "secret123").await;
+
+    let resp = form_sign_in(&app, "ghost@example.com", "secret123").await;
+    assert_eq!(resp.status(), 302);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=not_found_in_database")),
+        "not_found_in_database flash on unknown email: {cookies:?}"
+    );
+    assert!(
+        !cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=invalid")),
+        "unknown email must not report plain invalid: {cookies:?}"
+    );
+}
+
+/// Devise parity: the same unknown account inside paranoid mode reports the
+/// unified `invalid` key (the enumeration oracle closes again).
+#[actix_web::test]
+async fn flow_sign_in_unknown_email_paranoid_reports_invalid() {
+    let mut config = common::test_config();
+    config.paranoid = true;
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
+    seed_user(&state, "known@example.com", "secret123").await;
+
+    let resp = form_sign_in(&app, "ghost@example.com", "secret123").await;
+    assert_eq!(resp.status(), 302);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=invalid")),
+        "unified invalid flash under paranoid: {cookies:?}"
+    );
+    assert!(
+        !cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=not_found_in_database")),
+        "paranoid must not leak account absence: {cookies:?}"
+    );
 }
 
 /// Devise: invalid password → 302 back to `sign_in` with `invalid` flash
@@ -267,6 +343,154 @@ async fn flow_account_update_requires_current_password() {
         .expect("lookup")
         .expect("record");
     assert_eq!(after.encrypted_password, digest_before, "nothing persisted");
+}
+
+/// Devise reconfirmable parity (`confirmable.rb:261-270`, #5783): an account
+/// update that changes the email postpones the change — the DB keeps the
+/// ORIGINAL address, `unconfirmed_email` carries the new one, a
+/// confirmation mail is sent to the new address, and the flash key becomes
+/// `update_needs_confirmation`. Security regression: the original test
+/// `concurrent "update email" requests should not allow confirming a
+/// victim email address`.
+#[actix_web::test]
+async fn flow_account_update_email_postpones_until_confirmation() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    seed_user(&state, "flow6@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    let resp = form_sign_in(&app, "flow6@example.com", "secret123").await;
+    jar.merge(&resp);
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::default()
+            .method(actix_web::http::Method::PATCH)
+            .uri("/users/")
+            .insert_header(("cookie", jar.header()))
+            .insert_header(("content-type", "application/x-www-form-urlencoded"))
+            .set_payload("user[current_password]=secret123&user[email]=attacker@example.com")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 302);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=update_needs_confirmation")),
+        "update_needs_confirmation flash expected: {cookies:?}"
+    );
+
+    // The DB row still carries the ORIGINAL address; the new one waits in
+    // unconfirmed_email with a fresh token (never a raw token in the DB).
+    let mut conditions = Conditions::new();
+    conditions.insert("email", Value::String("flow6@example.com".to_string()));
+    let after = state
+        .adapter
+        .find_first(&conditions)
+        .await
+        .expect("lookup")
+        .expect("record");
+    assert_eq!(after.email, "flow6@example.com", "email postponed");
+    assert_eq!(
+        after.unconfirmed_email.as_deref(),
+        Some("attacker@example.com"),
+        "new address parked in unconfirmed_email"
+    );
+    assert!(
+        after
+            .confirmation_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty()),
+        "a confirmation token was minted"
+    );
+
+    // The sign-in session of the ORIGINAL address must survive (the account
+    // keeps working) — #5783's protection is that the victim's session and
+    // address cannot be hijacked by the pending email.
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/users_dashboard")
+            .insert_header(("cookie", jar.header()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+}
+
+/// Devise recoverable parity (`recoverable.rb:32`): a password change
+/// through the account update clears outstanding reset tokens, so a link
+/// emailed before the change can no longer be used.
+#[actix_web::test]
+async fn flow_account_update_clears_reset_token_on_password_change() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    seed_user(&state, "flow7@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    let resp = form_sign_in(&app, "flow7@example.com", "secret123").await;
+    jar.merge(&resp);
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::default()
+            .method(actix_web::http::Method::PATCH)
+            .uri("/users/")
+            .insert_header(("cookie", jar.header()))
+            .insert_header(("content-type", "application/x-www-form-urlencoded"))
+            .set_payload(
+                "user[current_password]=secret123&user[password]=brand-new-pass&user[password_confirmation]=brand-new-pass",
+            )
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 302);
+
+    let mut conditions = Conditions::new();
+    conditions.insert("email", Value::String("flow7@example.com".to_string()));
+    let after = state
+        .adapter
+        .find_first(&conditions)
+        .await
+        .expect("lookup")
+        .expect("record");
+    assert_eq!(
+        after.reset_password_token, None,
+        "password change must clear the reset token"
+    );
+}
+
+/// Devise `set_flash_message_for_update`: a pending reconfirmation flashing
+/// `update_needs_confirmation`; a non-active account flashing
+/// `updated_but_not_signed_in`.
+#[actix_web::test]
+async fn flow_account_update_plain_flash() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    seed_user(&state, "flow8@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    let resp = form_sign_in(&app, "flow8@example.com", "secret123").await;
+    jar.merge(&resp);
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::default()
+            .method(actix_web::http::Method::PATCH)
+            .uri("/users/")
+            .insert_header(("cookie", jar.header()))
+            .insert_header(("content-type", "application/x-www-form-urlencoded"))
+            .set_payload("user[current_password]=secret123")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 302);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=updated")),
+        "plain update flash expected: {cookies:?}"
+    );
 }
 
 /// Devise passwords controller: blank token on edit redirects with
@@ -641,4 +865,54 @@ async fn flow_stored_location_get_only() {
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     assert_eq!(location.as_deref(), Some("/"), "POST is never stored");
+}
+
+/// Devise `verify_signed_out_user` (`sessions_controller.rb:6`): a second
+/// sign-out with no session reports `already_signed_out` (JSON: 401) instead
+/// of pretending a sign-out happened.
+#[actix_web::test]
+async fn flow_sign_out_again_reports_already_signed_out() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    seed_user(&state, "flow9@example.com", "secret123").await;
+    let mut jar = Jar::new();
+
+    let resp = form_sign_in(&app, "flow9@example.com", "secret123").await;
+    jar.merge(&resp);
+    let resp = sign_out_request(&app, &jar.header()).await;
+    assert_eq!(resp.status(), 302);
+    jar.merge(&resp);
+
+    let resp = sign_out_request(&app, &jar.header()).await;
+    assert_eq!(resp.status(), 302);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=already_signed_out")),
+        "already_signed_out flash expected: {cookies:?}"
+    );
+}
+
+/// Devise `require_no_authentication` (`sessions_controller.rb:4`): a sign-in
+/// POST from an already signed-in session redirects home with
+/// `already_authenticated` instead of re-authenticating.
+#[actix_web::test]
+async fn flow_sign_in_while_signed_in_reports_already_authenticated() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    seed_user(&state, "flow10@example.com", "secret123").await;
+    let mut jar = Jar::new();
+
+    let resp = form_sign_in(&app, "flow10@example.com", "secret123").await;
+    jar.merge(&resp);
+
+    let resp =
+        form_sign_in_with(&app, "flow10@example.com", "secret123", Some(&jar.header())).await;
+    assert_eq!(resp.status(), 302);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=already_authenticated")),
+        "already_authenticated flash expected: {cookies:?}"
+    );
 }

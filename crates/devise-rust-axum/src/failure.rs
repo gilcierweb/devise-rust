@@ -11,7 +11,7 @@
 //! |------------------------|------------------------------------------------------|
 //! | `NavigationalRedirect` | 302 toward `mapping.sign_in_path()` + flash cookie   |
 //! | `ApiUnauthorized`      | 401 with `WWW-Authenticate` when present             |
-//! | `Recall`               | 302 toward the recall target (documented gap: Devise re-dispatches to the controller action; 09-02 wires per-controller rendering) |
+//! | `Recall`               | 302 toward the scope's sign-in path (Devise's recall re-render, scope-mounted) |
 //! | everything else        | 401                                                  |
 
 #![allow(clippy::missing_errors_doc)] // failure shapes documented upstream
@@ -93,11 +93,14 @@ impl FailureRenderer for AxumFailureRenderer {
                 response
             }
             Failure::Recall { controller, action } => {
-                // Recall: Devise re-dispatches to the controller/action with
-                // the original params. Until per-controller wiring (09-02),
-                // respond with a 302 toward the recall target — the same
-                // documented gap the actix renderer carries.
-                redirect_found(&format!("/{controller}/{action}"))
+                // Recall (Devise's failure_app `recall` branch): re-render the
+                // scope's sign-in form. Devise re-dispatches `sessions#new`
+                // with the posted params; the port redirects to the mapping's
+                // sign-in path (the scope-mounted equivalent of
+                // `/{controller}/{action}`), so the user lands on the real
+                // form instead of an unmounted bare path.
+                let _ = (controller, action);
+                redirect_found(&mapping.sign_in_path())
             }
             // Catch-all for the raw strategy/hook variants (Timeout,
             // InvalidCredentials, Locked, Unconfirmed, NotFound, Config,

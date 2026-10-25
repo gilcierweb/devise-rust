@@ -331,15 +331,30 @@ async fn registrations_controller_create_matrix() {
         "{errors:?}"
     );
 
-    // Remaining form routes exist (new/edit gated, cancel open).
-    for path in ["/users/sign_up", "/users/cancel"] {
-        let response = app
-            .clone()
-            .oneshot(request(Method::GET, path))
-            .await
-            .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::OK, "{path}");
-    }
+    // Remaining form routes exist (new/edit gated, cancel open). Devise's
+    // cancel expires the session data and redirects to the sign-up path
+    // (registrations_controller.rb:78-81) — 303, not the old stub body.
+    let response = app
+        .clone()
+        .oneshot(request(Method::GET, "/users/sign_up"))
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK, "/users/sign_up");
+
+    let response = app
+        .clone()
+        .oneshot(request(Method::GET, "/users/cancel"))
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::SEE_OTHER, "/users/cancel");
+    assert_eq!(
+        response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/users/sign_up"),
+        "cancel redirects to the sign-up path"
+    );
 }
 
 /// Passwords controller: create always sends instructions (201 JSON); edit

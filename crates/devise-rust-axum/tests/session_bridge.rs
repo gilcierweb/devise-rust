@@ -1176,3 +1176,40 @@ async fn remember_ops_drain_into_set_cookie() {
         .expect("Clear op drained into a tombstone");
     assert!(clear.contains("Max-Age=0"));
 }
+
+/// Devise `handle_unverified_request` parity (`controllers/helpers.rb:254-260`):
+/// a CSRF failure clears every scope's session payload (plus the timeoutable
+/// tick) and cycles the session id.
+#[tokio::test]
+async fn renewal_handle_unverified_request_clears_every_scope() {
+    let session = fresh_session();
+    let (key, salt) = fixture_pair();
+    let user_key = keys::scope_session_key("user");
+    let admin_key = keys::scope_session_key("admin");
+    let tick_key = devise_rust::timeoutable::last_request_at_key("user");
+
+    let store = devise_rust_axum::TowerSessionStore::new(session.clone());
+    store
+        .insert_value(&user_key, serde_json::json!([key.to_string(), &salt]))
+        .await;
+    store
+        .insert_value(&admin_key, serde_json::json!([key.to_string(), &salt]))
+        .await;
+    store
+        .insert_value(&tick_key, serde_json::json!(i64::MAX))
+        .await;
+    session.save().await.expect("save assigns the id");
+    let id_before = session.id().expect("id assigned after save");
+
+    let scopes = vec!["user".to_string(), "admin".to_string()];
+    devise_rust_axum::bridge::handle_unverified_request(&session, &scopes)
+        .await
+        .expect("unverified request");
+    session.save().await.expect("save assigns the new id");
+    let id_after = session.id().expect("id reassigned after cycle");
+
+    assert_ne!(id_before, id_after, "session id must cycle on CSRF failure");
+    assert!(session.get_value(&user_key).await.expect("read").is_none());
+    assert!(session.get_value(&admin_key).await.expect("read").is_none());
+    assert!(session.get_value(&tick_key).await.expect("read").is_none());
+}

@@ -194,6 +194,58 @@ pub fn sign_out_and_renew(session: &Session, scope: &str) -> Result<(), DeviseEr
     Ok(())
 }
 
+/// Devise `handle_unverified_request` (`controllers/helpers.rb:254-260`):
+/// the CSRF-failure hook. Rails' base clears the session; Devise's override
+/// additionally signs out EVERY scope without locking and marks the request
+/// to skip session storage, so no user survives the aborted request
+/// (session-fixation / cross-site form-abuse protection).
+///
+/// The port clears each scope's devise session payload and then renews the
+/// session id, so any session-cookie value captured before the failure is
+/// dead afterwards. Applications wire this from their own CSRF failure path
+/// (`protect_from_forgery` with a handler that calls it, or a custom
+/// `DeviseController::handle_unverified_request`-equivalent).
+///
+/// # Errors
+///
+/// Infallible: see [`sign_out_and_renew`].
+pub fn handle_unverified_request(session: &Session, scopes: &[String]) -> Result<(), DeviseError> {
+    for scope in scopes {
+        let session_key = keys::scope_session_key(scope);
+        session.remove(&session_key);
+    }
+    // Sessions also carry the timeoutable tick; a forged request must not
+    // keep a live tick either.
+    for scope in scopes {
+        let tick_key = devise_rust::timeoutable::last_request_at_key(scope);
+        session.remove(&tick_key);
+    }
+    let _ = ActixSessionStore::renew_sync(session);
+    Ok(())
+}
+
+/// Devise `expire_data_after_sign_in!` (`controllers/helpers.rb`): drop every
+/// devise session payload and tick, the way Rails' `session.delete` sweep
+/// over `/devise\./`-matching keys does. Called on the inactive sign-up
+/// branch and on `cancel`, where a request must leave no signed-in state
+/// behind.
+///
+/// The port clears each scope's devise session payload and timeoutable tick
+/// (no session id change — the data dies, the session lives).
+///
+/// # Errors
+///
+/// Infallible: see [`sign_out_and_renew`].
+pub fn expire_devise_data_sync(session: &Session, scopes: &[String]) -> Result<(), DeviseError> {
+    for scope in scopes {
+        let session_key = keys::scope_session_key(scope);
+        session.remove(&session_key);
+        let tick_key = devise_rust::timeoutable::last_request_at_key(scope);
+        session.remove(&tick_key);
+    }
+    Ok(())
+}
+
 /// Sign out all scopes: remove each scope's session key, renewing first
 /// (D-03).
 ///

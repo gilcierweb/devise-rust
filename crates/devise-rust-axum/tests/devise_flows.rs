@@ -215,6 +215,50 @@ async fn flow_sign_in_and_sign_out_with_flashes() {
     assert_eq!(resp.status(), StatusCode::FOUND);
 }
 
+/// Devise parity (`strategies/database_authenticatable.rb:24-25`): an unknown
+/// account fails with `not_found_in_database` outside paranoid mode.
+#[tokio::test]
+async fn flow_sign_in_unknown_email_reports_not_found() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user(&state, "known@example.com", "secret123").await;
+
+    let resp = form_sign_in(&app, "ghost@example.com", "secret123").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=not_found_in_database")),
+        "not_found_in_database flash on unknown email: {cookies:?}"
+    );
+}
+
+/// Devise parity: inside paranoid mode the same miss reports the unified
+/// `invalid` key (no enumeration oracle).
+#[tokio::test]
+async fn flow_sign_in_unknown_email_paranoid_reports_invalid() {
+    let mut config = common::test_config();
+    config.paranoid = true;
+    let (state, app) = common::build_app(common::test_state_with_config(default_mapping(), config));
+    seed_user(&state, "known@example.com", "secret123").await;
+
+    let resp = form_sign_in(&app, "ghost@example.com", "secret123").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=invalid")),
+        "unified invalid flash under paranoid: {cookies:?}"
+    );
+    assert!(
+        !cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=not_found_in_database")),
+        "paranoid must not leak account absence: {cookies:?}"
+    );
+}
+
 /// Devise: invalid password → 302 back to `sign_in` with the `invalid`
 /// flash (HTML) and 401 + symbolic key for JSON callers (D-09 analogue).
 #[tokio::test]
@@ -322,6 +366,154 @@ async fn flow_account_update_requires_current_password() {
         .expect("lookup")
         .expect("record");
     assert_eq!(after.encrypted_password, digest_before, "nothing persisted");
+}
+
+/// Devise reconfirmable parity (`confirmable.rb:261-270`, #5783): an account
+/// update that changes the email postpones the change — the DB keeps the
+/// ORIGINAL address, `unconfirmed_email` carries the new one, and the flash
+/// key becomes `update_needs_confirmation`.
+#[tokio::test]
+async fn flow_account_update_email_postpones_until_confirmation() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user(&state, "flow6@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    let resp = form_sign_in(&app, "flow6@example.com", "secret123").await;
+    jar.merge(&resp);
+
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::PATCH)
+            .uri("/users/")
+            .header(header::COOKIE, jar.header())
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "user[current_password]=secret123&user[email]=attacker@example.com",
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=update_needs_confirmation")),
+        "update_needs_confirmation flash expected: {cookies:?}"
+    );
+    // The bypass re-sign-in cycles the session id; a browser follows the
+    // fresh cookie, so the jar must absorb it before the probe.
+    jar.merge(&resp);
+
+    let mut conditions = Conditions::new();
+    conditions.insert("email", Value::String("flow6@example.com".to_string()));
+    let after = state
+        .adapter
+        .find_first(&conditions)
+        .await
+        .expect("lookup")
+        .expect("record");
+    assert_eq!(after.email, "flow6@example.com", "email postponed");
+    assert_eq!(
+        after.unconfirmed_email.as_deref(),
+        Some("attacker@example.com"),
+        "new address parked in unconfirmed_email"
+    );
+    assert!(
+        after
+            .confirmation_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty()),
+        "a confirmation token was minted"
+    );
+
+    // The original session must survive (the victim keeps access).
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/users_dashboard")
+            .header(header::COOKIE, jar.header())
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Devise recoverable parity (`recoverable.rb:32`): a password change
+/// through the account update clears outstanding reset tokens.
+#[tokio::test]
+async fn flow_account_update_clears_reset_token_on_password_change() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user(&state, "flow7@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    let resp = form_sign_in(&app, "flow7@example.com", "secret123").await;
+    jar.merge(&resp);
+
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::PATCH)
+            .uri("/users/")
+            .header(header::COOKIE, jar.header())
+            .header(
+                header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(Body::from(
+                "user[current_password]=secret123&user[password]=brand-new-pass&user[password_confirmation]=brand-new-pass",
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+
+    let mut conditions = Conditions::new();
+    conditions.insert("email", Value::String("flow7@example.com".to_string()));
+    let after = state
+        .adapter
+        .find_first(&conditions)
+        .await
+        .expect("lookup")
+        .expect("record");
+    assert_eq!(
+        after.reset_password_token, None,
+        "password change must clear the reset token"
+    );
+}
+
+/// Devise `set_flash_message_for_update`: a plain update flashes `updated`.
+#[tokio::test]
+async fn flow_account_update_plain_flash() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user(&state, "flow8@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    let resp = form_sign_in(&app, "flow8@example.com", "secret123").await;
+    jar.merge(&resp);
+
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::PATCH)
+            .uri("/users/")
+            .header(header::COOKIE, jar.header())
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("user[current_password]=secret123"))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=updated")),
+        "plain update flash expected: {cookies:?}"
+    );
 }
 
 /// Devise passwords controller: blank token on edit redirects with
@@ -843,5 +1035,76 @@ async fn bypass_helpers_reach_protected_route_via_cookie_replay() {
         resp.status(),
         StatusCode::FOUND,
         "bypass sign-out clears the scope"
+    );
+}
+
+/// Devise `verify_signed_out_user` (`sessions_controller.rb:6`): a second
+/// sign-out with no session reports `already_signed_out`.
+#[tokio::test]
+async fn flow_sign_out_again_reports_already_signed_out() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user(&state, "flow9@example.com", "secret123").await;
+    let mut jar = Jar::new();
+
+    let resp = form_sign_in(&app, "flow9@example.com", "secret123").await;
+    jar.merge(&resp);
+
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::DELETE)
+            .uri("/users/sign_out")
+            .header(header::COOKIE, jar.header())
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    jar.merge(&resp);
+
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::DELETE)
+            .uri("/users/sign_out")
+            .header(header::COOKIE, jar.header())
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=already_signed_out")),
+        "already_signed_out flash expected: {cookies:?}"
+    );
+}
+
+/// Devise `require_no_authentication` (`sessions_controller.rb:4`): a sign-in
+/// POST from an already signed-in session redirects home with
+/// `already_authenticated` instead of re-authenticating.
+#[tokio::test]
+async fn flow_sign_in_while_signed_in_reports_already_authenticated() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user(&state, "flow10@example.com", "secret123").await;
+    let mut jar = Jar::new();
+
+    let resp = form_sign_in(&app, "flow10@example.com", "secret123").await;
+    jar.merge(&resp);
+
+    let resp = call(
+        &app,
+        form_sign_in_request("flow10@example.com", "secret123", Some(&jar.header())),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("devise.flash=already_authenticated")),
+        "already_authenticated flash expected: {cookies:?}"
     );
 }

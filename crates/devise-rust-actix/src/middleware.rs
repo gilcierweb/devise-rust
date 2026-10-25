@@ -183,6 +183,7 @@ where
         // D-04 owned snapshot: the raw cookie/header/params data is cloned
         // synchronously; the remainder of the pipeline owns plain Rust values.
         let auth_request = build_auth_request(&req, &config.config, scope.as_deref());
+        let auth_request_for_resolution = auth_request.clone();
 
         // Session payload snapshot (synchronous, D-04): the `Session` handle
         // is read and dropped BEFORE any `.await`. Resolution of boxed
@@ -214,17 +215,137 @@ where
         req.extensions_mut().insert(auth_request);
         req.extensions_mut().insert(handle.clone());
 
+        let remember_clears: RememberClearHandle = Arc::new(std::sync::Mutex::new(Vec::new()));
+        req.extensions_mut().insert(remember_clears.clone());
+
         let fut = self.service.call(req);
         Box::pin(async move {
             // Record resolution: adapter `.await`s happen here with no
             // `Session` handle alive (owned-extract, D-04).
             let users = resolve_users(&config, &payloads).await;
+            // Remember-me arm (CONCERNS #7 / RMB parity): when the session
+            // holds no user for the scope, the strategy chain's rememberable
+            // arm runs over the signature-verified cookie, so a
+            // remember-only request authenticates in actix like axum does.
+            // Stale cookies are tombstoned on the response below.
+            let (users, clears) = resolve_remember_users(
+                &config,
+                scope.as_deref(),
+                users,
+                &auth_request_for_resolution,
+            )
+            .await;
+            if let Ok(mut guard) = remember_clears.lock() {
+                *guard = clears;
+            }
             if let Ok(mut guard) = handle.lock() {
                 guard.users = users;
             }
-            fut.await
+            let response = fut.await;
+            match response {
+                Ok(service_response) => {
+                    Ok(drain_remember_clears(service_response, &remember_clears))
+                }
+                Err(err) => Err(err),
+            }
         })
     }
+}
+
+/// Staged remember-cookie tombstones for the response phase (the strategy
+/// chain's `ClearCookieAndPass` outcomes in actix).
+pub type RememberClearHandle = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// Apply the staged remember-cookie tombstones to the response
+/// (`ClearCookieAndPass` → `cookies.delete`, Devise jar semantics).
+fn drain_remember_clears<B>(
+    mut response: actix_web::dev::ServiceResponse<B>,
+    clears: &RememberClearHandle,
+) -> actix_web::dev::ServiceResponse<B> {
+    let Ok(guard) = clears.lock() else {
+        return response;
+    };
+    let names: Vec<String> = guard.clone();
+    drop(guard);
+    for name in names {
+        let _ = response
+            .response_mut()
+            .add_removal_cookie(&crate::remember::removal_cookie(&name));
+    }
+    response
+}
+
+/// Remember-me arm of the resolution (CONCERNS #7 / RMB-04).
+///
+/// For every scope that has NO session-resolved user but a registered
+/// finder, a rememberable mapping, and a staged (signature-verified)
+/// remember cookie, the core strategy chain runs and:
+///
+/// - on success, the record joins the resolved users (the 5-condition
+///   check in `rememberable.rs` owns validity);
+/// - on `ClearCookieAndPass`, the cookie name is returned so the response
+///   phase tombstones it (Devise `cookies.delete`, never a Failure).
+///
+/// Signature verification happens here (the staged snapshot carries the
+/// raw signed cookie); the core strategy sees only the plaintext triple,
+/// exactly like the axum layer's inbound path.
+async fn resolve_remember_users(
+    config: &DeviseMiddlewareConfig,
+    scope: Option<&str>,
+    mut users: HashMap<String, Arc<dyn AnyDeviseModel>>,
+    request: &AuthRequest,
+) -> (HashMap<String, Arc<dyn AnyDeviseModel>>, Vec<String>) {
+    let mut clears: Vec<String> = Vec::new();
+    let Ok(jar_key) = crate::remember::derive_remember_key(&config.config) else {
+        return (users, clears);
+    };
+    let Some(scope) = scope else {
+        return (users, clears);
+    };
+    if users.contains_key(scope) {
+        return (users, clears);
+    }
+    let Some(finder) = config.finders.get(scope) else {
+        return (users, clears);
+    };
+    let Some(mapping) = config.scope_registry.get(scope) else {
+        return (users, clears);
+    };
+    if !mapping.has_module(devise_rust::scope::Module::Rememberable) {
+        return (users, clears);
+    }
+    let cookie_name = devise_rust::rememberable::remember_cookie_key(scope, &config.config);
+    let Some(staged) = request.cookies.get(&cookie_name).cloned() else {
+        return (users, clears);
+    };
+    // Signature-verified plaintext; a failed verify keeps the raw value,
+    // which the core strategy classifies as stale (delete + pass through).
+    let plaintext =
+        crate::remember::verified_cookie_value(&jar_key, &cookie_name, &staged).unwrap_or(staged);
+    let mut verified_request = request.clone();
+    verified_request
+        .cookies
+        .insert(cookie_name.clone(), plaintext);
+
+    let strategies = devise_rust::strategy::strategies_for(mapping, &config.config);
+    for strategy in &strategies {
+        if strategy.no_input() {
+            match strategy
+                .authenticate(&verified_request, mapping, finder.as_ref(), &config.config)
+                .await
+            {
+                Ok(devise_rust::failure::AuthOutcome::Success(record)) => {
+                    users.insert(scope.to_string(), Arc::from(record));
+                }
+                Ok(devise_rust::failure::AuthOutcome::ClearCookieAndPass { cookie_key }) => {
+                    clears.push(cookie_key);
+                }
+                _ => {}
+            }
+            break;
+        }
+    }
+    (users, clears)
 }
 
 /// Resolve session users for every scope that has a payload and a

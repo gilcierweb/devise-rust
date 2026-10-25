@@ -141,6 +141,36 @@ pub fn read_cookie<J: Borrow<CookieJar>>(jar: &SignedJar<J>, name: &str) -> Reme
     }
 }
 
+/// Unwrap a signed remember cookie to its plaintext value.
+///
+/// Mirrors the axum transport's inbound verification: a raw signed value is
+/// replayed through a `SignedJar` under the shared key, so the core codec
+/// only ever sees the verified triple. A failed verification keeps the raw
+/// value — the core strategy then classifies it as stale (delete + pass).
+///
+/// # Examples
+///
+/// ```
+/// use devise_rust_actix::remember;
+/// use devise_rust::config::DeviseConfig;
+///
+/// let config = DeviseConfig {
+///     secret_key: "a-32-byte-minimum-secret-key-for-keys".to_string(),
+///     ..DeviseConfig::default()
+/// };
+/// let key = remember::derive_remember_key(&config).expect("key");
+/// // A raw unsigned value fails verification (returns None).
+/// assert!(remember::verified_cookie_value(&key, "remember_user_token", "raw-value").is_none());
+/// ```
+#[must_use]
+pub fn verified_cookie_value(key: &Key, name: &str, raw_value: &str) -> Option<String> {
+    let mut jar = CookieJar::new();
+    jar.add_original(Cookie::new(name.to_string(), raw_value.to_string()));
+    jar.signed(key)
+        .get(name)
+        .map(|cookie| cookie.value().to_string())
+}
+
 /// Build the `Clear` op for a stale/missing remember cookie (scope-aware,
 /// key-override-aware via `rememberable_options`).
 #[must_use]

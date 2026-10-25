@@ -286,6 +286,53 @@ pub async fn sign_out_and_renew(session: &Session, scope: &str) -> Result<(), De
     Ok(())
 }
 
+/// Devise `handle_unverified_request` (`controllers/helpers.rb:254-260`):
+/// the CSRF-failure hook. Rails' base clears the session; Devise's override
+/// additionally signs out EVERY scope without locking and marks the request
+/// to skip session storage, so no user survives the aborted request
+/// (session-fixation / cross-site form-abuse protection).
+///
+/// The port clears each scope's devise session payload plus the timeoutable
+/// tick and then cycles the session id, so any session id captured before
+/// the failure is dead afterwards. Applications wire this from their own
+/// CSRF failure path.
+///
+/// # Errors
+///
+/// Returns [`DeviseError::Internal`] when the cycle fails — the transition
+/// fails instead of leaving the pre-failure id in place.
+pub async fn handle_unverified_request(
+    session: &Session,
+    scopes: &[String],
+) -> Result<(), DeviseError> {
+    for scope in scopes {
+        let session_key = keys::scope_session_key(scope);
+        let _ = session.remove_value(&session_key).await;
+        let tick_key = devise_rust::timeoutable::last_request_at_key(scope);
+        let _ = session.remove_value(&tick_key).await;
+    }
+    session.cycle_id().await.map_err(cycle_error)
+}
+
+/// Devise `expire_data_after_sign_in!` (`controllers/helpers.rb`): drop every
+/// devise session payload and tick — the inactive sign-up branch and `cancel`
+/// must leave no signed-in state behind.
+///
+/// # Errors
+///
+/// Infallible in practice (value removals from tower-sessions are
+/// best-effort); the signature stays fallible for symmetry with the other
+/// bridge transitions.
+pub async fn expire_devise_data(session: &Session, scopes: &[String]) -> Result<(), DeviseError> {
+    for scope in scopes {
+        let session_key = keys::scope_session_key(scope);
+        let _ = session.remove_value(&session_key).await;
+        let tick_key = devise_rust::timeoutable::last_request_at_key(scope);
+        let _ = session.remove_value(&tick_key).await;
+    }
+    Ok(())
+}
+
 /// Remove the warden session payload for every scope on the
 /// SIGN-OUT-ALL-SCOPES path, cycling the session id first (D-04).
 ///

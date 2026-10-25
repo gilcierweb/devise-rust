@@ -25,7 +25,7 @@ use devise_rust::{
 };
 use devise_rust_actix::{
     ActixSessionStore,
-    bridge::{fetch_session_with_salt, insert_session_and_renew_sync},
+    bridge::{fetch_session_with_salt, handle_unverified_request, insert_session_and_renew_sync},
 };
 use serde_json::json;
 
@@ -243,4 +243,52 @@ async fn tracer_session_payload_and_size() {
         body.to_string().len() < 4096,
         "payload fits CookieSessionStore ceiling"
     );
+}
+
+/// Devise `handle_unverified_request` parity (`controllers/helpers.rb:254-260`):
+/// a CSRF failure clears every scope's session payload and cycles the
+/// session id, so no signed-in user survives the aborted request.
+#[actix_web::test]
+async fn tracer_handle_unverified_request_clears_all_scopes() {
+    let config = tracer_config();
+    let key =
+        devise_rust_actix::callbacks::derive_actix_key(&config.secret_key).expect("derive key");
+    let _store = ActixSessionStore::new(key.clone());
+
+    let app = test::init_service(
+        App::new()
+            .wrap(
+                SessionMiddleware::builder(CookieSessionStore::default(), key.clone())
+                    .cookie_name("devise-test".to_string())
+                    .build(),
+            )
+            .route(
+                "/tracer/multi-scope",
+                web::get().to(|session: Session| async move {
+                    let scopes: Vec<String> = vec!["user".to_string(), "admin".to_string()];
+                    handle_unverified_request(&session, &scopes).expect("unverified request");
+                    let user_payload: Option<serde_json::Value> =
+                        session.get(&keys::scope_session_key("user")).ok().flatten();
+                    let admin_payload: Option<serde_json::Value> = session
+                        .get(&keys::scope_session_key("admin"))
+                        .ok()
+                        .flatten();
+                    HttpResponse::Ok().json(json!({
+                        "user": user_payload.is_some(),
+                        "admin": admin_payload.is_some(),
+                    }))
+                }),
+            ),
+    )
+    .await;
+
+    let req = test::TestRequest::get()
+        .uri("/tracer/multi-scope")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_success());
+
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["user"], json!(false), "user scope cleared");
+    assert_eq!(body["admin"], json!(false), "admin scope cleared");
 }

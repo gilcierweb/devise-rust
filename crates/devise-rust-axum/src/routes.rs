@@ -460,7 +460,7 @@ where
         (_, "new") => mr.get(new_handler),
         ("password", "edit") => mr.get(passwords_edit),
         ("registration", "edit") => mr.get(registrations_edit::<M, A, L>),
-        ("registration", "cancel") => mr.get(registrations_cancel),
+        ("registration", "cancel") => mr.get(registrations_cancel::<M, A, L>),
         ("confirmation", "show") => mr.get(confirmations_show::<M, A, L>),
         ("unlock", "show") => mr.get(unlocks_show::<M, A, L>),
         ("session", "destroy") => mr.get(sessions_destroy::<M, A, L>),
@@ -700,6 +700,18 @@ fn all_scope_names<M, A, L>(st: &DeviseWebState<M, A, L>) -> Vec<String> {
     }
 }
 
+/// Cheap scope-session probe for `require_no_authentication` /
+/// `verify_signed_out_user`: no adapter round-trip, just the session payload's
+/// presence (the salt check happens later, where the record is needed).
+async fn scope_session_present(session: &Session, scope: &str) -> bool {
+    session
+        .get_value(&devise_rust::session::keys::scope_session_key(scope))
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 /// Load the currently-signed-in record for `scope` — the memoized
 /// layer-resolved fetch (never a re-authentication).
 async fn current_record<M>(handle: &AuthProxyHandle, scope: &str) -> Option<M>
@@ -730,7 +742,7 @@ pub(crate) async fn sign_in_bookkeeping<M, A>(
 {
     // Trackable: shift current→last, stamp now + socket peer (D-11), and
     // persist durably (the hook owns only the memo copy).
-    record.update_tracked_fields(clock.now(), peer_addr);
+    record.update_tracked_fields(clock.now(), Some(peer_addr));
     let fields = HashMap::from([
         (
             "sign_in_count".to_string(),
@@ -799,6 +811,15 @@ where
 {
     let singular = st.mapping.singular.clone();
     let scope = st.mapping.name.clone();
+    // Devise `require_no_authentication` (sessions_controller.rb:4): an
+    // already signed-in scope is redirected home with `already_authenticated`
+    // instead of re-authenticating (navigational formats only, as in Devise).
+    if !wants_json(&auth_request) && scope_session_present(&session, &scope).await {
+        let proxy = handle.lock().await;
+        let target = after_sign_in_path_for(&scope, &proxy, &auth_request).await;
+        drop(proxy);
+        return flash_redirect(&target, "already_authenticated");
+    }
     let params = body_map(params.0, &singular);
     let email = param_str(&params, "email").to_string();
     let password = param_str(&params, "password").to_string();
@@ -812,7 +833,15 @@ where
     let Some(mut record) =
         M::find_for_authentication(&conditions, st.adapter.as_ref(), &st.config).await
     else {
-        return auth_fail(&auth_request, &st, "invalid");
+        // Devise paranoid mitigation + the non-paranoid `:not_found_in_database`
+        // branch (`strategies/database_authenticatable.rb:22-25`): the dummy
+        // hash and the key rule live in core so both frameworks and the
+        // strategy chain share one implementation.
+        return auth_fail(
+            &auth_request,
+            &st,
+            devise_rust::strategy::unknown_account_failure(&st.config),
+        );
     };
 
     let password_ok = record
@@ -836,11 +865,11 @@ where
             return auth_fail(&auth_request, &st, "locked");
         }
         LockAttemptOutcome::FailedIncremented => {
-            let key = if record.last_attempt(&st.config) && st.config.last_attempt_warning {
-                "last_attempt"
-            } else {
-                "invalid"
-            };
+            // Devise's `unauthenticated_message` (lockable branch,
+            // `lockable.rb:127-139`): paranoid-first, then locked, then
+            // last-attempt warning. Core owns the rule; the controller just
+            // renders its key (no hand-rolled duplicate here).
+            let key = record.lock_unauthenticated_message(&st.config, st.clock.as_ref());
             return auth_fail(&auth_request, &st, key);
         }
         LockAttemptOutcome::Authenticated => {}
@@ -932,6 +961,23 @@ where
     L: Mailer<M> + 'static,
 {
     let scope = st.mapping.name.clone();
+
+    // Devise `verify_signed_out_user` (sessions_controller.rb:6): nobody was
+    // signed in, so report `already_signed_out` (401 for API callers, Devise's
+    // `non_navigational_status: :unauthorized`).
+    if current_record::<M>(&handle, &scope).await.is_none()
+        && !scope_session_present(&session, &scope).await
+    {
+        return if wants_json(&auth_request) {
+            (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({"error": "already_signed_out"})),
+            )
+                .into_response()
+        } else {
+            flash_redirect("/", "already_signed_out")
+        };
+    }
 
     // forget_me on the current record (durable), then the proxy sign-out
     // (logout hooks — incl. the forgetable Clear op when hooks are
@@ -1039,6 +1085,9 @@ where
     }
     if let Some(message) = saved.post_sign_up_message() {
         let key = format!("signed_up_but_{message}");
+        // Devise `expire_data_after_sign_in!`: the inactive branch must not
+        // leave any signed-in state behind (registrations_controller.rb:26-29).
+        let _ = bridge::expire_devise_data(&session, &all_scope_names(&st)).await;
         if wants_json(&auth_request) {
             (
                 StatusCode::CREATED,
@@ -1090,6 +1139,14 @@ where
     let singular = st.mapping.singular.clone();
     let mut params = body_map(params.0, &singular);
 
+    // Capture the pre-update state Devise's `before_update` callbacks and
+    // `set_flash_message_for_update` read after the fact.
+    let original_email = record.email_value().map(str::to_string);
+    let password_changed = params
+        .get("password")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|pw| !pw.is_empty());
+
     if let Err(errors) = record.update_with_password(&mut params, &st.config) {
         record.clean_up_passwords();
         return invalid_response(&auth_request, &errors);
@@ -1104,16 +1161,56 @@ where
         return invalid_response(&auth_request, &errors);
     }
 
-    let fields = HashMap::from([
-        (
+    // Devise `before_update` on recoverable (`clear_reset_password_token`,
+    // `recoverable.rb:32`): a password change invalidates outstanding reset
+    // links. Devise `postpone_email_change...` (confirmable #5783): an email
+    // change is postponed behind a confirmation instead of being applied.
+    let email_changed = matches!(
+        (original_email.as_deref(), record.email_value()),
+        (Some(old), Some(new)) if old != new
+    );
+    let mut reconfirmation_pending = false;
+    if email_changed {
+        let new_email = record.email_value().unwrap_or_default().to_string();
+        // `update_with_password` already assigned the new address in memory;
+        // `change_email_with_reconfirmation` reads the record's address as
+        // the pre-change value (Devise's `devise_will_save_change_to_email?`
+        // compares against the persisted row), so restore it first.
+        record.set_email_address(original_email.clone().unwrap_or_default());
+        match record
+            .change_email_with_reconfirmation(
+                &new_email,
+                st.adapter.as_ref(),
+                st.mailer.as_ref(),
+                &st.config,
+                st.clock.as_ref(),
+            )
+            .await
+        {
+            Ok(Some(_raw)) => reconfirmation_pending = true,
+            Ok(None) => {}
+            Err(_) => return internal_error(),
+        }
+    }
+
+    let mut fields = HashMap::new();
+    fields.insert(
+        "encrypted_password".to_string(),
+        AdapterValue::String(record.encrypted_password().unwrap_or_default().to_string()),
+    );
+    // After a postponed reconfirmation the DB keeps the ORIGINAL address
+    // (core wrote it); the in-memory record carries the new one.
+    if email_changed && !reconfirmation_pending {
+        fields.insert(
             "email".to_string(),
             AdapterValue::String(record.email_value().unwrap_or_default().to_string()),
-        ),
-        (
-            "encrypted_password".to_string(),
-            AdapterValue::String(record.encrypted_password().unwrap_or_default().to_string()),
-        ),
-    ]);
+        );
+    }
+    if password_changed {
+        record.clear_reset_password_token();
+        fields.insert("reset_password_token".to_string(), AdapterValue::Null);
+        fields.insert("reset_password_sent_at".to_string(), AdapterValue::Null);
+    }
     let Ok(persisted) = st.adapter.update_columns(&record.to_key(), &fields).await else {
         return internal_error();
     };
@@ -1125,10 +1222,18 @@ where
         drop(bridge::bypass_sign_in_and_renew(&session, &scope, &key, &salt).await);
         rotate_csrf_token(&session, &scope, &st.config).await;
     }
+    // Devise `set_flash_message_for_update` (`registrations_controller.rb:151-162`).
+    let flash_key = if !record.active_for_authentication() {
+        "updated_but_not_signed_in"
+    } else if reconfirmation_pending {
+        "update_needs_confirmation"
+    } else {
+        "updated"
+    };
     if wants_json(&auth_request) {
         axum::Json(serde_json::json!({ "updated": true })).into_response()
     } else {
-        flash_redirect("/", "updated")
+        flash_redirect("/", flash_key)
     }
 }
 
@@ -1148,7 +1253,14 @@ where
         return unauthenticated_response(&auth_request, &st);
     };
     drop(st.adapter.delete(&record.to_key()).await);
-    drop(bridge::sign_out_and_renew(&session, &scope).await);
+    // Devise registrations#destroy honors `sign_out_all_scopes` like
+    // sessions#destroy does (registrations_controller.rb:69-71).
+    let sign_out = if st.config.sign_out_all_scopes {
+        bridge::sign_out_all_scopes_and_renew(&session, &all_scope_names(&st)).await
+    } else {
+        bridge::sign_out_and_renew(&session, &scope).await
+    };
+    drop(sign_out);
     rotate_csrf_token(&session, &scope, &st.config).await;
     if wants_json(&auth_request) {
         StatusCode::NO_CONTENT.into_response()
@@ -1157,11 +1269,21 @@ where
     }
 }
 
-async fn registrations_cancel() -> Response {
+async fn registrations_cancel<M, A, L>(
+    State(st): State<DeviseWebState<M, A, L>>,
+    Extension(session): Extension<Session>,
+) -> Response
+where
+    M: FullDeviseModel,
+    A: OrmAdapter<M> + Send + Sync + 'static,
+    L: Mailer<M> + 'static,
+{
+    // Devise registrations#cancel (`registrations_controller.rb:78-81`):
+    // expire the session data, then redirect to the sign-up path (no flash).
+    let _ = bridge::expire_devise_data(&session, &all_scope_names(&st)).await;
     (
-        StatusCode::OK,
-        [("content-type", "text/html; charset=utf-8")],
-        "cancel",
+        StatusCode::SEE_OTHER,
+        [(header::LOCATION, st.mapping.sign_up_path())],
     )
         .into_response()
 }
@@ -1341,7 +1463,16 @@ where
     let Ok(resource) = outcome else {
         return internal_error();
     };
-    if resource.is_valid() {
+    // Devise `successfully_sent?` (devise_controller.rb:135-147): paranoid
+    // mode clears the errors and reports a uniform
+    // `send_paranoid_instructions`, so known and unknown addresses get the
+    // same response.
+    if resource.is_valid() || st.config.paranoid {
+        let key = if st.config.paranoid && !resource.is_valid() {
+            "send_paranoid_instructions"
+        } else {
+            "send_instructions"
+        };
         if wants_json(&auth_request) {
             return (
                 StatusCode::CREATED,
@@ -1349,7 +1480,7 @@ where
             )
                 .into_response();
         }
-        return flash_redirect(&st.mapping.sign_in_path(), "send_instructions");
+        return flash_redirect(&st.mapping.sign_in_path(), key);
     }
     invalid_response(&auth_request, &resource.errors)
 }
@@ -1411,7 +1542,16 @@ where
     let Ok(resource) = outcome else {
         return internal_error();
     };
-    if resource.is_valid() {
+    // Devise `successfully_sent?` (devise_controller.rb:135-147): paranoid
+    // mode clears the errors and reports a uniform
+    // `send_paranoid_instructions`, so known and unknown addresses get the
+    // same response.
+    if resource.is_valid() || st.config.paranoid {
+        let key = if st.config.paranoid && !resource.is_valid() {
+            "send_paranoid_instructions"
+        } else {
+            "send_instructions"
+        };
         if wants_json(&auth_request) {
             return (
                 StatusCode::CREATED,
@@ -1419,7 +1559,7 @@ where
             )
                 .into_response();
         }
-        return flash_redirect(&st.mapping.sign_in_path(), "send_instructions");
+        return flash_redirect(&st.mapping.sign_in_path(), key);
     }
     invalid_response(&auth_request, &resource.errors)
 }

@@ -11,7 +11,7 @@
 //! |-----------------------------|---------------------------------------------------------|
 //! | `NavigationalRedirect`      | 302 toward `mapping.sign_in_path()`, including flash    |
 //! | `ApiUnauthorized`           | 401 with `WWW-Authenticate` when present                |
-//! | `Recall { .. }`             | 302 toward the recall target (documented gap)           |
+//! | `Recall { .. }`             | 302 toward the scope's sign-in path (recall re-render)   |
 
 #![allow(clippy::missing_errors_doc)] // failure shapes documented upstream
 
@@ -76,11 +76,14 @@ impl FailureRenderer for ActixFailureRenderer {
                 builder.finish()
             }
             Failure::Recall { controller, action } => {
-                // Recall: the core model can't render a controller dispatch
-                // directly; actix-web responds with a 302 toward the
-                // controller route as a redirect (documented gap pending
-                // per-controller wiring in 08-03).
-                let target = format!("/{controller}/{action}");
+                // Recall (Devise's failure_app `recall` branch): re-render the
+                // scope's sign-in form. Devise re-dispatches `sessions#new`
+                // with the posted params; the port redirects to the mapping's
+                // sign-in path (the scope-mounted equivalent of
+                // `/{controller}/{action}`), so the user lands on the real
+                // form instead of an unmounted bare path.
+                let target = mapping.sign_in_path();
+                let _ = (controller, action);
                 HttpResponse::Found()
                     .insert_header((header::LOCATION, target))
                     .finish()

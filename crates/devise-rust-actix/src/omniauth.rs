@@ -256,7 +256,7 @@ async fn sign_in_bookkeeping<M, A, L>(
     A: OrmAdapter<M> + Send + Sync,
 {
     let now = state.clock.now();
-    record.update_tracked_fields(now, peer_addr);
+    record.update_tracked_fields(now, Some(peer_addr));
     let fields = HashMap::from([
         (
             "sign_in_count".to_string(),

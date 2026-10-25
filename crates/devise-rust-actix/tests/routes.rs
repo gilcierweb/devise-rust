@@ -240,15 +240,25 @@ async fn registrations_controller_create_matrix() {
         "{errors:?}"
     );
 
-    // Remaining form routes exist (new/edit/cancel).
-    for (method, path) in [("GET", "/users/sign_up"), ("GET", "/users/cancel")] {
-        let req = test::TestRequest::default()
-            .method(method.parse().expect("method"))
-            .uri(path)
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK, "{method} {path}");
-    }
+    // Remaining form routes exist (new/edit/cancel). Devise's cancel
+    // expires the session data and redirects to the sign-up path
+    // (registrations_controller.rb:78-81) — 303, not the old stub body.
+    let req = test::TestRequest::default()
+        .uri("/users/sign_up")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "GET /users/sign_up");
+
+    let req = test::TestRequest::default()
+        .uri("/users/cancel")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "GET /users/cancel");
+    assert_eq!(
+        resp.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/users/sign_up"),
+        "cancel redirects to the sign-up path"
+    );
 }
 
 /// Passwords controller: create always sends instructions (201 JSON); edit
