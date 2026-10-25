@@ -55,8 +55,8 @@ pub fn normalize_credential_value(
 /// applies [`normalize_credential_value`] to every string entry of the flat
 /// param map that lands on a record through `assign_attributes`. This is the
 /// port of Devise's `before_validation :downcase_keys` /
-/// `:strip_whitespace` (`devise/lib/devise/models/authenticatable.rb:198-204`)
-/// — normalizing on WRITE, not just on lookup, so `"  Foo@Bar.COM "` is
+/// `:strip_whitespace` (`devise/lib/devise/models/authenticatable.rb:198-204`),
+/// normalizing on WRITE, not just on lookup, so `"  Foo@Bar.COM "` is
 /// stored as `foo@bar.com` and cannot coexist with `foo@bar.com`
 /// (`CONCERNS.md` items 4 and 44).
 #[must_use]
@@ -236,7 +236,7 @@ pub trait DatabaseAuthenticatable: Authenticatable {
     ) -> Result<(), ValidationErrors> {
         // Devise `before_validation :downcase_keys` / `:strip_whitespace`
         // (`authenticatable.rb:198-204`): normalize configured keys on WRITE
-        // (CONCERNS #4) — the same single home the finder path uses.
+        // (CONCERNS #4) - the same single home the finder path uses.
         *params = normalize_attribute_map(params, config);
         let current = params
             .remove("current_password")
@@ -816,7 +816,7 @@ pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
     /// `:reset_password_token :blank` on a fresh record; unknown token ->
     /// `:not_found`; expired window -> `:expired`; otherwise reset, clear,
     /// and restore the RAW token on the returned record (in memory) on the
-    /// FAILURE branch — Devise's `recoverable.rb:148` restores it exactly
+    /// FAILURE branch - Devise's `recoverable.rb:148` restores it exactly
     /// when the token is still present, so the re-rendered form keeps it.
     ///
     /// # Errors
@@ -870,7 +870,7 @@ pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
             Ok(()) => Ok(ResourceWithErrors::new(record, ValidationErrors::new())),
             Err(errors) => {
                 // Devise (`recoverable.rb:148`) restores the raw token on the
-                // returned record when the token was still present — the
+                // returned record when the token was still present - the
                 // failure branch (a validation error aborts the save before
                 // `clear_reset_password_token` runs), so the re-rendered form
                 // keeps the user's token instead of the digest. The success
@@ -1197,8 +1197,8 @@ pub trait Authenticatable: AnyDeviseModel {
 
 /// Compose the canonical confirmable-before-lockable activity gate.
 ///
-/// `confirmable_active` is the [`Confirmable::confirmation_gate_active`](crate::confirmable::Confirmable::confirmation_gate_active)
-/// slice, `lockable_active` the [`Lockable::lock_gate_active`](crate::lockable::Lockable::lock_gate_active)
+/// `confirmable_active` is the [`Confirmable::confirmation_gate_active`]
+/// slice, `lockable_active` the [`Lockable::lock_gate_active`]
 /// slice. App `User` types call confirmable-then-lockable through this fn;
 /// the order is fixed here so call sites cannot invert it.
 ///
@@ -1388,7 +1388,7 @@ where
 ///
 /// Blanket-implemented for every [`Authenticatable`] model, so the hook
 /// pipeline (which only sees `dyn AnyDeviseModel`) reads the very same
-/// implementation the typed controllers call — no second composition to
+/// implementation the typed controllers call - no second composition to
 /// drift. Devise's `active_for_authentication?` / `inactive_message` pair.
 pub trait Activatable: Send + Sync {
     /// Devise `active_for_authentication?`.

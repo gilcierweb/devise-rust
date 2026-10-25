@@ -237,7 +237,7 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
     ///
     /// Default `None` (nothing to gate); models that implement
     /// [`Authenticatable`](crate::model::Authenticatable) return
-    /// `Some(self)` — the blanket [`Activatable`](crate::model::Activatable)
+    /// `Some(self)` - the blanket [`Activatable`](crate::model::Activatable)
     /// impl then reads the very same composition the typed side calls, so
     /// hooks and controllers can never disagree.
     fn as_activatable(&self) -> Option<&dyn crate::model::Activatable> {

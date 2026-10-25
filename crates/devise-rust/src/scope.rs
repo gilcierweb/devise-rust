@@ -132,7 +132,7 @@ pub enum SignOutVia {
     Delete,
     Get,
     Post,
-    /// `sign_out_via: [:get, :post]`-style arrays — one route row per verb.
+    /// `sign_out_via: [:get, :post]`-style arrays - one route row per verb.
     Multiple(Vec<String>),
 }
 
@@ -371,7 +371,7 @@ impl Mapping {
             "create",
             self.named("session"),
         ));
-        // Rails `via: mapping.sign_out_via` accepts an array — one route row
+        // Rails `via: mapping.sign_out_via` accepts an array - one route row
         // per verb (`sign_out_via: [:get, :post]`).
         let sign_out = self.scoped(&self.path_names.sign_out);
         let sign_out_name = format!("destroy_{}", self.named("session"));

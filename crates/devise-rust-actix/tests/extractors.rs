@@ -393,7 +393,7 @@ async fn multi_scope_independence_and_group() {
         .to_request();
     let resp = test::call_service(&app, req).await;
     let cookies = set_cookie_pairs(&resp);
-    assert!(!cookies.is_empty());
+    assert_ne!(cookies.len(), 0);
 
     let body: serde_json::Value = {
         let req = test::TestRequest::get()

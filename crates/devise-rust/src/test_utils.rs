@@ -33,6 +33,6 @@ mod tests {
     fn test_test_config() {
         let config = test_config();
         assert_eq!(config.stretches, 4);
-        assert!(!config.secret_key.is_empty());
+        assert_ne!(config.secret_key.len(), 0);
     }
 }

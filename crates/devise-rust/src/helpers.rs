@@ -452,7 +452,7 @@ mod tests {
         assert!(!group_signed_in(&group, &proxy));
         let opts = AuthenticateOpts::default();
         let done = authenticate_group(&group, &mut proxy, &request, &opts).await;
-        assert!(done.is_empty());
+        assert_eq!(done.len(), 0);
     }
 
     #[tokio::test]

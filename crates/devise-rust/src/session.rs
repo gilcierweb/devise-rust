@@ -424,7 +424,7 @@ mod tests {
             serializer::serialize_into_cookie(&user, "remember-token-value");
         assert_eq!(key, DeviseKey::from_i64(1));
         assert_eq!(value, "remember-token-value");
-        assert!(!timestamp.is_empty());
+        assert_ne!(timestamp.len(), 0);
     }
 
     #[test]

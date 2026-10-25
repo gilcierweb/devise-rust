@@ -552,7 +552,7 @@ mod tests {
         assert!(user.timedout(parse_last_request_at(&epoch_offset(1)), &zero, &clock));
         assert!(!user.timedout(None, &zero, &clock));
 
-        assert!(required_fields().is_empty());
+        assert_eq!(required_fields().len(), 0);
     }
 
     /// Record carrying remember state for the exemption matrix.

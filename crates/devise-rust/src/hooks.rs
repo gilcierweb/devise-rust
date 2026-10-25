@@ -330,7 +330,7 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
                 // transition with its `inactive_message` (`unconfirmed` /
                 // `locked` / `inactive`). The gate pair is read through the
                 // object-safe Activatable view, so the hook enforces the very
-                // same composition the typed controllers check — no app-side
+                // same composition the typed controllers check - no app-side
                 // wiring required (divergence closed 2026-10-25).
                 if let Some(record) = ctx.record {
                     if let Some(gate) = record.as_activatable() {
@@ -1549,7 +1549,7 @@ mod tests {
 
     /// Devise `hooks/activatable.rb` parity end-to-end: the core hook
     /// pipeline rejects a gated record on the sign-in transition with its
-    /// `inactive_message` — the app no longer composes the gates by hand.
+    /// `inactive_message` - the app no longer composes the gates by hand.
     #[tokio::test]
     async fn activatable_hook_rejects_gated_record() {
         let store = Arc::new(TrackingStore {

@@ -155,13 +155,13 @@ pub trait BackendWrites<M: DieselModel, Conn>: Send + Sync {
         column: &'static str,
     ) -> Result<(), OrmError>;
 
-    /// Reports whether the backing table exposes `column` — the
+    /// Reports whether the backing table exposes `column`, the
     /// `column_exists` answer behind `devise_rust::schema::check_fields`
-    /// (Devise's `check_fields!`). Both identifiers travel as binds and the
+    /// (Devise's `check_fields!`). Both identifiers travel as binds and a
     /// catalog failure maps through the crate's diesel error mapper (never
-    /// swallowed into "absent").
-    async fn probe_column(conn: &mut Conn, table: M::Table, column: &str)
-    -> Result<bool, OrmError>;
+    /// swallowed into "absent"). The table name comes from
+    /// [`DieselModel::table_name`], so the seam carries no table value.
+    async fn probe_column(conn: &mut Conn, column: &str) -> Result<bool, OrmError>;
 }
 
 /// Postgres write arm (`RETURNING` for create; `execute` for the rest).
@@ -249,25 +249,8 @@ where
         Ok(())
     }
 
-    async fn probe_column(
-        conn: &mut Conn,
-        table: M::Table,
-        column: &str,
-    ) -> Result<bool, OrmError> {
-        // Postgres: information_schema (both identifiers as binds).
-        #[derive(diesel::QueryableByName)]
-        struct Hit {
-            #[diesel(sql_type = diesel::sql_types::Integer)]
-            hit: i32,
-        }
-        let table_name = M::table_name();
-        let sql = "SELECT 1 AS hit FROM information_schema.columns                    WHERE table_name = $1 AND column_name = $2 LIMIT 1";
-        let hit: Result<Hit, _> = diesel::sql_query(sql)
-            .bind::<diesel::sql_types::Text, _>(table_name)
-            .bind::<diesel::sql_types::Text, _>(column)
-            .get_result(conn)
-            .await;
-        Ok(matches!(hit, Ok(_)))
+    async fn probe_column(conn: &mut Conn, column: &str) -> Result<bool, OrmError> {
+        crate::probe::postgres_column_exists(conn, M::table_name(), column).await
     }
 }
 
@@ -356,28 +339,8 @@ where
         Ok(())
     }
 
-    async fn probe_column(
-        conn: &mut Conn,
-        table: M::Table,
-        column: &str,
-    ) -> Result<bool, OrmError> {
-        // SQLite has no information_schema: the pragma table-valued
-        // function is the catalog (the table name is itself a bind).
-        #[derive(diesel::QueryableByName)]
-        struct Hit {
-            #[diesel(sql_type = diesel::sql_types::Text)]
-            name: String,
-        }
-        let _hit_marker: fn(Hit) -> String = |hit| hit.name;
-        let hits: Result<Vec<Hit>, _> = diesel::sql_query(
-            "SELECT name FROM pragma_table_info($1) WHERE name = $2 LIMIT 1",
-        )
-        .bind::<diesel::sql_types::Text, _>(M::table_name())
-        .bind::<diesel::sql_types::Text, _>(column)
-        .load(conn)
-        .await;
-        let _ = table;
-        Ok(matches!(hits, Ok(rows) if !rows.is_empty()))
+    async fn probe_column(conn: &mut Conn, column: &str) -> Result<bool, OrmError> {
+        crate::probe::sqlite_column_exists(conn, M::table_name(), column).await
     }
 }
 
@@ -505,7 +468,7 @@ where
     async fn column_exists(&self, column: &str) -> Result<bool, OrmError> {
         let mut guard = self.pooled().await?;
         let conn: &mut Conn = &mut guard;
-        DB::probe_column(conn, M::table(), column).await
+        DB::probe_column(conn, column).await
     }
 }
 

@@ -1730,7 +1730,7 @@ mod tests {
         mapping
     }
 
-    /// Typed sink over the in-memory adapter — the shape a framework bridge
+    /// Typed sink over the in-memory adapter - the shape a framework bridge
     /// registers per scope.
     struct MemorySink {
         adapter: Arc<MemoryAdapter<TestUser>>,

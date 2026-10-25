@@ -1771,7 +1771,7 @@ mod tests {
 
     /// CONCERNS #3 / divergence closure: the port stores the HMAC DIGEST in
     /// `confirmation_token` (Devise stores the raw token and carries an open
-    /// TODO to converge to digest-only). Behavioral parity is what matters —
+    /// TODO to converge to digest-only). Behavioral parity is what matters -
     /// a confirmation link works in both worlds:
     ///
     /// 1. a row the PORT minted (digest stored) confirms through the emailed
@@ -1841,7 +1841,7 @@ mod tests {
         assert!(outcome.is_valid(), "legacy raw row still confirms");
         assert!(outcome.record.confirmed());
 
-        // A token that matches neither shape fails with :invalid — never :blank.
+        // A token that matches neither shape fails with :invalid - never :blank.
         let outcome = TestUser::confirm_by_token(
             Some("unknown-token-value-000000"),
             &adapter,

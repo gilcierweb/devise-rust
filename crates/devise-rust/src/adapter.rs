@@ -666,13 +666,13 @@ pub trait OrmAdapter<M: Send + Sync + 'static>: Send + Sync {
     /// Returns [`OrmError`] when the backend fails.
     async fn delete(&self, id: &DeviseKey) -> Result<(), OrmError>;
 
-    /// Whether the backing table exposes `column` — the schema probe behind
+    /// Whether the backing table exposes `column` - the schema probe behind
     /// Devise's `check_fields!` (`devise/lib/devise/models.rb:53-69`).
     ///
     /// Devise verifies the MODEL responds to each module's
     /// `required_fields`; in Rust the accessor set is compile-time, so the
     /// remaining failure mode is a model whose column is missing from the
-    /// DATABASE — exactly what this probe reports at startup instead of
+    /// DATABASE - exactly what this probe reports at startup instead of
     /// surfacing later as an opaque write error.
     ///
     /// Defaults to `Ok(true)`: backends without a reachable schema (the

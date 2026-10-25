@@ -1,4 +1,4 @@
-//! Schema checking — the port of Devise's `check_fields!` /
+//! Schema checking - the port of Devise's `check_fields!` /
 //! `Devise::Models::MissingAttribute`.
 //!
 //! Devise fails loudly at model-load time when a model does not respond to
@@ -146,7 +146,7 @@ pub fn required_columns(mapping: &Mapping, config: &DeviseConfig) -> Vec<String>
 /// rt.block_on(async {
 ///     let adapter = MemoryAdapter::<User>::new();
 ///     // The in-memory oracle has no reachable schema, so the permissive
-///     // default answers every probe — no false startup failures.
+///     // default answers every probe - no false startup failures.
 ///     check_fields(&adapter, &mapping, &DeviseConfig::default())
 ///         .await
 ///         .expect("in-memory adapter passes");

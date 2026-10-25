@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# A superseded run on the same ref is pointless work (T-10-SC: cancel before
+# it burns the cache the new run needs).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-D warnings"
@@ -30,6 +36,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Swatinem/rust-cache v2.2.0 (SHA-pinned per the supply-chain
+      # hygiene rule, T-10-SC): without it every job cold-builds the full
+      # dependency tree.
+      - uses: Swatinem/rust-cache@9057aaeaa2fc4df01d8f389da99600bed9801508 # v2.2.0
       - name: Check clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       # MySQL posture: the `mysql` feature compiles on stable (clippy --all-features)
@@ -42,6 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@9057aaeaa2fc4df01d8f389da99600bed9801508 # v2.2.0
       - name: Run tests
         run: cargo test --all
 
@@ -64,6 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@9057aaeaa2fc4df01d8f389da99600bed9801508 # v2.2.0
       - name: Run ${{ matrix.backend }} Postgres e2e tests
         run: |
           if [ ! -d "crates/devise-rust-${{ matrix.backend }}" ]; then
@@ -78,16 +90,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@9057aaeaa2fc4df01d8f389da99600bed9801508 # v2.2.0
       - name: Install MSRV-pinned lockfile
         run: cp Cargo.lock.msrv Cargo.lock
       - name: Run tests with MSRV
         run: cargo test --all --locked
-
-  check:
-    name: Cargo Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Check
-        run: cargo check --all
+      # No `check` job: clippy --all-targets --all-features builds every
+      # target of every feature combination already, so a separate
+      # `cargo check --all` was pure duplicate wall-clock.

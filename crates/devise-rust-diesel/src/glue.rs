@@ -129,9 +129,9 @@ pub trait DieselModel: Send + Sync + Sized + 'static {
     /// The table value for query roots (`users::table`).
     fn table() -> Self::Table;
 
-    /// The table's catalog name (`"users"`) — the bind
-    /// [`probe_column`](super::BackendWrites::probe_column) looks up in
-    /// `information_schema` (Devise's `check_fields!`).
+    /// The table's catalog name (`"users"`) - the bind
+    /// `BackendWrites::probe_column` looks up in `information_schema`
+    /// (Devise's `check_fields!`).
     fn table_name() -> &'static str;
 
     /// Extracts the record's primary key as a [`DeviseKey`].

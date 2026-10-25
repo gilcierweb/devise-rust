@@ -157,7 +157,7 @@ pub fn strategies_for(mapping: &Mapping, config: &DeviseConfig) -> Vec<Box<dyn S
 /// is reported through the `:not_found_in_database` failure key.
 ///
 /// Returns the flash/I18n key the caller must fail with. Single home for the
-/// rule — [`ParanoidStrategy`] and the framework controllers share it.
+/// rule - [`ParanoidStrategy`] and the framework controllers share it.
 #[must_use]
 pub fn unknown_account_failure(config: &DeviseConfig) -> &'static str {
     if config.paranoid {

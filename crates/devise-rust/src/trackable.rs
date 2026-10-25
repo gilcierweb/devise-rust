@@ -604,7 +604,7 @@ mod tests {
         assert_eq!(plain.current_sign_in_ip(), Some("127.0.0.1"));
 
         // Devise parity (`trackable.rb:45-47`): a missing peer leaves the
-        // IP columns NULL — the port never fabricates an empty string.
+        // IP columns NULL - the port never fabricates an empty string.
         let mut missing = TestUser::fresh(1);
         missing.update_tracked_fields_from_peer(None, &clock);
         assert_eq!(missing.current_sign_in_ip(), None);
@@ -1469,7 +1469,7 @@ mod security_regression {
             .await
             .unwrap()
             .expect("postpones with instructions");
-        assert!(!raw.is_empty());
+        assert_ne!(raw.len(), 0);
 
         let sent = mailer.sent_mails();
         assert_eq!(sent.len(), 2);

@@ -92,7 +92,7 @@ pub struct DeviseConfig {
     pub secret_key: String,
     /// Pepper string appended to password before bcrypt (optional)
     pub pepper: Option<String>,
-    /// Bcrypt cost factor (default: 12; bcrypt's valid range is 4..=31 —
+    /// Bcrypt cost factor (default: 12; bcrypt's valid range is 4..=31 -
     /// see [`DeviseConfig::bcrypt_cost`] for the clamping rule)
     pub stretches: u32,
 
@@ -117,7 +117,7 @@ pub struct DeviseConfig {
     pub http_authentication_realm: String,
 
     // Validation
-    /// Email regexp (default: /\A[^@\s]+@[^@\s]+\z/)
+    /// Email regexp (default: `/\A[^@\s]+@[^@\s]+\z/`)
     pub email_regexp: String,
     /// Password length range (default: 6..128)
     pub password_length: std::ops::Range<usize>,
@@ -291,7 +291,7 @@ impl DeviseConfig {
     /// range. Devise raises `BCrypt::Errors::InvalidCost` when `stretches` is
     /// outside that range (`devise/lib/devise/encryptor.rb`); the port clamps
     /// instead so a misconfiguration degrades to the nearest valid cost rather
-    /// than panicking on a request path. Single home for the rule — every
+    /// than panicking on a request path. Single home for the rule - every
     /// hashing site reads the cost from here.
     #[must_use]
     pub fn bcrypt_cost(&self) -> u32 {

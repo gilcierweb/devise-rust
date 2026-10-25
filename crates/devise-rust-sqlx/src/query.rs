@@ -59,10 +59,11 @@ pub trait Dialect: sqlx::Database + Send + Sync + 'static {
     /// native `UUID` on Postgres, hyphenated `TEXT` elsewhere.
     fn uuid_key(id: uuid::Uuid) -> Bind;
 
-    /// Catalog-probe SQL text around the two binds `(table, column)` — the
+    /// Catalog-probe SQL text around the two binds `(table, column)`, the
     /// `column_exists` answer behind `devise_rust::schema::check_fields`
     /// (Devise's `check_fields!`). The default is the `information_schema`
     /// family (Postgres, MySQL); SQLite overrides it with its `pragma`.
+    #[must_use]
     fn probe_sql() -> (&'static str, &'static str) {
         (
             "SELECT 1 FROM information_schema.columns WHERE table_name = ",

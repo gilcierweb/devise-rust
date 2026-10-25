@@ -1,9 +1,9 @@
-//! Failed-attempt accounting seam — the object-safe bridge that lets the
+//! Failed-attempt accounting seam - the object-safe bridge that lets the
 //! STRATEGY CHAIN persist Devise's `valid_for_authentication?` side effects.
 //!
 //! In Devise, the failed-attempt counter lives inside
 //! `Lockable#valid_for_authentication?`, which the `database_authenticatable`
-//! strategy triggers through `Authenticatable#validate` — so locking works
+//! strategy triggers through `Authenticatable#validate` - so locking works
 //! on every authentication path, not only in `SessionsController#create`.
 //! The port's controllers accounting runs in the framework handlers; this
 //! seam closes the remaining gap for the strategy-chain path
@@ -61,7 +61,9 @@ impl FailedAttemptSink for NoopFailedAttemptSink {
 /// framework-agnostic registration any bridge makes (both integrations
 /// share it, so neither hand-rolls the accounting).
 ///
-/// The rules stay in [`Lockable::apply_failed_attempt`]; this type only
+/// The rules stay in
+/// [`Lockable::apply_failed_attempt`](crate::lockable::Lockable::apply_failed_attempt);
+/// this type only
 /// adapts it to the object-safe seam.
 #[derive(Debug, Clone)]
 pub struct LockableFailedAttemptSink<M, A, L> {

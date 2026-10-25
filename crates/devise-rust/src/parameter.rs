@@ -19,7 +19,7 @@ impl ParameterFilter {
     /// - Non-string scalars are left typed (stringify at the query layer if needed)
     ///
     /// The per-value rules live in
-    /// [`crate::model::normalize_credential_value`] — the single home shared
+    /// [`crate::model::normalize_credential_value`] - the single home shared
     /// with the finder and write paths, so this method only owns the JSON-tree
     /// walk.
     ///

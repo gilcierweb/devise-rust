@@ -65,7 +65,7 @@ pub mod encryptor {
     /// # Panics
     ///
     /// Only if bcrypt rejects a cost inside its own valid range (a bcrypt-crate
-    /// bug — unreachable, kept as a defensive invariant check).
+    /// bug - unreachable, kept as a defensive invariant check).
     #[must_use]
     pub fn digest(password: &str, config: &DeviseConfig) -> String {
         let mut password_with_pepper = password.to_string();

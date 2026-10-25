@@ -487,7 +487,7 @@ async fn multi_scope_independence_and_group() {
         .await
         .expect("sign in admin");
     let cookies = set_cookie_pairs(&response).join("; ");
-    assert!(!cookies.is_empty());
+    assert_ne!(cookies.len(), 0);
 
     let response = app
         .clone()

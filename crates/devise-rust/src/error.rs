@@ -339,7 +339,7 @@ mod tests {
     fn test_blank_record_default() {
         let user = TestUser::blank();
         assert_eq!(user.id, 0);
-        assert!(user.email.is_empty());
+        assert_eq!(user.email.len(), 0);
     }
 
     #[test]

@@ -120,7 +120,7 @@ impl AuthProxy {
     ///
     /// Devise runs the lockable counter side effects inside the strategy
     /// chain (`valid_for_authentication?`); this is the port's seam for that
-    /// path — the rules stay in core, the persistence comes from the app's
+    /// path - the rules stay in core, the persistence comes from the app's
     /// typed sink. Without a registration the chain keeps its pre-seam
     /// behavior (the controllers account on the sign-in POST path).
     pub fn register_failed_attempt_sink(
@@ -1078,7 +1078,7 @@ mod tests {
             .await
             .expect("remember hit authenticates");
         assert_eq!(user.to_key(), DeviseKey::from_i64(1));
-        assert!(proxy.take_remember_cookie_ops().is_empty());
+        assert_eq!(proxy.take_remember_cookie_ops().len(), 0);
         let session_key = session::keys::scope_session_key("user");
         assert!(store.get_value(&session_key).await.is_some());
     }

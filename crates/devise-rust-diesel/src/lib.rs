@@ -39,6 +39,8 @@ pub mod glue;
 pub mod adapter;
 #[cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql"))]
 pub mod pool;
+#[cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql"))]
+mod probe;
 
 #[cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql"))]
 pub use adapter::DieselOrmAdapter;

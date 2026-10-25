@@ -1162,7 +1162,7 @@ mod tests {
     }
 
     /// Regression (S6.3): a cookie minted in the SAME epoch second as
-    /// `remember_created_at` still validates — the mint is forced strictly
+    /// `remember_created_at` still validates - the mint is forced strictly
     /// newer than the creation stamp, so condition 4 of the five-condition
     /// check cannot false-negative right after sign-in.
     #[tokio::test]
@@ -1644,7 +1644,7 @@ mod tests {
         plain.set_remember_token(Some("hook-token".to_string()));
         plain.set_remember_created_at(Some(fixed_clock().now()));
         assert!(proxy.sign_in("user", Box::new(plain), false).await);
-        assert!(proxy.take_remember_cookie_ops().is_empty());
+        assert_eq!(proxy.take_remember_cookie_ops().len(), 0);
         assert!(proxy.sign_out("user").await);
         // The sign-out above queues its own delete; drain before continuing.
         let leftovers = proxy.take_remember_cookie_ops();
@@ -1654,7 +1654,7 @@ mod tests {
         let mut empty = TestUser::fresh(1, "empty@example.com");
         empty.set_remember_me_flag(true);
         assert!(proxy.sign_in("user", Box::new(empty), false).await);
-        assert!(proxy.take_remember_cookie_ops().is_empty());
+        assert_eq!(proxy.take_remember_cookie_ops().len(), 0);
         assert!(proxy.sign_out("user").await);
         let ops = proxy.take_remember_cookie_ops();
         assert_eq!(ops.len(), 1);
@@ -1669,7 +1669,7 @@ mod tests {
         let (mut proxy, _) = hook_test_proxy(test_config());
         let user = TestUser::fresh(1, "bye@example.com");
         assert!(proxy.sign_in("user", Box::new(user), false).await);
-        assert!(proxy.take_remember_cookie_ops().is_empty());
+        assert_eq!(proxy.take_remember_cookie_ops().len(), 0);
 
         assert!(proxy.sign_out("user").await);
         let ops = proxy.take_remember_cookie_ops();

@@ -580,7 +580,7 @@ where
 /// confirmed on creation, an unverified one stays pending (the core
 /// activatable gate then blocks its sign-in until the user confirms).
 /// Applications call this from their own `from_omniauth` right after
-/// [`default_from_omniauth`] — one home for the rule, so fixtures and the
+/// [`default_from_omniauth`] - one home for the rule, so fixtures and the
 /// example apps never hand-roll it.
 ///
 /// Returns `true` when the record was confirmed (and persisted).
@@ -769,7 +769,7 @@ mod tests {
         use crate::config::{DeviseConfig, DeviseConfigOverride};
 
         // Devise default: no providers registered (empty allowlist, fail closed).
-        assert!(DeviseConfig::default().omniauth_providers.is_empty());
+        assert_eq!(DeviseConfig::default().omniauth_providers.len(), 0);
 
         // Per-scope override resolves over the global, mirroring every other
         // DeviseConfig option.

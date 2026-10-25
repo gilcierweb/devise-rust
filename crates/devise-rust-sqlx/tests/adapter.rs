@@ -260,7 +260,7 @@ async fn sqlite_column_exists_probe() {
 }
 
 /// Full-module mapping over the fixture users table (shared by the
-/// check_fields legs of every backend crate's sqlite suite).
+/// `check_fields` legs of every backend crate's sqlite suite).
 fn full_module_mapping() -> devise_rust::scope::Mapping {
     use devise_rust::scope::{Mapping, Module, PathNames, SignOutVia};
     let mut mapping = Mapping {

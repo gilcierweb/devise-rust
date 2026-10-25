@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel superseded runs (same policy as ci.yml, T-10-SC).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   RUST_BACKTRACE: 1
 
@@ -16,6 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Swatinem/rust-cache v2.2.0 (SHA-pinned per the supply-chain hygiene
+      # rule, T-10-SC): the rustdoc step cold-builds the crate otherwise.
+      - uses: Swatinem/rust-cache@9057aaeaa2fc4df01d8f389da99600bed9801508 # v2.2.0
       # D-24: the docs gate is blocking, same as clippy. Broken intra-doc
       # links must fail before the link checker runs (key_links ordering).
       - name: Rustdoc warning free
@@ -28,9 +36,9 @@ jobs:
       # Checklist recorded in the project planning artifacts
       # (10-USER-SETUP.md), so this gate resumes checking the real registry
       # targets.
-      # Markdown link check over the hub, the guide corpus, and the
-      # changelog. Pinned to the full commit SHA of tag v2 per the
-      # supply-chain hygiene rule (T-10-SC); localhost targets are excluded.
+      # The repository's Discussions tab is disabled (404 on every
+      # /discussions target, including the README hub link). Drop this
+      # exclude at the repo-setup session once Discussions is enabled.
       - name: Markdown links
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
         with:
@@ -39,6 +47,7 @@ jobs:
             --exclude '^https?://(localhost|127\.0\.0\.1)'
             --exclude 'https://docs\.rs/devise-rust'
             --exclude 'https://crates\.io/crates/devise-rust'
+            --exclude 'https://github\.com/gilcierweb/devise-rust/discussions'
             README.md docs/ CHANGELOG.md
       # D-06 house prose rule: no em dash codepoints in README, guides,
       # changelog, or core rustdoc. grep -P over the U+2014 codepoint.
