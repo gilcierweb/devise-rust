@@ -21,7 +21,7 @@
 //!
 //! ```ignore
 //! // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
-//! assert!(user.timedout(Some(clock.now() - config.timeout_in - TimeDelta::minutes(1)), &config, &clock));
+//! assert!(user.timedout(Some(clock.now() - config.timeout_in.unwrap() - TimeDelta::minutes(1)), &config, &clock));
 //! assert!(!user.timedout(None, &config, &clock));
 //! ```
 
@@ -93,7 +93,7 @@ pub trait Timeoutable: Authenticatable {
     /// Per-model `timeout_in` window (Devise `timeout_in`): defaults to the
     /// global config so apps override per model by overriding this method
     /// (mirrors the Devise test overriding `timeout_in` on the instance).
-    fn timeout_in(&self, config: &DeviseConfig) -> TimeDelta {
+    fn timeout_in(&self, config: &DeviseConfig) -> Option<TimeDelta> {
         config.timeout_in
     }
 
@@ -109,7 +109,11 @@ pub trait Timeoutable: Authenticatable {
         config: &DeviseConfig,
         clock: &dyn Clock,
     ) -> bool {
-        last_access.is_some_and(|at| at <= clock.now() - self.timeout_in(config))
+        match self.timeout_in(config) {
+            Some(window) => last_access.is_some_and(|at| at <= clock.now() - window),
+            // Devise `timeout_in: nil` = sessions never time out.
+            None => false,
+        }
     }
 }
 
@@ -203,15 +207,24 @@ pub fn classify_last_request(stored: Option<&serde_json::Value>) -> LastRequestT
 ///
 /// let clock = FixedClock::new(chrono::Utc::now());
 /// let window = TimeDelta::minutes(30);
-/// assert!(!tick_expired(LastRequestTick::Missing, window, &clock));
-/// assert!(tick_expired(LastRequestTick::Malformed, window, &clock));
+/// assert!(!tick_expired(LastRequestTick::Missing, Some(window), &clock));
+/// assert!(tick_expired(LastRequestTick::Malformed, Some(window), &clock));
 /// ```
 #[must_use]
-pub fn tick_expired(tick: LastRequestTick, timeout_in: TimeDelta, clock: &dyn Clock) -> bool {
+pub fn tick_expired(
+    tick: LastRequestTick,
+    timeout_in: Option<TimeDelta>,
+    clock: &dyn Clock,
+) -> bool {
+    // Devise `timeout_in: nil` = sessions never time out: even a malformed
+    // tick cannot expire a nil window.
+    let Some(window) = timeout_in else {
+        return false;
+    };
     match tick {
         LastRequestTick::Missing => false,
         LastRequestTick::Malformed => true,
-        LastRequestTick::At(at) => at <= clock.now() - timeout_in,
+        LastRequestTick::At(at) => at <= clock.now() - window,
     }
 }
 
@@ -260,7 +273,7 @@ pub enum TimeoutDecision {
 pub fn check_timeout(
     stored: Option<&serde_json::Value>,
     flags: &RequestFlags,
-    timeout_in: TimeDelta,
+    timeout_in: Option<TimeDelta>,
     clock: &dyn Clock,
 ) -> TimeoutDecision {
     if flags.skip_timeoutable || flags.skip_timeout {
@@ -399,8 +412,8 @@ mod tests {
     impl Authenticatable for CustomTimeoutUser {}
 
     impl Timeoutable for CustomTimeoutUser {
-        fn timeout_in(&self, _config: &DeviseConfig) -> TimeDelta {
-            TimeDelta::minutes(10)
+        fn timeout_in(&self, _config: &DeviseConfig) -> Option<TimeDelta> {
+            Some(TimeDelta::minutes(10))
         }
     }
 
@@ -515,14 +528,14 @@ mod tests {
 
         // Fallback to the config option (Devise `swap Devise, timeout_in:`).
         let narrow = DeviseConfig {
-            timeout_in: TimeDelta::minutes(1),
+            timeout_in: Some(TimeDelta::minutes(1)),
             ..DeviseConfig::default()
         };
         assert!(user.timedout(parse_last_request_at(&epoch_offset(120)), &narrow, &clock));
         assert!(!user.timedout(parse_last_request_at(&epoch_offset(30)), &narrow, &clock));
 
         let wide = DeviseConfig {
-            timeout_in: TimeDelta::minutes(5),
+            timeout_in: Some(TimeDelta::minutes(5)),
             ..DeviseConfig::default()
         };
         assert!(!user.timedout(parse_last_request_at(&epoch_offset(120)), &wide, &clock));
@@ -533,7 +546,7 @@ mod tests {
         // has no `TimeDelta` representation, so it is intentionally not
         // ported; the per-model `timeout_in` override stays the opt-out seam.
         let zero = DeviseConfig {
-            timeout_in: TimeDelta::zero(),
+            timeout_in: Some(TimeDelta::zero()),
             ..DeviseConfig::default()
         };
         assert!(user.timedout(parse_last_request_at(&epoch_offset(1)), &zero, &clock));

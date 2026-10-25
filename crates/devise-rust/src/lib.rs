@@ -80,7 +80,7 @@ mod tests {
         let config = DeviseConfig::default();
         assert_eq!(config.stretches, 12);
         assert_eq!(config.remember_for, chrono::TimeDelta::weeks(2));
-        assert_eq!(config.timeout_in, chrono::TimeDelta::minutes(30));
+        assert_eq!(config.timeout_in, Some(chrono::TimeDelta::minutes(30)));
         assert_eq!(config.reset_password_within, chrono::TimeDelta::hours(6));
         // Devise 5.0.4 defaults (devise/lib/devise.rb): paranoid = false, default_scope = nil
         assert!(!config.paranoid);

@@ -23,7 +23,7 @@
 //!
 //! ```ignore
 //! // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
-//! user.update_tracked_fields(clock.now(), "127.0.0.1");
+//! user.update_tracked_fields(clock.now(), Some("127.0.0.1"));
 //! assert_eq!(user.sign_in_count(), 1);
 //! user.update_tracked_fields_bang(Some("127.0.0.1"), &adapter, &clock).await?;
 //! ```
@@ -137,8 +137,8 @@ pub trait Trackable: Authenticatable {
     /// The default returns the peer address as-is (empty and missing peers
     /// yield `None`); override for custom resolution. Proxy headers are
     /// never consulted here (D-20).
-    fn extract_ip_from(&self, peer_addr: Option<&str>) -> Option<String> {
-        peer_addr.filter(|ip| !ip.is_empty()).map(str::to_string)
+    fn extract_ip_from<'a>(&self, peer_addr: Option<&'a str>) -> Option<&'a str> {
+        peer_addr.filter(|ip| !ip.is_empty())
     }
 
     /// Devise `update_tracked_fields`: shift current into last, stamp the
@@ -146,14 +146,17 @@ pub trait Trackable: Authenticatable {
     ///
     /// First sign-in sets last equal to current (the `||` fallback when no
     /// previous value exists).
-    fn update_tracked_fields(&mut self, now: DateTime<Utc>, peer_ip: &str) {
+    fn update_tracked_fields(&mut self, now: DateTime<Utc>, peer_ip: Option<&str>) {
         let previous_at = self.current_sign_in_at();
         self.set_last_sign_in_at(Some(previous_at.unwrap_or(now)));
         self.set_current_sign_in_at(Some(now));
 
+        // Devise (`trackable.rb:45-47`) assigns `request.remote_ip` directly:
+        // a missing peer leaves the columns NULL. The port never fabricates
+        // an empty string (a NULL column vs '' differ for queries/I18n).
         let previous_ip = self.current_sign_in_ip().map(str::to_string);
-        self.set_last_sign_in_ip(Some(previous_ip.unwrap_or_else(|| peer_ip.to_string())));
-        self.set_current_sign_in_ip(Some(peer_ip.to_string()));
+        self.set_last_sign_in_ip(previous_ip.or_else(|| peer_ip.map(str::to_string)));
+        self.set_current_sign_in_ip(peer_ip.map(str::to_string));
 
         self.set_sign_in_count(self.sign_in_count().saturating_add(1));
     }
@@ -163,8 +166,8 @@ pub trait Trackable: Authenticatable {
     /// Pure (no adapter); the hook body and tests share this path.
     fn update_tracked_fields_from_peer(&mut self, peer_addr: Option<&str>, clock: &dyn Clock) {
         let now = clock.now();
-        let peer_ip = self.extract_ip_from(peer_addr).unwrap_or_default();
-        self.update_tracked_fields(now, &peer_ip);
+        let peer_ip = self.extract_ip_from(peer_addr);
+        self.update_tracked_fields(now, peer_ip);
     }
 
     /// Devise `update_tracked_fields!` (TRK-01, D-21): probe the adapter for
@@ -257,7 +260,7 @@ mod tests {
             crate::adapter::DeviseKey::from_i64(self.id)
         }
 
-        fn apply_tracked_fields_hook(&mut self, now: DateTime<Utc>, peer_ip: &str) -> bool {
+        fn apply_tracked_fields_hook(&mut self, now: DateTime<Utc>, peer_ip: Option<&str>) -> bool {
             self.update_tracked_fields(now, peer_ip);
             true
         }
@@ -398,7 +401,7 @@ mod tests {
         adapter.create(user.clone()).await.unwrap();
 
         // Pure shift: count bumps, last equals current on first sign-in.
-        user.update_tracked_fields(clock.now(), "127.0.0.1");
+        user.update_tracked_fields(clock.now(), Some("127.0.0.1"));
         assert_eq!(user.sign_in_count(), 1);
         assert_eq!(user.current_sign_in_at(), user.last_sign_in_at());
         assert!(user.current_sign_in_at().is_some());
@@ -465,7 +468,7 @@ mod tests {
         let mut user = TestUser::fresh(1);
         adapter.create(user.clone()).await.unwrap();
 
-        user.update_tracked_fields(clock.now(), "127.0.0.1");
+        user.update_tracked_fields(clock.now(), Some("127.0.0.1"));
         assert_eq!(user.current_sign_in_ip(), Some("127.0.0.1"));
         assert_eq!(user.sign_in_count(), 1);
 
@@ -512,7 +515,8 @@ mod tests {
             .unwrap();
         assert!(persisted);
         assert_eq!(stored.sign_in_count(), 1);
-        assert_eq!(stored.current_sign_in_ip(), Some(""));
+        // Devise NULL semantics: a missing peer IP never becomes "".
+        assert_eq!(stored.current_sign_in_ip(), None);
     }
 
     /// Override model proving `extract_ip_from` is an override point.
@@ -580,8 +584,8 @@ mod tests {
             self.inner.persisted()
         }
 
-        fn extract_ip_from(&self, _peer_addr: Option<&str>) -> Option<String> {
-            Some("127.0.0.2".to_string())
+        fn extract_ip_from<'a>(&self, _peer_addr: Option<&'a str>) -> Option<&'a str> {
+            Some("127.0.0.2")
         }
     }
 
@@ -599,10 +603,12 @@ mod tests {
         plain.update_tracked_fields_from_peer(Some("127.0.0.1"), &clock);
         assert_eq!(plain.current_sign_in_ip(), Some("127.0.0.1"));
 
-        // Missing and empty peers shift with an empty IP, never a header.
+        // Devise parity (`trackable.rb:45-47`): a missing peer leaves the
+        // IP columns NULL — the port never fabricates an empty string.
         let mut missing = TestUser::fresh(1);
         missing.update_tracked_fields_from_peer(None, &clock);
-        assert_eq!(missing.current_sign_in_ip(), Some(""));
+        assert_eq!(missing.current_sign_in_ip(), None);
+        assert_eq!(missing.last_sign_in_ip(), None);
     }
 }
 
@@ -693,7 +699,7 @@ mod security_regression {
             self.encrypted_password.get(..29).map(str::to_string)
         }
 
-        fn apply_tracked_fields_hook(&mut self, now: DateTime<Utc>, peer_ip: &str) -> bool {
+        fn apply_tracked_fields_hook(&mut self, now: DateTime<Utc>, peer_ip: Option<&str>) -> bool {
             Trackable::update_tracked_fields(self, now, peer_ip);
             true
         }

@@ -258,7 +258,7 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
     /// persistence through `update_tracked_fields_bang` (with the #4673
     /// new-record probe); this seam exists because that trait is not
     /// object-safe and hook bodies only see `dyn AnyDeviseModel`.
-    fn apply_tracked_fields_hook(&mut self, _now: DateTime<Utc>, _peer_ip: &str) -> bool {
+    fn apply_tracked_fields_hook(&mut self, _now: DateTime<Utc>, _peer_ip: Option<&str>) -> bool {
         false
     }
 
@@ -343,6 +343,8 @@ pub enum FailureReason {
     Unauthenticated,
     /// Wrong credentials.
     Invalid,
+    /// Unknown account (non-paranoid mode; Devise's `:not_found_in_database`).
+    NotFoundInDatabase,
     /// Email not confirmed.
     Unconfirmed,
     /// Account locked.
@@ -362,6 +364,7 @@ impl FailureReason {
         match self {
             FailureReason::Unauthenticated => "unauthenticated",
             FailureReason::Invalid => "invalid",
+            FailureReason::NotFoundInDatabase => "not_found_in_database",
             FailureReason::Unconfirmed => "unconfirmed",
             FailureReason::Locked => "locked",
             FailureReason::Timeout => "timeout",

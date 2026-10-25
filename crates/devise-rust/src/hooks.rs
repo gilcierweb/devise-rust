@@ -457,7 +457,7 @@ fn trackable_hook() -> Box<HookFn> {
             if request.flags.skip_trackable {
                 return Ok(());
             }
-            let peer = request.peer_addr.as_deref().unwrap_or_default();
+            let peer = request.peer_addr.as_deref();
             let now = SystemClock.now();
             let scope = ctx.scope.to_string();
             if let Some(slot) = ctx.proxy.user_mut(&scope) {
@@ -582,8 +582,17 @@ fn rememberable_set_hook() -> Box<HookFn> {
             let key = record.to_key().to_string();
             let (op_key, attrs, jar) = {
                 let config = ctx.proxy.devise_config();
+                // The durable mint stamps `remember_created_at` with the
+                // request clock; the hook must mint from the SAME clock, or
+                // a same-second cookie would fail condition 4 until the
+                // clock ticks (S6.3).
                 let clock = crate::time::SystemClock;
-                let triple = crate::rememberable::build_cookie_triple(&key, &value, &clock);
+                let triple = crate::rememberable::build_cookie_triple_after_created_at(
+                    &key,
+                    &value,
+                    &clock,
+                    record.remember_created_at_opt(),
+                );
                 let jar = crate::rememberable::encode_cookie_value(&triple.0, &triple.1, &triple.2);
                 let attrs = crate::rememberable::RememberableCookieAttrs::for_scope(
                     ctx.scope, config, &clock,
@@ -1041,10 +1050,10 @@ mod tests {
         fn apply_tracked_fields_hook(
             &mut self,
             _now: chrono::DateTime<chrono::Utc>,
-            peer_ip: &str,
+            peer_ip: Option<&str>,
         ) -> bool {
             self.last_sign_in_ip = self.current_sign_in_ip.clone();
-            self.current_sign_in_ip = Some(peer_ip.to_string());
+            self.current_sign_in_ip = peer_ip.map(str::to_string);
             self.sign_in_count += 1;
             true
         }

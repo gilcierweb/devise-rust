@@ -463,11 +463,44 @@ pub fn decode_cookie_value(raw: &str) -> Option<(String, String, String)> {
 ///
 /// Builds the cookie triple from the record; mirrors the model-side half of devise's `serialize_into_cookie`.
 #[must_use]
+/// Mint the cookie triple `[key, value, generated_at]` (RMB-02).
+///
+/// `generated_at` is the integer-epoch cookie timestamp (Devise's
+/// `Time.now.utc.to_f.to_s` at whole-second resolution). It is guaranteed to
+/// be STRICTLY NEWER than `remember_created_at`: with epoch-second
+/// resolution, the same second would otherwise mint a cookie that fails
+/// condition 4 of the five-condition check until the clock ticks (a
+/// self-healing but real false-negative right after sign-in). Devise gets
+/// this for free from float microseconds; the port nudges by one second.
 pub fn build_cookie_triple(key: &str, value: &str, clock: &dyn Clock) -> (String, String, String) {
     (
         key.to_string(),
         value.to_string(),
         clock.now().timestamp().to_string(),
+    )
+}
+
+/// Same-contract mint, but `generated_at` is forced strictly newer than
+/// `remember_created_at` (see [`build_cookie_triple`]). Use this whenever
+/// both timestamps can land in the same epoch second (the sign-in set hook
+/// and any durable mint right after stamping `remember_created_at`).
+pub fn build_cookie_triple_after_created_at(
+    key: &str,
+    value: &str,
+    clock: &dyn Clock,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> (String, String, String) {
+    let mut generated = clock.now();
+    if let Some(created) = created_at {
+        let floor = created + chrono::TimeDelta::seconds(1);
+        if generated <= created {
+            generated = floor;
+        }
+    }
+    (
+        key.to_string(),
+        value.to_string(),
+        generated.timestamp().to_string(),
     )
 }
 
@@ -569,10 +602,11 @@ pub trait Rememberable: Authenticatable {
         Self: Sized,
     {
         let value = self.rememberable_value()?;
-        Ok(build_cookie_triple(
+        Ok(build_cookie_triple_after_created_at(
             &self.to_key().to_string(),
             &value,
             clock,
+            self.remember_created_at(),
         ))
     }
 
@@ -1125,6 +1159,33 @@ mod tests {
         clock.advance(TimeDelta::seconds(2));
         let (key, value, generated) = user.serialize_into_cookie(&*clock).unwrap();
         (user, key, value, generated)
+    }
+
+    /// Regression (S6.3): a cookie minted in the SAME epoch second as
+    /// `remember_created_at` still validates — the mint is forced strictly
+    /// newer than the creation stamp, so condition 4 of the five-condition
+    /// check cannot false-negative right after sign-in.
+    #[tokio::test]
+    async fn rememberable_same_second_mint_stays_valid() {
+        let config = test_config();
+        let clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mut user = TestUser::fresh(1, "matrix@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        user.remember_me(&adapter, &clock).await.unwrap();
+
+        // No clock advance: same second as the creation stamp.
+        let (key, value, generated) = user.serialize_into_cookie(&clock).unwrap();
+        assert_eq!(key, user.to_key().to_string());
+        assert!(
+            generated.parse::<i64>().expect("epoch")
+                > user.remember_created_at().expect("created").timestamp(),
+            "cookie timestamp must be strictly newer than remember_created_at"
+        );
+        assert!(
+            user.remember_me_valid(&value, &generated, &config, &clock),
+            "same-second mint must validate"
+        );
     }
 
     #[tokio::test]

@@ -214,11 +214,15 @@ pub trait Confirmable: Authenticatable + HasEmail {
         config: &DeviseConfig,
         clock: &dyn crate::time::Clock,
     ) -> bool {
-        if config.allow_unconfirmed_access_for.is_zero() {
-            return false;
+        match config.allow_unconfirmed_access_for {
+            // Devise `allow_unconfirmed_access_for: nil` = unconfirmed access
+            // never expires.
+            None => true,
+            Some(window) if window.is_zero() => false,
+            Some(window) => self
+                .confirmation_sent_at()
+                .is_some_and(|sent_at| sent_at >= clock.now() - window),
         }
-        self.confirmation_sent_at()
-            .is_some_and(|sent_at| sent_at >= clock.now() - config.allow_unconfirmed_access_for)
     }
 
     /// `confirmation_period_expired?` (CNF-02): true only when both
@@ -1504,16 +1508,29 @@ mod tests {
     async fn confirmable_allow_window_three_way_table() {
         let clock = FixedClock::now();
         let zero_config = test_config();
-        assert!(zero_config.allow_unconfirmed_access_for.is_zero());
+        assert_eq!(
+            zero_config.allow_unconfirmed_access_for,
+            Some(chrono::TimeDelta::zero())
+        );
+
+        // Devise's nil = unconfirmed access never expires (the third arm).
+        let mut nil_config = test_config();
+        nil_config.allow_unconfirmed_access_for = None;
 
         let mut pending = TestUser::fresh(1, "pending@example.com");
         pending.set_confirmation_sent_at(Some(clock.now()));
+        // Devise's nil = unconfirmed access never expires (the third arm).
+        assert!(
+            pending.confirmation_period_valid(&nil_config, &clock),
+            "nil allow_unconfirmed_access_for never expires"
+        );
+        assert!(pending.confirmation_gate_active(true, &nil_config, &clock));
         assert!(!pending.confirmation_period_valid(&zero_config, &clock));
         assert!(!pending.confirmation_gate_active(true, &zero_config, &clock));
         assert_eq!(pending.confirmation_inactive_message(), Some("unconfirmed"));
 
         let mut windowed = test_config();
-        windowed.allow_unconfirmed_access_for = chrono::TimeDelta::days(5);
+        windowed.allow_unconfirmed_access_for = Some(chrono::TimeDelta::days(5));
         let mut inside = TestUser::fresh(2, "inside@example.com");
         inside.set_confirmation_sent_at(Some(clock.now() - chrono::TimeDelta::days(4)));
         assert!(inside.confirmation_period_valid(&windowed, &clock));

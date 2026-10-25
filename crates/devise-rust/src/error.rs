@@ -229,6 +229,39 @@ pub fn is_unsafe_attribute(attr: &str) -> bool {
     UNSAFE_ATTRIBUTES_FOR_SERIALIZATION.contains(&attr)
 }
 
+/// Strip every UNSAFE attribute from a JSON map (Devise's
+/// `serializable_hash` filter).
+///
+/// The application-facing enforcement seam for CONCERNS #6: models whose
+/// `serializable_hash` (or any API-facing projection) is built by hand call
+/// this on the map they are about to return, so `encrypted_password`,
+/// `reset_password_token`, `confirmation_token`, `unlock_token`, sign-in IPs
+/// and friends can never leak through serialization. The default
+/// `Authenticatable::serializable_hash` is empty (nothing to leak); models
+/// that widen it must call this filter.
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::error::filter_unsafe_attributes;
+///
+/// let mut map = serde_json::Map::new();
+/// map.insert("email".to_string(), serde_json::json!("user@example.com"));
+/// map.insert("encrypted_password".to_string(), serde_json::json!("$2b$12$..."));
+/// let safe = filter_unsafe_attributes(&map);
+/// assert_eq!(safe["email"], serde_json::json!("user@example.com"));
+/// assert!(safe.get("encrypted_password").is_none());
+/// ```
+#[must_use]
+pub fn filter_unsafe_attributes(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    map.iter()
+        .filter(|(key, _)| !is_unsafe_attribute(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 impl From<crate::failure::Failure> for DeviseError {
     fn from(failure: crate::failure::Failure) -> Self {
         DeviseError::Internal(format!("{failure:?}"))
