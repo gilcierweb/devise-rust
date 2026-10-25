@@ -18,7 +18,19 @@
 > audit time; the implemented gaps closed since then are listed in
 > "Behaviors closed by the 2026-10-24 remediation" below.
 
-## Behaviors closed by the 2026-10-24 remediation
+## Divergence decisions (documented, deliberately NOT changed)
+
+* **`confirmation_token` stores the HMAC digest, not the raw token.**
+  Devise stores the raw token in the column and carries an open TODO to
+  converge to digest-only (`confirm_by_token`). The port implements that
+  TODO's destination while keeping Devise's compatibility: the lookup is
+  raw-first-then-digest, so a legacy Devise row still confirms, and a port
+  row confirms through the emailed raw token. Storing raw would REGRESS
+  security (a DB read would hand over account takeover); the behavioral
+  contract (the emailed link works in both worlds) is pinned by
+  `confirmable_token_storage_is_digest_and_both_lookups_work`.
+
+## Behaviors closed by the 2026-10-24/25 remediation
 
 | Devise behavior | Where it lives now | Test that proves it |
 |---|---|---|
