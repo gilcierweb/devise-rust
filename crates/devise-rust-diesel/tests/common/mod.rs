@@ -202,10 +202,17 @@ pub mod pg {
 
             let uuid_files =
                 devise_rust_migrations::emit(&uuid_ddl).expect("fixture pg uuid DDL emits");
-            let text_id_ddl = uuid_files.up_sql.replace(
-                "id UUID PRIMARY KEY DEFAULT gen_random_uuid()",
-                "id TEXT PRIMARY KEY",
-            );
+            let text_id_ddl = uuid_files
+                .up_sql
+                .replace(
+                    "id UUID PRIMARY KEY DEFAULT gen_random_uuid()",
+                    "id TEXT PRIMARY KEY",
+                )
+                // Same TEXT IP posture as the int fixture: a Text-typed
+                // changeset parameter cannot land in a real inet column
+                // ("expression is of type text"). See the comment above.
+                .replace("current_sign_in_ip INET", "current_sign_in_ip TEXT")
+                .replace("last_sign_in_ip INET", "last_sign_in_ip TEXT");
             assert!(
                 text_id_ddl != uuid_files.up_sql,
                 "pg uuid fixture substitution missed: the emitted id column changed shape"
