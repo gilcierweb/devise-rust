@@ -539,7 +539,7 @@ impl devise_rust::omniauthable::Omniauthable for FixtureUser {
         A: devise_rust::adapter::OrmAdapter<Self, New = Self::New> + Send + Sync,
     {
         let mut outcome =
-            devise_rust::omniauthable::default_from_omniauth(adapter, &profile, clock).await;
+            devise_rust::omniauthable::default_from_omniauth(adapter, &profile, &devise_rust::config::DeviseConfig::default(), clock).await;
         // Devise's canonical from_omniauth pattern: a provider-verified
         // identity is confirmed on creation (one home: core helper).
         if outcome.is_valid() {
