@@ -121,7 +121,178 @@ where
                     record.lock_unauthenticated_message(&self.config, self.clock.as_ref()),
                 )
             }
-            Ok(LockAttemptOutcome::Authenticated) | Err(_) => AttemptVerdict::Recorded,
+            Ok(LockAttemptOutcome::Authenticated) => AttemptVerdict::Recorded,
+            // Fail closed: Devise lets the persistence error raise (a 500)
+            // because the counter write IS the brute-force accounting -
+            // proceeding as "recorded" is how unlimited guessing slips
+            // past a lockout exactly when the backend is unhealthy.
+            Err(_) => AttemptVerdict::Failed("invalid"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::memory::MemoryAdapter;
+    use crate::adapter::{Conditions, OrmAdapter, OrmError, Value};
+    use crate::config::DeviseConfig;
+    use crate::failure::AnyDeviseModel;
+    use crate::lockable::Lockable;
+    use crate::mailer::TestMailer;
+    use crate::mailer::HasEmail;
+    use crate::model::Authenticatable;
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// Minimal lockable model exercising the sink seam.
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    struct SinkUser {
+        id: i64,
+        email: String,
+        #[serde(default)]
+        failed_attempts: u32,
+        locked_at: Option<DateTime<Utc>>,
+        unlock_token: Option<String>,
+    }
+
+    impl SinkUser {
+        fn fresh(id: i64, email: &str) -> Self {
+            Self {
+                id,
+                email: email.to_string(),
+                ..Self::default()
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Authenticatable for SinkUser {}
+
+    impl HasEmail for SinkUser {
+        fn email(&self) -> &str {
+            &self.email
+        }
+    }
+
+    impl Lockable for SinkUser {
+        fn failed_attempts(&self) -> u32 {
+            self.failed_attempts
+        }
+        fn set_failed_attempts(&mut self, count: u32) {
+            self.failed_attempts = count;
+        }
+        fn locked_at(&self) -> Option<DateTime<Utc>> {
+            self.locked_at
+        }
+        fn set_locked_at(&mut self, at: Option<DateTime<Utc>>) {
+            self.locked_at = at;
+        }
+        fn unlock_token(&self) -> Option<&str> {
+            self.unlock_token.as_deref()
+        }
+        fn set_unlock_token(&mut self, token: Option<String>) {
+            self.unlock_token = token;
+        }
+        fn persisted(&self) -> bool {
+            self.id != 0
+        }
+    }
+
+    impl AnyDeviseModel for SinkUser {
+        fn to_key(&self) -> DeviseKey {
+            DeviseKey::from_i64(self.id)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Adapter wrapper whose counter verb fails: simulates a DB outage at
+    /// the exact moment lockable must persist the failed-attempt accounting.
+    struct FailingCounterAdapter<'a> {
+        inner: &'a MemoryAdapter<SinkUser>,
+    }
+
+    #[async_trait::async_trait]
+    impl OrmAdapter<SinkUser> for FailingCounterAdapter<'_> {
+        type New = SinkUser;
+
+        async fn get(&self, id: &DeviseKey) -> Result<Option<SinkUser>, OrmError> {
+            self.inner.get(id).await
+        }
+        async fn find_first(
+            &self,
+            conditions: &Conditions,
+        ) -> Result<Option<SinkUser>, OrmError> {
+            self.inner.find_first(conditions).await
+        }
+        async fn create(&self, model: SinkUser) -> Result<SinkUser, OrmError> {
+            self.inner.create(model).await
+        }
+        async fn update(
+            &self,
+            key: &DeviseKey,
+            changes: &crate::adapter::ChangeSet,
+        ) -> Result<SinkUser, OrmError> {
+            self.inner.update(key, changes).await
+        }
+        async fn update_columns(
+            &self,
+            key: &DeviseKey,
+            fields: &HashMap<String, Value>,
+        ) -> Result<SinkUser, OrmError> {
+            self.inner.update_columns(key, fields).await
+        }
+        async fn increment_counter(
+            &self,
+            _key: &DeviseKey,
+            _column: &'static str,
+        ) -> Result<SinkUser, OrmError> {
+            Err(OrmError::Query {
+                message: "counter backend unavailable".to_string(),
+                source: None,
+            })
+        }
+        async fn delete(&self, id: &DeviseKey) -> Result<(), OrmError> {
+            self.inner.delete(id).await
+        }
+    }
+
+    /// Devise's `valid_for_authentication?` lets a persistence error raise
+    /// (a 500): the counter write is load-bearing security accounting. The
+    /// sink must FAIL CLOSED when it cannot record - never proceed as if
+    /// the attempt had been recorded (that is how brute force slips past a
+    /// lockout during a backend hiccup).
+    #[tokio::test]
+    async fn sink_fails_closed_when_the_counter_write_errors() {
+        let memory = MemoryAdapter::<SinkUser>::new();
+        let user = SinkUser::fresh(1, "sink@example.com");
+        let key = user.to_key();
+        let _ = memory.create(user).await;
+
+        let failing = FailingCounterAdapter { inner: &memory };
+        let config = Arc::new(DeviseConfig {
+            secret_key: "test-secret-key".to_string(),
+            ..DeviseConfig::default()
+        });
+        let sink = LockableFailedAttemptSink::<
+            SinkUser,
+            FailingCounterAdapter<'_>,
+            TestMailer,
+        >::new(
+            Arc::new(failing),
+            Arc::new(TestMailer::default()),
+            config,
+            Arc::new(crate::time::SystemClock),
+        );
+
+        let verdict = sink.record(&key, false).await;
+        assert!(
+            matches!(verdict, AttemptVerdict::Failed(_)),
+            "a failed counter write must fail closed, got {verdict:?}"
+        );
     }
 }
