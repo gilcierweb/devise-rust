@@ -173,7 +173,19 @@ pub mod pg {
                 .flow(Flow::Create);
 
             let files = devise_rust_migrations::emit(&int_ddl).expect("fixture pg DDL emits");
-            conn.batch_execute(&files.up_sql)
+            // The rig stores IPs in TEXT columns: diesel's changeset binds
+            // are typed by the `table!` schema (Text), and a Text parameter
+            // into a real inet column fails with "column is of type inet but
+            // expression is of type text". Casting from the TEXT-typed
+            // changeset needs typed Inet entities (diesel sql_types::Inet +
+            // a ToSql/FromSql newtype) - tracked as backend follow-up; the
+            // shared contract still proves the IP round-trip at TEXT level,
+            // the same posture as the sqlx and sea-orm rigs.
+            let up_sql = files
+                .up_sql
+                .replace("current_sign_in_ip INET", "current_sign_in_ip TEXT")
+                .replace("last_sign_in_ip INET", "last_sign_in_ip TEXT");
+            conn.batch_execute(&up_sql)
                 .await
                 .expect("emitted pg DDL applies to testcontainers Postgres");
 

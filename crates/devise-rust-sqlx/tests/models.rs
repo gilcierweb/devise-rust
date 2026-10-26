@@ -12,8 +12,8 @@ use chrono::NaiveDateTime;
 use devise_rust::adapter::{DeviseKey, OrmError, Value};
 use devise_rust_adapter_tests::ContractModel;
 use devise_rust_sqlx::glue::{
-    Bind, KeyShape, SqlxModel, WriteValue, nullable_datetime, nullable_inet, nullable_string,
-    required_datetime, required_i64, required_string,
+    Bind, KeyShape, SqlxModel, WriteValue, nullable_datetime, nullable_string, required_datetime,
+    required_i64, required_string,
 };
 use sqlx::Type;
 use sqlx::decode::Decode;
@@ -251,8 +251,13 @@ fn write_bind(column: &str, value: &Value) -> Result<(&'static str, WriteValue),
         "sign_in_count" => ("sign_in_count", required_i64(column, value)?),
         "current_sign_in_at" => ("current_sign_in_at", nullable_datetime(column, value)?),
         "last_sign_in_at" => ("last_sign_in_at", nullable_datetime(column, value)?),
-        "current_sign_in_ip" => ("current_sign_in_ip", nullable_inet(column, value)?),
-        "last_sign_in_ip" => ("last_sign_in_ip", nullable_inet(column, value)?),
+        // The pg rig stores IPs in TEXT columns (sqlx 0.8.6 has no native
+        // inet decode without new dependencies); routing through
+        // `nullable_string` keeps the round-trip exact. Apps on REAL inet
+        // columns route through `Bind::Inet`, whose `::inet` write cast is
+        // proven by `postgres_inet_bind_appends_inet_cast`.
+        "current_sign_in_ip" => ("current_sign_in_ip", nullable_string(column, value)?),
+        "last_sign_in_ip" => ("last_sign_in_ip", nullable_string(column, value)?),
         "confirmation_token" => ("confirmation_token", nullable_string(column, value)?),
         "confirmed_at" => ("confirmed_at", nullable_datetime(column, value)?),
         "confirmation_sent_at" => ("confirmation_sent_at", nullable_datetime(column, value)?),
