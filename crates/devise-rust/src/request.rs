@@ -165,25 +165,72 @@ impl AuthRequest {
         self
     }
 
-    /// Check if request is a navigational format (HTML/Turbo Stream)
+/// Resolve the winning media range of an `Accept` header.
+///
+/// Picks the entry with the highest quality (`q=`); on equal quality the
+/// first listed entry wins, matching how browsers order their preferences.
+/// An empty or unparsable header yields `*/*` (the browser default).
+fn best_media_range(accept: &str) -> &str {
+    let mut best: Option<(&str, f32)> = None;
+    for entry in accept.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (mime, quality) = match entry.split_once(';') {
+            Some((mime, params)) => {
+                let quality = params
+                    .split(';')
+                    .find_map(|param| {
+                        let param = param.trim();
+                        param
+                            .strip_prefix("q=")
+                            .and_then(|value| value.parse::<f32>().ok())
+                    })
+                    .unwrap_or(1.0);
+                (mime.trim(), quality)
+            }
+            None => (entry, 1.0),
+        };
+        if mime.is_empty() {
+            continue;
+        }
+        match best {
+            Some((_, best_quality)) if quality <= best_quality => {}
+            _ => best = Some((mime, quality)),
+        }
+    }
+    best.map_or("*/*", |(mime, _)| mime)
+}
+
+/// Check if request is a navigational format (HTML/Turbo Stream)
     ///
-    /// Mirrors Devise's `is_navigational_format?` - checks Accept header against
+    /// Mirrors Devise's `is_navigational_format?` - Rails resolves
+    /// `request.format.ref` from the Accept header and asks whether it is in
     /// `config.navigational_formats` (default: `["*/*", "html", "turbo_stream"]`).
-    /// Devise 5.0.4 includes `"*/*"` so bare curl gets redirect (RESEARCH.md Pitfall 2).
+    /// The winning media range (highest `q`, first listed on ties) decides:
+    /// `*/*` resolves to `:html` (browsers, bare curl), an explicit
+    /// `application/json` resolves to `:json` and is NOT navigational, so an
+    /// API failure answers 401 rather than a 302 to the sign-in page.
     #[must_use]
     pub fn is_navigational_format(&self, config: &DeviseConfig) -> bool {
         let accept = self.headers.get("accept").map_or("*/*", |s| s.as_str());
+        let negotiated = Self::best_media_range(accept);
 
-        for format in &config.navigational_formats {
-            let format = format.trim();
-            if format == "*/*" {
-                return true;
-            }
-            if accept.contains(format) {
-                return true;
-            }
+        // `*/*` (or no parsable entry) resolves to the browser format.
+        if negotiated.contains("*/*") {
+            return true;
         }
-        false
+        if negotiated.contains("html") || negotiated.contains("turbo") {
+            return true;
+        }
+        // Honor custom navigational_formats entries ("json" makes json
+        // navigational for that app); "*/*" never forces a redirect on its
+        // own once a concrete type won.
+        config.navigational_formats.iter().any(|format| {
+            let format = format.trim();
+            !format.is_empty() && format != "*/*" && negotiated.contains(format)
+        })
     }
 
     /// Check if request is XHR (AJAX)
@@ -253,13 +300,28 @@ impl AuthRequest {
     /// Strips scheme+authority, keeps path+query+fragment. Invalid → None.
     ///
     /// Mirrors devise's `stored_location` read with the open-redirect guard: same-host validation of the stored location.
+    ///
+    /// The guard rejects every shape a browser could resolve off-host:
+    /// absolute schemes (`http://`, `https://`), protocol-relative `//host`,
+    /// and - because browsers normalize `\` to `/` and strip raw control
+    /// whitespace - any target containing a backslash, tab, CR, or LF. A
+    /// leading `/` alone is not evidence of same-hostness (`/\evil.com` and
+    /// `/\/evil.com` both travel off-host once the browser rewrites them).
     #[must_use]
     pub fn parse_stored_uri(input: &str) -> Option<String> {
-        // Simple implementation: reject absolute URLs, accept relative paths
+        // Reject absolute URLs, accept relative paths
         if input.starts_with("http://") || input.starts_with("https://") {
             return None;
         }
         if input.starts_with("//") {
+            return None;
+        }
+        // A backslash or raw control whitespace makes the target unsafe after
+        // browser normalization (path confusion, open redirect, header folding).
+        if input
+            .chars()
+            .any(|c| matches!(c, '\\' | '\t' | '\r' | '\n'))
+        {
             return None;
         }
         // Must start with / for a valid path
@@ -381,20 +443,26 @@ mod tests {
     fn test_is_navigational_format() {
         let config = DeviseConfig::default();
 
-        // */* matches everything (Devise 5.0.4 default)
+        // */* matches everything (browsers, bare curl): Rails resolves it
+        // to :html, which IS in navigational_formats.
         let req = AuthRequest::new(HttpMethod::Get, "/")
             .headers([("accept".to_string(), "*/*".to_string())]);
+        assert!(req.is_navigational_format(&config));
+
+        // A missing Accept header behaves like a browser (*/*).
+        let req = AuthRequest::new(HttpMethod::Get, "/");
+        assert!(req.is_navigational_format(&config));
+
+        // Browser header: html (q=1) beats */* (q=0.8).
+        let req = AuthRequest::new(HttpMethod::Get, "/").headers([(
+            "accept".to_string(),
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string(),
+        )]);
         assert!(req.is_navigational_format(&config));
 
         // text/html matches
         let req = AuthRequest::new(HttpMethod::Get, "/")
             .headers([("accept".to_string(), "text/html".to_string())]);
-        assert!(req.is_navigational_format(&config));
-
-        // application/json MATCHES because */* is in default navigational_formats
-        // (Devise 5.0.4 behavior: bare curl gets redirect)
-        let req = AuthRequest::new(HttpMethod::Get, "/")
-            .headers([("accept".to_string(), "application/json".to_string())]);
         assert!(req.is_navigational_format(&config));
 
         // turbo_stream matches
@@ -403,6 +471,20 @@ mod tests {
             "text/vnd.turbo-stream.html".to_string(),
         )]);
         assert!(req.is_navigational_format(&config));
+
+        // An explicit application/json (no */*) is an API request: Rails
+        // resolves request.format.ref to :json, which is NOT navigational,
+        // so the failure app must answer 401 - never a 302 to sign_in.
+        let req = AuthRequest::new(HttpMethod::Get, "/")
+            .headers([("accept".to_string(), "application/json".to_string())]);
+        assert!(!req.is_navigational_format(&config));
+
+        // axios-style header: json (q=1) beats */* (q=0.01).
+        let req = AuthRequest::new(HttpMethod::Get, "/").headers([(
+            "accept".to_string(),
+            "application/json, text/javascript, */*; q=0.01".to_string(),
+        )]);
+        assert!(!req.is_navigational_format(&config));
 
         // Test with config that excludes */*
         let config_no_star = DeviseConfig {
@@ -499,5 +581,30 @@ mod tests {
         // Invalid: no leading slash
         assert!(AuthRequest::parse_stored_uri("path").is_none());
         assert!(AuthRequest::parse_stored_uri("").is_none());
+    }
+
+    /// S1: the open-redirect guard must also reject protocol-relative
+    /// backslash targets. Browsers normalize `\` to `/`, so a stored
+    /// `/\evil.com` would resolve `Location: /\evil.com` off-host even though
+    /// it starts with a slash. Raw tab/CR/LF are rejected for the same
+    /// reason (header folding and browser normalization).
+    #[test]
+    fn test_parse_stored_uri_rejects_backslash_targets() {
+        // Protocol-relative backslash forms (Ruby's `parse_uri` equivalent
+        // rejects them; a naive `starts_with("//")` does not).
+        assert!(AuthRequest::parse_stored_uri("/\\evil.com").is_none());
+        assert!(AuthRequest::parse_stored_uri("/\\t//evil.com").is_none());
+        assert!(AuthRequest::parse_stored_uri("/\\/evil.com").is_none());
+
+        // Already-rejected shapes stay rejected.
+        assert!(AuthRequest::parse_stored_uri("//evil.com").is_none());
+        assert!(AuthRequest::parse_stored_uri("http://evil.com").is_none());
+        assert!(AuthRequest::parse_stored_uri("https://evil.com").is_none());
+
+        // A well-formed relative path still lands.
+        assert_eq!(
+            AuthRequest::parse_stored_uri("/good/path?q=1"),
+            Some("/good/path?q=1".to_string())
+        );
     }
 }

@@ -178,8 +178,10 @@ pub fn secure_compare(a: &str, b: &str) -> bool {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
     if a_bytes.len() != b_bytes.len() {
-        // Still do a dummy comparison to avoid timing leak on length
-        let _ = a_bytes.ct_eq(b_bytes);
+        // Length mismatch: the answer is already decided. `ct_eq` cannot
+        // hide the length difference itself (it short-circuits on length),
+        // and the compared values here (salts, digests) are not secret
+        // data - so a plain early false is correct and honest.
         return false;
     }
     a_bytes.ct_eq(b_bytes).into()
