@@ -420,7 +420,7 @@ pub fn verify_state(stashed_state: Option<&str>, returned_state: Option<&str>) -
 ///         Self: Sized,
 ///         A: OrmAdapter<Self, New = Self::New> + Send + Sync,
 ///     {
-///         default_from_omniauth(adapter, &profile, clock).await
+///         default_from_omniauth(adapter, &profile, &crate::config::DeviseConfig::default(), clock).await
 ///     }
 ///
 ///     fn new_from_profile(profile: &ProviderProfile, now: DateTime<Utc>) -> Self::New {
@@ -514,13 +514,27 @@ pub trait Omniauthable: Authenticatable {
 pub async fn default_from_omniauth<M, A>(
     adapter: &A,
     profile: &ProviderProfile,
+    config: &crate::config::DeviseConfig,
     clock: &dyn Clock,
 ) -> ResourceWithErrors<M>
 where
     M: Omniauthable + Default + Sized + Send + Sync + 'static,
     A: OrmAdapter<M, New = <M as Omniauthable>::New> + Send + Sync,
 {
-    let profile = M::normalize_profile(profile.clone());
+    let mut profile = M::normalize_profile(profile.clone());
+
+    // Devise routes EVERY credential source through the parameter filter
+    // (`authenticatable.rb:267-269` + `downcase_keys`): a provider asserting
+    // `User@Example.COM` must link to the stored `user@example.com`, not
+    // fall through to create-new and mint a duplicate account.
+    if let Some(email) = profile.email.as_deref() {
+        profile.email = Some(crate::model::normalize_credential_value(
+            email,
+            "email",
+            &config.case_insensitive_keys,
+            &config.strip_whitespace_keys,
+        ));
+    }
 
     // 1. Existing identity pair: return the row untouched.
     let mut identity = Conditions::new();
@@ -838,7 +852,7 @@ mod tests {
             Self: Sized,
             A: OrmAdapter<Self, New = Self::New> + Send + Sync,
         {
-            default_from_omniauth(adapter, &profile, clock).await
+            default_from_omniauth(adapter, &profile, &crate::config::DeviseConfig::default(), clock).await
         }
 
         fn new_from_profile(profile: &ProviderProfile, now: DateTime<Utc>) -> Self::New {
@@ -884,6 +898,14 @@ mod tests {
             .expect("seed row");
     }
 
+
+    fn test_config() -> crate::config::DeviseConfig {
+        crate::config::DeviseConfig {
+            secret_key: "test-secret-key".to_string(),
+            ..crate::config::DeviseConfig::default()
+        }
+    }
+
     #[tokio::test]
     async fn omniauthable_policy_returns_existing_identity_row() {
         let adapter = MemoryAdapter::<OmniUser>::new();
@@ -905,6 +927,7 @@ mod tests {
         let outcome: ResourceWithErrors<OmniUser> = default_from_omniauth(
             &adapter,
             &omni_profile(Some("known@example.com"), true),
+            &test_config(),
             &clock,
         )
         .await;
@@ -936,6 +959,7 @@ mod tests {
         let outcome: ResourceWithErrors<OmniUser> = default_from_omniauth(
             &adapter,
             &omni_profile(Some("user@example.com"), true),
+            &test_config(),
             &clock,
         )
         .await;
@@ -964,6 +988,52 @@ mod tests {
         );
     }
 
+    /// Devise routes EVERY credential source through the parameter filter
+    /// (`authenticatable.rb:267-269`): a provider asserting
+    /// `User@Example.COM` against a stored `user@example.com` links to the
+    /// existing account. An unnormalized lookup falls through to
+    /// create-new and mints a duplicate account (or surfaces :taken).
+    #[tokio::test]
+    async fn omniauthable_policy_normalizes_provider_email_before_linking() {
+        let adapter = MemoryAdapter::<OmniUser>::new();
+        seed_row(&adapter, "user@example.com").await;
+
+        let clock = FixedClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        let outcome: ResourceWithErrors<OmniUser> = default_from_omniauth(
+            &adapter,
+            &omni_profile(Some("  User@Example.COM  "), true),
+            &test_config(),
+            &clock,
+        )
+        .await;
+
+        assert!(
+            outcome.is_valid(),
+            "a mixed-case provider email must link to the stored row, got errors {:?}",
+            outcome.errors
+        );
+        // Exactly one row: the existing one, updated with the identity pair.
+        let mut identity = Conditions::new();
+        identity.insert(PROVIDER_COLUMN, "stub");
+        identity.insert(UID_COLUMN, "uid-42");
+        let row = adapter
+            .find_first(&identity)
+            .await
+            .expect("store readable")
+            .expect("linked identity row");
+        assert_eq!(row.email, "user@example.com");
+        let mut by_email = Conditions::new();
+        by_email.insert("email", "user@example.com");
+        assert!(
+            adapter
+                .find_first(&by_email)
+                .await
+                .expect("store readable")
+                .is_some(),
+            "the stored row must be reachable under its normalized email"
+        );
+    }
+
     #[tokio::test]
     async fn omniauthable_policy_unverified_email_never_links() {
         let adapter = MemoryAdapter::<OmniUser>::new();
@@ -974,6 +1044,7 @@ mod tests {
         let outcome: ResourceWithErrors<OmniUser> = default_from_omniauth(
             &adapter,
             &omni_profile(Some("user@example.com"), false),
+            &test_config(),
             &clock,
         )
         .await;
@@ -1006,6 +1077,7 @@ mod tests {
         let outcome: ResourceWithErrors<OmniUser> = default_from_omniauth(
             &adapter,
             &omni_profile(Some("fresh@example.com"), true),
+            &test_config(),
             &clock,
         )
         .await;
@@ -1029,7 +1101,7 @@ mod tests {
         // A profile with no email at all: nothing to collide with, and the
         // default policy cannot look up by a nonexistent column value.
         let outcome: ResourceWithErrors<OmniUser> =
-            default_from_omniauth(&adapter, &omni_profile(None, false), &clock).await;
+            default_from_omniauth(&adapter, &omni_profile(None, false), &test_config(), &clock).await;
 
         assert!(outcome.is_valid());
         assert_eq!(outcome.record.provider.as_deref(), Some("stub"));
@@ -1147,6 +1219,7 @@ mod tests {
         let outcome: ResourceWithErrors<OmniUser> = default_from_omniauth(
             &adapter,
             &omni_profile(Some("new@example.com"), true),
+            &test_config(),
             &clock,
         )
         .await;
