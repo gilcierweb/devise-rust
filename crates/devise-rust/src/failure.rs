@@ -223,7 +223,10 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
     /// Check if this model is the same as another (for `sign_in` no-op check)
     fn is_same(&self, other: &dyn AnyDeviseModel) -> bool {
         self.to_key() == other.to_key()
-            && self.authenticatable_salt() == other.authenticatable_salt()
+            && crate::crypto::secure_compare(
+                &self.authenticatable_salt().unwrap_or_default(),
+                &other.authenticatable_salt().unwrap_or_default(),
+            )
     }
 
     /// Downcast to the password-checking facet, if this model stores a
@@ -423,9 +426,13 @@ pub fn http_auth(
 
 /// Core failure decision, mirroring `failure_app.rb`.
 ///
-/// Priority: recall target, HTTP Basic, navigational redirect, API 401.
+/// Priority: HTTP Basic, recall target, navigational redirect, API 401 -
+/// `failure_app.rb:42-50` asks `http_auth?` first and `recall` second.
 /// The stored location is kept only for `GET` navigational non-XHR
-/// requests, per `store_location.rb`.
+/// requests, per `store_location.rb`. A `Timeout` on a navigational
+/// request redirects to the attempted path (`failure_app.rb:135-149`)
+/// instead of the sign-in page, so an expired session resumes where it
+/// left off after re-authenticating.
 #[must_use]
 pub fn build_failure(
     request: &crate::request::AuthRequest,
@@ -433,14 +440,20 @@ pub fn build_failure(
     config: &crate::config::DeviseConfig,
     reason: FailureReason,
 ) -> Failure {
-    if let Some((controller, action)) = request.recall_target() {
-        return Failure::Recall { controller, action };
-    }
     if http_auth(request, config) {
         return Failure::ApiUnauthorized {
             status: 401,
-            www_authenticate: Some(format!("Basic realm={}", config.http_authentication_realm)),
+            // Devise quotes the realm (`failure_app.rb:54` builds it with
+            // `.inspect`); quotes are syntactically required once the
+            // configured realm contains a space.
+            www_authenticate: Some(format!(
+                "Basic realm=\"{}\"",
+                config.http_authentication_realm
+            )),
         };
+    }
+    if let Some((controller, action)) = request.recall_target() {
+        return Failure::Recall { controller, action };
     }
     if is_navigational_format(request, config) {
         let stored_location =
@@ -449,8 +462,16 @@ pub fn build_failure(
             } else {
                 None
             };
+        // Devise's `redirect_url`: a timed-out session returns the user to
+        // the page they were trying to reach (GET) or the referrer path
+        // (non-GET), falling back to the sign-in path.
+        let location = if reason == FailureReason::Timeout {
+            timeout_redirect_target(request).unwrap_or_else(|| mapping.sign_in_path())
+        } else {
+            mapping.sign_in_path()
+        };
         return Failure::NavigationalRedirect {
-            location: mapping.sign_in_path(),
+            location,
             flash_key: reason.flash_key(),
             stored_location,
         };
@@ -458,6 +479,20 @@ pub fn build_failure(
     Failure::ApiUnauthorized {
         status: 401,
         www_authenticate: None,
+    }
+}
+
+/// Devise's timeout `redirect_url` arm (`failure_app.rb:135-149`): the
+/// attempted path on GET, the referrer's path otherwise. Values that fail
+/// the same-host guard are discarded by the caller.
+fn timeout_redirect_target(request: &crate::request::AuthRequest) -> Option<String> {
+    if request.method == crate::request::HttpMethod::Get {
+        AuthRequest::parse_stored_uri(&request.path)
+    } else {
+        request
+            .headers
+            .get("referer")
+            .and_then(|referer| AuthRequest::parse_stored_uri(referer))
     }
 }
 
@@ -503,8 +538,15 @@ pub async fn stored_location_for(
 ) -> Option<String> {
     let key = stored_location_key(scope);
     let location = session_store.get_value(&key).await?;
+    // Read-once, matching Devise's take semantics.
     session_store.remove(&key).await;
-    location.as_str().map(str::to_string)
+    // Defense in depth on the READ path: a value poisoned straight into
+    // the store (shared session backend, stale server, tampered cookie)
+    // must never surface as a `Location` header - the same off-host guard
+    // the writers apply (S1).
+    location
+        .as_str()
+        .and_then(crate::request::AuthRequest::parse_stored_uri)
 }
 
 /// Framework rendering contract for failures (S-13).
@@ -546,11 +588,22 @@ mod tests {
 
         let api_basic = Failure::ApiUnauthorized {
             status: 401,
-            www_authenticate: Some("Basic realm=Application".to_string()),
+            // Devise emits `Basic realm="Application"` - failure_app.rb:54
+            // (`Devise.http_authentication_realm.inspect`); the quotes are
+            // syntactically required for multi-word realms.
+            www_authenticate: Some("Basic realm=\"Application\"".to_string()),
         };
         assert_eq!(
             api_basic.www_authenticate(),
-            Some("Basic realm=Application")
+            Some("Basic realm=\"Application\"")
+        );
+        let api_multiword = Failure::ApiUnauthorized {
+            status: 401,
+            www_authenticate: Some("Basic realm=\"My Application\"".to_string()),
+        };
+        assert_eq!(
+            api_multiword.www_authenticate(),
+            Some("Basic realm=\"My Application\"")
         );
 
         let recall = Failure::Recall {
@@ -751,8 +804,46 @@ mod tests {
         let challenged = build_failure(&basic, &mapping, &basic_config, FailureReason::Invalid);
         assert_eq!(
             challenged.www_authenticate(),
-            Some("Basic realm=Application")
+            // Devise quotes the realm (failure_app.rb:54 `realm.inspect`).
+            Some("Basic realm=\"Application\"")
         );
+
+        // HTTP Basic outranks recall (failure_app.rb:42-50 `respond`):
+        // http_auth? is asked first, recall second.
+        let mut basic_recall = basic.clone();
+        basic_recall
+            .params
+            .insert("recall_controller".to_string(), "sessions".to_string());
+        basic_recall
+            .params
+            .insert("recall_action".to_string(), "new".to_string());
+        let recalled = build_failure(
+            &basic_recall,
+            &mapping,
+            &basic_config,
+            FailureReason::Invalid,
+        );
+        assert!(
+            recalled.is_api_unauthorized(),
+            "http_auth must win over recall (got {recalled:?})"
+        );
+
+        // Timeout on GET redirects to the attempted path, not the sign-in
+        // page (failure_app.rb:135-149 redirect_url).
+        let timed_out = build_failure(
+            &html_request("/secret/page?q=1"),
+            &mapping,
+            &DeviseConfig::default(),
+            FailureReason::Timeout,
+        );
+        assert!(matches!(
+            timed_out,
+            Failure::NavigationalRedirect {
+                ref location,
+                flash_key: "timeout",
+                ..
+            } if location == "/secret/page?q=1"
+        ));
 
         // Recall: re-dispatch data preserved.
         let mut recall = html_request("/users/sign_in");
@@ -794,5 +885,42 @@ mod tests {
         // Absolute URLs are rejected by the parser.
         assert!(crate::request::AuthRequest::parse_stored_uri("http://evil.example/x").is_none());
         assert_eq!(stored_location_key("user"), "user_return_to");
+    }
+
+    /// Defense in depth (`store_location.rb` + the S1 hardening): the READ
+    /// path must validate too. A value poisoned straight into the session
+    /// store (shared Redis, a stale server, a tampered session) must never
+    /// surface as a `Location` header - `stored_location_for` returns None
+    /// and consumes the key.
+    #[tokio::test]
+    async fn test_stored_location_read_validates_the_stored_value() {
+        use crate::session::SessionStore;
+
+        let store = FailureTestStore::default();
+
+        // Protocol-relative backslash: passes no prefix check but browsers
+        // normalize `\` to `/` - an off-host redirect.
+        store
+            .insert_value(&stored_location_key("user"), serde_json::json!("/\\evil.example"))
+            .await;
+        assert!(
+            stored_location_for("user", &store).await.is_none(),
+            "a backslash target must not survive the read path"
+        );
+        // Read-once still applies: the poisoned key is consumed.
+        assert_eq!(
+            store.get_value(&stored_location_key("user")).await,
+            None,
+            "a rejected value must not linger in the store"
+        );
+
+        // A valid path still round-trips.
+        store
+            .insert_value(&stored_location_key("user"), serde_json::json!("/landing?tab=1"))
+            .await;
+        assert_eq!(
+            stored_location_for("user", &store).await.as_deref(),
+            Some("/landing?tab=1")
+        );
     }
 }
