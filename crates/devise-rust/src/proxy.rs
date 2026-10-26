@@ -79,6 +79,10 @@ pub struct AuthProxy {
     failed_attempt_sinks: HashMap<String, Arc<dyn crate::failed_attempt::FailedAttemptSink>>,
     config: Arc<DeviseConfig>,
     remember_cookie_ops: Vec<RememberCookieOp>,
+    /// Strategy id that won the last chain run; the CSRF hook reads it to
+    /// reproduce Devise's rememberable exemption
+    /// (`strategies/rememberable.rb:36-43`).
+    winning_strategy: Option<&'static str>,
 }
 
 impl AuthProxy {
@@ -95,6 +99,8 @@ impl AuthProxy {
         hooks: Arc<HookRegistry>,
         config: Arc<DeviseConfig>,
     ) -> Self {
+        // Deliberately infallible: `try_new` is the validated entry point
+        // and this constructor stays for internal/test wiring.
         Self {
             users: HashMap::new(),
             performed: HashMap::new(),
@@ -106,6 +112,7 @@ impl AuthProxy {
             failed_attempt_sinks: HashMap::new(),
             config,
             remember_cookie_ops: Vec::new(),
+            winning_strategy: None,
         }
     }
 
@@ -161,6 +168,25 @@ impl AuthProxy {
     #[must_use]
     pub fn config(&self) -> &DeviseConfig {
         &self.config
+    }
+
+    /// Construct a proxy, refusing an unconfigured `secret_key`.
+    ///
+    /// Devise's `raise_no_secret_key` (`rails/routes.rb:228`) makes the
+    /// secret a boot-time requirement because it keys every token HMAC;
+    /// [`DeviseConfig::validate`] carries the same contract here.
+    ///
+    /// # Errors
+    ///
+    /// [`DeviseError::Config`] when the configuration fails validation.
+    pub fn try_new(
+        session_store: Arc<dyn SessionStore>,
+        registry: Arc<ScopeRegistry>,
+        hooks: Arc<HookRegistry>,
+        config: Arc<DeviseConfig>,
+    ) -> Result<Self, DeviseError> {
+        config.validate()?;
+        Ok(Self::new(session_store, registry, hooks, config))
     }
 
     /// Pending remember-cookie intents (Devise jar writes, core side).
@@ -374,9 +400,22 @@ impl AuthProxy {
 
     /// Sign out every scope, optionally locking the proxy.
     ///
+    /// Devise iterates `Devise.mappings.keys` - every registered mapping,
+    /// not only the ones authenticated in this request - so a sibling
+    /// scope's session never survives a sign-out-all
+    /// (`controllers/sign_in_out.rb:86-95`).
+    ///
     /// Returns whether any user was present.
     pub async fn sign_out_all_scopes(&mut self, lock: bool) -> bool {
-        let scopes: Vec<String> = self.users.keys().cloned().collect();
+        // Registry scopes first; union the memoized users so a scope the
+        // registry missed (registered after this proxy was built) is still
+        // cleared.
+        let mut scopes = self.registry.scope_names();
+        for scope in self.users.keys() {
+            if !scopes.iter().any(|registered| registered == scope) {
+                scopes.push(scope.clone());
+            }
+        }
         let mut any_user = false;
         for scope in &scopes {
             if self.sign_out(scope).await {
@@ -462,6 +501,30 @@ impl AuthProxy {
         Some(record)
     }
 
+    /// Queue the extend re-issue cookie (D-14) for a rememberable
+    /// `SuccessWithCookieRefresh`: hardened attributes with the strategy's
+    /// expiry, drained by the framework bridge.
+    fn queue_remember_refresh(
+        &mut self,
+        scope: &str,
+        cookie_key: String,
+        cookie_value: String,
+        expires: chrono::DateTime<chrono::Utc>,
+    ) {
+        let mut attrs = crate::rememberable::RememberableCookieAttrs::for_scope(
+            scope,
+            &self.config,
+            &crate::time::SystemClock,
+        );
+        attrs.expires = expires;
+        self.remember_cookie_ops.push(RememberCookieOp::Set {
+            scope: scope.to_string(),
+            key: cookie_key,
+            value: cookie_value,
+            attrs,
+        });
+    }
+
     /// Run the strategy chain in Devise order.
     async fn authenticate_via_strategies(
         &mut self,
@@ -498,7 +561,7 @@ impl AuthProxy {
             {
                 continue;
             }
-            if !strategy.valid(request, &mapping).await {
+            if !strategy.valid(request, &mapping, &config).await {
                 continue;
             }
             match strategy
@@ -510,7 +573,19 @@ impl AuthProxy {
                         .entry(scope.to_string())
                         .or_default()
                         .insert(strategy_id.to_string());
-                    return Ok((user, strategy.store()));
+                    self.winning_strategy = Some(strategy_id);
+                    // `store?` composition (`strategies/authenticatable.rb:13-15`
+                    // + `devise.skip_storage`): the strategy's own vote, the
+                    // config's `skip_session_storage` list, and the
+                    // CSRF-failure request flag.
+                    return Ok((
+                        user,
+                        crate::strategy::session_should_store(
+                            strategy.as_ref(),
+                            &config,
+                            request,
+                        ),
+                    ));
                 }
                 Ok(AuthOutcome::SuccessWithCookieRefresh {
                     user,
@@ -522,21 +597,18 @@ impl AuthProxy {
                         .entry(scope.to_string())
                         .or_default()
                         .insert(strategy_id.to_string());
+                    self.winning_strategy = Some(strategy_id);
                     // Extend re-issue (D-14): queue the refreshed cookie with
                     // the hardened attributes, then proceed as success.
-                    let mut attrs = crate::rememberable::RememberableCookieAttrs::for_scope(
-                        scope,
-                        &config,
-                        &crate::time::SystemClock,
-                    );
-                    attrs.expires = expires;
-                    self.remember_cookie_ops.push(RememberCookieOp::Set {
-                        scope: scope.to_string(),
-                        key: cookie_key,
-                        value: cookie_value,
-                        attrs,
-                    });
-                    return Ok((user, strategy.store()));
+                    self.queue_remember_refresh(scope, cookie_key, cookie_value, expires);
+                    return Ok((
+                        user,
+                        crate::strategy::session_should_store(
+                            strategy.as_ref(),
+                            &config,
+                            request,
+                        ),
+                    ));
                 }
                 Ok(AuthOutcome::ClearCookieAndPass { cookie_key }) => {
                     // Stale cookie (RMB-04): queue the delete for the bridge
@@ -573,6 +645,14 @@ impl crate::hooks::HookProxy for AuthProxy {
 
     fn devise_config(&self) -> &DeviseConfig {
         &self.config
+    }
+
+    fn csrf_cleanup_enabled(&self) -> bool {
+        self.config.clean_up_csrf_token_on_authentication
+    }
+
+    fn won_by_rememberable(&self) -> bool {
+        self.winning_strategy == Some("rememberable")
     }
 
     fn push_remember_cookie_op(&mut self, op: RememberCookieOp) {
@@ -705,9 +785,46 @@ mod tests {
 
     fn test_config() -> DeviseConfig {
         DeviseConfig {
+            secret_key: "test-secret-key-for-testing-only".to_string(),
             stretches: 4,
             ..DeviseConfig::default()
         }
+    }
+
+    /// Devise refuses to boot with an empty `secret_key`; the port's
+    /// `try_new` must refuse too (token HMACs would otherwise be keyed
+    /// with the empty string - forgeable reset links).
+    #[test]
+    fn test_try_new_rejects_empty_secret_key() {
+        let store = Arc::new(ProxySessionStore {
+            data: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            renewed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let registry = Arc::new(ScopeRegistry::new());
+
+        let error = AuthProxy::try_new(
+            store.clone(),
+            registry.clone(),
+            Arc::new(HookRegistry::new()),
+            Arc::new(DeviseConfig::default()),
+        )
+        .err()
+        .expect("empty secret_key must fail closed");
+        assert!(
+            matches!(error, DeviseError::Config(ref message) if message.contains("secret_key")),
+            "unexpected error: {error:?}"
+        );
+
+        assert!(
+            AuthProxy::try_new(
+                store,
+                registry,
+                Arc::new(HookRegistry::new()),
+                Arc::new(test_config()),
+            )
+            .is_ok(),
+            "a configured secret_key must be accepted"
+        );
     }
 
     fn test_proxy(renewed: &Arc<AtomicBool>) -> (AuthProxy, Arc<ProxySessionStore>) {
@@ -865,6 +982,71 @@ mod tests {
         assert!(proxy.sign_out_all_scopes(false).await);
         assert!(!proxy.authenticated("user"));
         assert!(!proxy.locked());
+    }
+
+    /// Devise signs out EVERY registered mapping (`Devise.mappings.keys`),
+    /// not only the ones authenticated in this request - a sibling scope's
+    /// session must not survive `sign_out_all_scopes`
+    /// (`controllers/sign_in_out.rb:86-95`).
+    #[tokio::test]
+    async fn test_proxy_sign_out_all_scopes_clears_untouched_sibling_scope() {
+        let renewed = Arc::new(AtomicBool::new(false));
+        let (mut proxy, store) = test_proxy(&renewed);
+        // Register a second mapping the request never authenticated.
+        proxy.registry = Arc::new({
+            let mut registry = ScopeRegistry::new();
+            for (name, path) in [("user", "users"), ("admin", "admins")] {
+                registry.register(Mapping {
+                    name: name.to_string(),
+                    class_name: "Record".to_string(),
+                    path: path.to_string(),
+                    path_prefix: None,
+                    singular: name.to_string(),
+                    path_names: PathNames::default(),
+                    controllers: HashMap::new(),
+                    modules: vec![crate::scope::Module::DatabaseAuthenticatable],
+                    only: vec![],
+                    skip: vec![],
+                    constraints: HashMap::new(),
+                    defaults: HashMap::new(),
+                    format: None,
+                    router_name: None,
+                    sign_out_via: SignOutVia::Delete,
+                    failure_app: None,
+                });
+            }
+            registry
+        });
+
+        // Authenticate only "user"; simulate a stale-but-valid "admin"
+        // session payload left in the store by an earlier request.
+        proxy
+            .sign_in(
+                "user",
+                Box::new(ProxyUser {
+                    id: 1,
+                    email: "test@example.com".to_string(),
+                    encrypted_password: String::new(),
+                }),
+                false,
+            )
+            .await;
+        let admin_key = session::keys::scope_session_key("admin");
+        store
+            .insert_value(&admin_key, serde_json::json!([1, "stale-salt"]))
+            .await;
+
+        assert!(proxy.sign_out_all_scopes(false).await);
+
+        let user_key = session::keys::scope_session_key("user");
+        assert!(
+            store.get_value(&user_key).await.is_none(),
+            "authenticated scope must be signed out"
+        );
+        assert!(
+            store.get_value(&admin_key).await.is_none(),
+            "sibling scope session must not survive sign_out_all_scopes"
+        );
     }
 
     #[tokio::test]

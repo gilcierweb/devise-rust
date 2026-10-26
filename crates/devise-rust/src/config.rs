@@ -6,6 +6,8 @@ use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::error::DeviseError;
+
 /// Serde module for `TimeDelta` (as seconds)
 mod serde_time_delta {
     use chrono::TimeDelta;
@@ -298,6 +300,28 @@ impl DeviseConfig {
         self.stretches
             .clamp(*BCRYPT_COST_RANGE.start(), *BCRYPT_COST_RANGE.end())
     }
+
+    /// Validate the configuration before any authentication runs.
+    ///
+    /// Devise refuses to boot without a `secret_key`
+    /// (`devise/lib/devise/rails/routes.rb:228` - `raise_no_secret_key`):
+    /// the key is the HMAC key of every token digest
+    /// (`reset_password_token`, `confirmation_token`, `unlock_token`), so an
+    /// empty key makes every token forgeable - a silent account-takeover
+    /// channel. The port enforces the same hard error instead of hashing
+    /// with an empty key.
+    ///
+    /// # Errors
+    ///
+    /// [`DeviseError::Config`] when `secret_key` is empty or whitespace.
+    pub fn validate(&self) -> Result<(), DeviseError> {
+        if self.secret_key.trim().is_empty() {
+            return Err(DeviseError::Config(
+                "Devise.secret_key must be set before using devise-rust: it keys the HMAC digests of all token columns (Devise's raise_no_secret_key)".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Per-scope configuration override - all fields optional, cascade over global
@@ -516,6 +540,30 @@ impl DeviseConfigOverride {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Devise refuses to boot without a `secret_key` (`rails/routes.rb:228`).
+    /// The port must fail loud instead of keying token HMACs with "".
+    #[test]
+    fn test_validate_rejects_empty_secret_key() {
+        let config = DeviseConfig::default();
+        let error = config.validate().expect_err("default config must not validate");
+        assert!(
+            matches!(error, DeviseError::Config(ref message) if message.contains("secret_key")),
+            "unexpected error: {error:?}"
+        );
+
+        let whitespace = DeviseConfig {
+            secret_key: "   ".to_string(),
+            ..DeviseConfig::default()
+        };
+        assert!(whitespace.validate().is_err());
+
+        let configured = DeviseConfig {
+            secret_key: "test-secret-key".to_string(),
+            ..DeviseConfig::default()
+        };
+        assert!(configured.validate().is_ok());
+    }
 
     /// Ported from `devise/test/devise_test.rb` - `Devise.email_regexp` matrix.
     #[test]

@@ -23,7 +23,14 @@ use std::sync::Arc;
 #[async_trait]
 pub trait Strategy: Send + Sync {
     /// Whether this strategy applies to the request.
-    async fn valid(&self, request: &AuthRequest, mapping: &Mapping) -> bool;
+    ///
+    /// Devise's `valid?` also consults the capability switches
+    /// (`valid_for_params_auth?` / `valid_for_http_auth?`,
+    /// `strategies/authenticatable.rb:77-90`): a disabled strategy is
+    /// simply not valid and the chain moves on - it never aborts the
+    /// request.
+    async fn valid(&self, request: &AuthRequest, mapping: &Mapping, config: &DeviseConfig)
+    -> bool;
 
     /// Attempt authentication.
     ///
@@ -40,6 +47,13 @@ pub trait Strategy: Send + Sync {
     /// Whether to persist the session after success.
     fn store(&self) -> bool {
         true
+    }
+
+    /// Devise's `authentication_type` (`:params_auth` / `:http_auth`):
+    /// the slot checked against `skip_session_storage`
+    /// (`strategies/authenticatable.rb:13-15`). Default: the strategy id.
+    fn authentication_type(&self) -> &'static str {
+        self.id()
     }
 
     /// Whether this strategy runs without credentials (remember-me).
@@ -62,8 +76,13 @@ pub trait Strategy: Send + Sync {
 
 #[async_trait]
 impl Strategy for Box<dyn Strategy> {
-    async fn valid(&self, request: &AuthRequest, mapping: &Mapping) -> bool {
-        (**self).valid(request, mapping).await
+    async fn valid(
+        &self,
+        request: &AuthRequest,
+        mapping: &Mapping,
+        config: &DeviseConfig,
+    ) -> bool {
+        (**self).valid(request, mapping, config).await
     }
 
     async fn authenticate(
@@ -109,6 +128,27 @@ fn extract_param(request: &AuthRequest, scope: &str, key: &str) -> Option<String
         .or_else(|| request.params.get(&format!("{scope}_{key}")))
         .or_else(|| request.params.get(key))
         .cloned()
+}
+
+/// Decide whether a winning strategy's success persists a session.
+///
+/// Devise composes three gates (`strategies/authenticatable.rb:13-15` plus
+/// warden's `env["devise.skip_storage"]`): the strategy's own `store?`, the
+/// `skip_session_storage` list keyed by authentication type (default
+/// `["http_auth"]` - an HTTP Basic login never creates a session), and the
+/// request flag `handle_unverified_request` raises after a CSRF failure.
+#[must_use]
+pub fn session_should_store(
+    strategy: &dyn Strategy,
+    config: &DeviseConfig,
+    request: &AuthRequest,
+) -> bool {
+    strategy.store()
+        && !config
+            .skip_session_storage
+            .iter()
+            .any(|skipped| skipped == strategy.authentication_type())
+        && !request.flags.skip_storage
 }
 
 /// Build the strategy chain in Devise execution order.
@@ -246,9 +286,23 @@ impl ParamsStrategy {
 
 #[async_trait]
 impl Strategy for ParamsStrategy {
-    async fn valid(&self, request: &AuthRequest, mapping: &Mapping) -> bool {
-        request.flags.allow_params_authentication
+    async fn valid(
+        &self,
+        request: &AuthRequest,
+        mapping: &Mapping,
+        config: &DeviseConfig,
+    ) -> bool {
+        // Devise gates the capability inside `valid?`
+        // (`valid_for_params_auth?`): a disabled strategy is skipped, never
+        // fatal to the chain.
+        config.params_authenticatable
+            && request.flags.allow_params_authentication
             && self.credentials(request, &mapping.name).is_some()
+    }
+
+    /// Devise's `:params_auth` slot in `skip_session_storage`.
+    fn authentication_type(&self) -> &'static str {
+        "params_auth"
     }
 
     async fn authenticate(
@@ -258,11 +312,6 @@ impl Strategy for ParamsStrategy {
         finder: &dyn ModelFinder,
         config: &DeviseConfig,
     ) -> Result<AuthOutcome, Failure> {
-        if !config.params_authenticatable {
-            return Err(Failure::Config(
-                "params_authenticatable is disabled".to_string(),
-            ));
-        }
         let Some((conditions, password)) = self.credentials(request, &mapping.name) else {
             return Ok(AuthOutcome::Pass);
         };
@@ -363,7 +412,18 @@ impl HttpBasicStrategy {
 
 #[async_trait]
 impl Strategy for HttpBasicStrategy {
-    async fn valid(&self, request: &AuthRequest, _mapping: &Mapping) -> bool {
+    async fn valid(
+        &self,
+        request: &AuthRequest,
+        _mapping: &Mapping,
+        config: &DeviseConfig,
+    ) -> bool {
+        // Devise gates the capability inside `valid?` (`valid_for_http_auth?`):
+        // with the default `http_authenticatable = false`, a stale Basic
+        // header simply makes this strategy not apply.
+        if !config.http_authenticatable {
+            return false;
+        }
         if !request.has_http_basic() {
             return false;
         }
@@ -373,6 +433,12 @@ impl Strategy for HttpBasicStrategy {
         true
     }
 
+    /// Devise's `:http_auth` slot - the default member of
+    /// `skip_session_storage`, so HTTP Basic never persists a session.
+    fn authentication_type(&self) -> &'static str {
+        "http_auth"
+    }
+
     async fn authenticate(
         &self,
         request: &AuthRequest,
@@ -380,11 +446,6 @@ impl Strategy for HttpBasicStrategy {
         finder: &dyn ModelFinder,
         config: &DeviseConfig,
     ) -> Result<AuthOutcome, Failure> {
-        if !config.http_authenticatable {
-            return Err(Failure::Config(
-                "http_authenticatable is disabled".to_string(),
-            ));
-        }
         let Some((username, password)) = request.http_basic_credentials() else {
             return Ok(AuthOutcome::Pass);
         };
@@ -394,6 +455,15 @@ impl Strategy for HttpBasicStrategy {
                 .cloned()
                 .unwrap_or_else(|| "email".to_string())
         });
+        // Devise routes EVERY credential source through the parameter
+        // filter (`authenticatable.rb:267-269`): `curl -u
+        // "USER@Example.COM"` must find the stored `user@example.com`.
+        let username = crate::model::normalize_credential_value(
+            &username,
+            &key,
+            &config.case_insensitive_keys,
+            &config.strip_whitespace_keys,
+        );
         let mut conditions = Conditions::new();
         conditions.insert(key, Value::String(username));
         let Some(user) = finder
@@ -470,7 +540,12 @@ impl Default for RememberableStrategy {
 
 #[async_trait]
 impl Strategy for RememberableStrategy {
-    async fn valid(&self, request: &AuthRequest, _mapping: &Mapping) -> bool {
+    async fn valid(
+        &self,
+        request: &AuthRequest,
+        _mapping: &Mapping,
+        _config: &DeviseConfig,
+    ) -> bool {
         request.cookies.contains_key(&self.cookie_key)
     }
 
@@ -583,8 +658,13 @@ impl<S: Strategy> ParanoidStrategy<S> {
 
 #[async_trait]
 impl<S: Strategy + Send + Sync> Strategy for ParanoidStrategy<S> {
-    async fn valid(&self, request: &AuthRequest, mapping: &Mapping) -> bool {
-        self.inner.valid(request, mapping).await
+    async fn valid(
+        &self,
+        request: &AuthRequest,
+        mapping: &Mapping,
+        config: &DeviseConfig,
+    ) -> bool {
+        self.inner.valid(request, mapping, config).await
     }
 
     async fn authenticate(
@@ -748,7 +828,6 @@ mod tests {
         let plain = strategies_for(&test_mapping(), &config);
         let plain_ids: Vec<&str> = plain.iter().map(Strategy::id).collect();
         assert_eq!(plain_ids, vec!["params", "http_basic"]);
-
         let mut with_remember = test_mapping();
         with_remember.modules = vec![
             crate::scope::Module::DatabaseAuthenticatable,
@@ -767,6 +846,89 @@ mod tests {
         assert_eq!(paranoid_ids, ordered_ids);
     }
 
+    /// `strategies/authenticatable.rb:13-15`: `store?` is `super &&`
+    /// not-in-`skip_session_storage` - with Devise's default
+    /// `[:http_auth]`, an HTTP Basic success must NOT persist a session,
+    /// and `env["devise.skip_storage"]` (set by
+    /// `handle_unverified_request`) suppresses storage for every strategy.
+    #[test]
+    fn test_session_storage_respects_skip_list_and_flag() {
+        let config = test_config();
+        let mapping = test_mapping();
+        let strategies = strategies_for(&mapping, &config);
+        let http_basic = strategies
+            .iter()
+            .find(|strategy| strategy.id() == "http_basic")
+            .expect("http_basic strategy in chain");
+        let params = strategies
+            .iter()
+            .find(|strategy| strategy.id() == "params")
+            .expect("params strategy in chain");
+
+        let request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
+        // Devise default skip_session_storage = ["http_auth"].
+        assert!(
+            !session_should_store(http_basic.as_ref(), &config, &request),
+            "http_auth must not store a session by default"
+        );
+        assert!(
+            session_should_store(params.as_ref(), &config, &request),
+            "params auth stores a session by default"
+        );
+
+        // An app that opts http_auth into storage gets it back.
+        let storing = DeviseConfig {
+            skip_session_storage: vec![],
+            ..test_config()
+        };
+        assert!(session_should_store(http_basic.as_ref(), &storing, &request));
+
+        // The CSRF-failure flag (`devise.skip_storage`) suppresses storage
+        // for every strategy.
+        let mut skipped = request.clone();
+        skipped.flags.skip_storage = true;
+        assert!(!session_should_store(params.as_ref(), &config, &skipped));
+    }
+
+    /// A disabled strategy is NOT valid and is skipped by the chain -
+    /// never a fatal `Failure::Config` aborting the request
+    /// (`strategies/authenticatable.rb:77-90` gates inside `valid?`).
+    #[tokio::test]
+    async fn test_disabled_strategy_is_skipped_not_fatal() {
+        let config = test_config();
+        let mapping = test_mapping();
+        let strategies = strategies_for(&mapping, &config);
+
+        let mut request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
+        request
+            .headers
+            .insert("authorization".to_string(), "Basic dXNlcjpwYXNz".to_string());
+        let disabled = DeviseConfig {
+            http_authenticatable: false,
+            ..test_config()
+        };
+
+        let http_basic = strategies
+            .iter()
+            .find(|strategy| strategy.id() == "http_basic")
+            .expect("http_basic strategy in chain");
+        assert!(
+            !http_basic.valid(&request, &mapping, &disabled).await,
+            "a disabled strategy must be invalid, not fatal"
+        );
+        // Devise's chain only calls authenticate after valid? - the hard
+        // contract is that a disabled capability can never surface an
+        // internal Failure::Config to the request.
+        let finder = seeded_finder(&config).await;
+        let outcome = http_basic
+            .authenticate(&request, &mapping, &finder, &disabled)
+            .await;
+        assert!(
+            !matches!(outcome, Err(Failure::Config(_))),
+            "a disabled strategy must never abort the chain with a config error: {outcome:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_params_strategy_success() {
         let config = test_config();
@@ -774,7 +936,7 @@ mod tests {
         let strategy = ParamsStrategy::default();
         let mapping = test_mapping();
         let request = params_request(&[("email", "test@example.com"), ("password", "secret123")]);
-        assert!(strategy.valid(&request, &mapping).await);
+        assert!(strategy.valid(&request, &mapping, &config).await);
         match strategy
             .authenticate(&request, &mapping, &finder, &config)
             .await
@@ -860,7 +1022,7 @@ mod tests {
         request
             .headers
             .insert("authorization".to_string(), format!("Basic {raw}"));
-        assert!(strategy.valid(&request, &mapping).await);
+        assert!(strategy.valid(&request, &mapping, &config).await);
         match strategy
             .authenticate(&request, &mapping, &finder, &config)
             .await
@@ -878,7 +1040,7 @@ mod tests {
         assert!(strategy.no_input());
         // Absent cookie: plain pass-through.
         let bare = AuthRequest::new(crate::request::HttpMethod::Get, "/");
-        assert!(!strategy.valid(&bare, &test_mapping()).await);
+        assert!(!strategy.valid(&bare, &test_mapping(), &config).await);
         let result = strategy
             .authenticate(&bare, &test_mapping(), &finder, &config)
             .await;
@@ -888,7 +1050,7 @@ mod tests {
         request
             .cookies
             .insert("remember_user_token".to_string(), "token".to_string());
-        assert!(strategy.valid(&request, &test_mapping()).await);
+        assert!(strategy.valid(&request, &test_mapping(), &config).await);
         let result = strategy
             .authenticate(&request, &test_mapping(), &finder, &config)
             .await;
@@ -1006,7 +1168,7 @@ mod tests {
         // Cookie minted a minute after creation: inside the window and
         // strictly greater than `remember_created_at`.
         request.cookies = remember_cookie_for("cookie-token", 1_700_000_060);
-        assert!(strategy.valid(&request, &mapping).await);
+        assert!(strategy.valid(&request, &mapping, &config).await);
         match strategy
             .authenticate(&request, &mapping, &finder, &config)
             .await

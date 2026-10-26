@@ -180,6 +180,19 @@ pub trait HookProxy: Send + Sync {
     fn devise_config(&self) -> &DeviseConfig {
         unimplemented!("hook proxies serving rememberable mappings must expose the config")
     }
+    /// Whether CSRF cleanup may run after authentication
+    /// (`Devise.clean_up_csrf_token_on_authentication`,
+    /// `hooks/csrf_cleaner.rb:3-13`). Safe default: enabled, matching
+    /// Devise's default `true`.
+    fn csrf_cleanup_enabled(&self) -> bool {
+        true
+    }
+    /// Whether the request's winning strategy was rememberable: a
+    /// GET-triggered auto sign-in must NOT rotate the CSRF token
+    /// (`strategies/rememberable.rb:36-43`). Safe default: never exempt.
+    fn won_by_rememberable(&self) -> bool {
+        false
+    }
     /// Queue a remember-cookie intent for the bridge outbox.
     ///
     /// `AuthProxy` records it for draining after authentication; the default
@@ -352,6 +365,18 @@ pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope
         HookFilter::new().only(vec![Event::Authentication]),
         Box::new(|ctx| {
             Box::pin(async move {
+                // Devise `hooks/csrf_cleaner.rb:3-13`: renewal is gated on
+                // `Devise.clean_up_csrf_token_on_authentication` AND the
+                // winning strategy - a rememberable win is a GET-triggered
+                // auto sign-in, and rotating the CSRF token there would
+                // expire every token embedded in the rendered page
+                // (`strategies/rememberable.rb:36-43` opts out).
+                if !ctx.proxy.csrf_cleanup_enabled() {
+                    return Ok(());
+                }
+                if ctx.proxy.won_by_rememberable() {
+                    return Ok(());
+                }
                 // Session renewal and CSRF rotation happen here.
                 // Framework bridges rotate their CSRF token inside renew().
                 let _ = ctx.proxy.session_store().renew().await;
@@ -724,6 +749,96 @@ mod tests {
             None
         }
         fn lock(&mut self) {}
+    }
+
+    /// Counting store: records `renew()` calls so hook bodies can be
+    /// asserted without a full proxy.
+    struct CountingStore {
+        renewed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl SessionStore for CountingStore {
+        async fn get_value(&self, _key: &str) -> Option<serde_json::Value> {
+            None
+        }
+        async fn insert_value(&self, _key: &str, _value: serde_json::Value) {}
+        async fn remove(&self, _key: &str) {}
+        async fn remove_prefix(&self, _prefix: &str) {}
+        async fn keys_with_prefix(&self, _prefix: &str) -> Vec<String> {
+            Vec::new()
+        }
+        async fn renew(&self) -> Result<(), crate::error::DeviseError> {
+            self.renewed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn reset(&self) -> Result<(), crate::error::DeviseError> {
+            Ok(())
+        }
+    }
+
+    /// Proxy stub with overridable CSRF gates, mirroring what real proxies
+    /// must expose: `Devise.clean_up_csrf_token_on_authentication` and the
+    /// winning-strategy exemption (`hooks/csrf_cleaner.rb`).
+    struct GateProxy {
+        store: Arc<CountingStore>,
+        csrf_enabled: bool,
+        rememberable_win: bool,
+    }
+    #[async_trait]
+    impl HookProxy for GateProxy {
+        fn session_store(&self) -> &dyn SessionStore {
+            self.store.as_ref()
+        }
+        fn scope_registry(&self) -> &crate::scope::ScopeRegistry {
+            unimplemented!()
+        }
+        fn user_mut(&mut self, _scope: &str) -> Option<&mut Option<Box<dyn AnyDeviseModel>>> {
+            None
+        }
+        fn lock(&mut self) {}
+        fn csrf_cleanup_enabled(&self) -> bool {
+            self.csrf_enabled
+        }
+        fn won_by_rememberable(&self) -> bool {
+            self.rememberable_win
+        }
+    }
+
+    /// `hooks/csrf_cleaner.rb:3-13` gates session renewal on
+    /// `Devise.clean_up_csrf_token_on_authentication` AND the winning
+    /// strategy: a rememberable win (a GET-triggered auto sign-in) must NOT
+    /// rotate the CSRF token, or every token embedded in the rendered page
+    /// dies.
+    #[tokio::test]
+    async fn test_csrf_hook_honors_config_and_rememberable_win() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (csrf_enabled, rememberable_win, expect_renew) in
+            [(false, false, 0), (true, false, 1), (true, true, 0)]
+        {
+            let store = Arc::new(CountingStore {
+                renewed: Arc::new(AtomicUsize::new(0)),
+            });
+            let mut proxy = GateProxy {
+                store: store.clone(),
+                csrf_enabled,
+                rememberable_win,
+            };
+            let mut hooks = HookRegistry::new();
+            register_devise_hooks(&mut hooks, &test_mapping());
+            let mut ctx = HookContext {
+                proxy: &mut proxy,
+                scope: "user",
+                event: Event::Authentication,
+                request: None,
+                record: None,
+            };
+            hooks.run_hooks(&mut ctx).await.expect("hooks must run");
+            assert_eq!(
+                store.renewed.load(Ordering::SeqCst),
+                expect_renew,
+                "csrf_enabled={csrf_enabled} rememberable_win={rememberable_win}"
+            );
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -1538,12 +1653,14 @@ mod tests {
             "locked"
         );
 
-        // Confirmable before lockable: an unconfirmed-plus-locked record
-        // reports `unconfirmed` (Devise's super-chain order).
+        // Lockable is the outermost link (modules.rb order: lockable is
+        // included after confirmable), so an unconfirmed-plus-locked
+        // record reports `locked` (Devise's super-chain: `lockable.rb:95-97`
+        // checks `access_locked?` before deferring via `super`).
         let both = GateUser::gate(4, false, true);
         assert_eq!(
             crate::model::compose_inactive_message(&both, &config, &clock),
-            "unconfirmed"
+            "locked"
         );
     }
 
