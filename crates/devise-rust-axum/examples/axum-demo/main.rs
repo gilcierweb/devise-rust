@@ -902,7 +902,7 @@ fn app_factory(pool: SqlitePool, config: &Arc<DeviseConfig>, mailer: Arc<TestMai
             );
         }
     }
-    let all_scopes = vec!["user".to_string(), "admin".to_string()];
+    let clock = Arc::new(SystemClock);
 
     // Devise's strategy-chain lockable accounting: both scopes register the
     // shared core sink, so a crossed threshold locks the account on ANY
@@ -922,38 +922,40 @@ fn app_factory(pool: SqlitePool, config: &Arc<DeviseConfig>, mailer: Arc<TestMai
             Arc::new(SystemClock),
         ));
 
-    let clock = Arc::new(SystemClock);
+    // The full scope registry backs every state (S2): sign-out-all and
+    // verify_signed_out_user iterate every registered scope.
+    let mut registry = ScopeRegistry::new();
+    registry.register(user_mapping.clone());
+    registry.register(admin_mapping.clone());
+    let registry = Arc::new(registry);
+
     let user_state = DeviseWebState::<ExampleUser, ExampleAdapter, ExampleMailer>::new(
         user_mapping.clone(),
+        registry.clone(),
         config.clone(),
         Arc::new(adapter.clone()),
         mailer.clone(),
         clock.clone(),
     )
-    .expect("user state builds")
-    .with_all_scopes(all_scopes.clone());
+    .expect("user state builds");
     let admin_state = DeviseWebState::<ExampleUser, ExampleAdapter, ExampleMailer>::new(
         admin_mapping.clone(),
+        registry.clone(),
         config.clone(),
         Arc::new(adapter.clone()),
         mailer,
         clock.clone(),
     )
-    .expect("admin state builds")
-    .with_all_scopes(all_scopes);
+    .expect("admin state builds");
 
     let mut hooks = HookRegistry::new();
     devise_rust::hooks::register_devise_hooks(&mut hooks, &user_mapping);
     devise_rust::hooks::register_devise_hooks(&mut hooks, &admin_mapping);
 
-    let mut registry = ScopeRegistry::new();
-    registry.register(user_mapping);
-    registry.register(admin_mapping);
-
     let user_finder: Arc<dyn ModelFinder> = Arc::new(AdapterBridge::new(adapter.clone()));
     let admin_finder: Arc<dyn ModelFinder> = Arc::new(AdapterBridge::new(adapter));
 
-    let devise_layer = DeviseLayer::new(Arc::new(registry), config.clone())
+    let devise_layer = DeviseLayer::new(registry, config.clone())
         .with_hooks(Arc::new(hooks))
         .with_finder("user", user_finder)
         .with_finder("admin", admin_finder)
@@ -1071,7 +1073,7 @@ fn print_journey_urls() {
         (
             "edit",
             "PATCH",
-            "/users/",
+            "/users",
             "302 flash updated (session renewed)",
         ),
         ("lock", "—", "seeded locked row", "sign-in 302 flash locked"),
@@ -1343,7 +1345,7 @@ async fn journey(pool: &SqlitePool, config: &Arc<DeviseConfig>, mailer: Arc<Test
         &app,
         form(
             Method::PATCH,
-            "/users/",
+            "/users",
             "user[current_password]=journey1&user[password]=journey2&user[password_confirmation]=journey2",
             Some(&jar.header()),
         ),

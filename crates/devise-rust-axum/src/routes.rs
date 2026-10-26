@@ -55,7 +55,7 @@ use devise_rust::model::{ModelFinder, Recoverable, Registerable, Validatable};
 use devise_rust::proxy::{SetUserEvent, SetUserOpts};
 use devise_rust::rememberable::{self, Rememberable};
 use devise_rust::request::AuthRequest;
-use devise_rust::scope::{Mapping, RouteSpec};
+use devise_rust::scope::{Mapping, RouteSpec, ScopeRegistry};
 use devise_rust::time::Clock;
 use serde_json::{Map, Value as JsonValue};
 use tower_sessions::Session;
@@ -111,12 +111,16 @@ async fn tracer_sessions_create(
     State(st): State<DeviseRouterState>,
     Extension(session): Extension<Session>,
     Extension(handle): Extension<AuthProxyHandle>,
-    Extension(auth_request): Extension<AuthRequest>,
+    Extension(mut auth_request): Extension<AuthRequest>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     let scope = st.mapping.name.clone();
     let email = form.get("user_email").cloned().unwrap_or_default();
     let password = form.get("user_password").cloned().unwrap_or_default();
+
+    // Devise `allow_params_authentication!` (sessions_controller.rb:5):
+    // sessions#create is the ONLY params-auth action (S4).
+    auth_request.flags.allow_params_authentication = st.config.params_authenticatable;
 
     let Some(finder) = st.finders.get(&scope) else {
         return internal_error();
@@ -139,6 +143,9 @@ async fn tracer_sessions_create(
     if !password_ok {
         return invalid_credentials(&auth_request, &st);
     }
+    // DBAU-07: fire `after_database_authentication` right after the
+    // successful password check, exactly where Devise's strategy does.
+    user.after_database_authentication();
 
     let (key, salt) = user.session_pair();
 
@@ -170,7 +177,7 @@ async fn tracer_sessions_create(
     rotate_csrf_token(&session, &scope, &st.config).await;
 
     if is_navigational_format(&auth_request, &st.config) {
-        flash_redirect(&target, "signed_in")
+        flash_redirect(&st.config, &target, "signed_in")
     } else {
         axum::Json(serde_json::json!({ "signed_in": true })).into_response()
     }
@@ -200,7 +207,7 @@ async fn tracer_sessions_destroy(
     rotate_csrf_token(&session, &scope, &st.config).await;
 
     if is_navigational_format(&auth_request, &st.config) {
-        flash_redirect("/", "signed_out")
+        flash_redirect(&st.config, "/", "signed_out")
     } else {
         StatusCode::NO_CONTENT.into_response()
     }
@@ -216,16 +223,20 @@ fn invalid_credentials(auth_request: &AuthRequest, st: &DeviseRouterState) -> Re
         &st.config,
         FailureReason::Invalid,
     );
-    AxumFailureRenderer::new().render(&failure, &st.mapping)
+    AxumFailureRenderer::for_config(&st.config).render(&failure, &st.mapping)
 }
 
-/// 302 + devise flash cookie (actix `flash_redirect` parity).
-fn flash_redirect(target: &str, flash_key: &str) -> Response {
+/// 302 + the SIGNED devise flash cookie carrying the bare I18n key
+/// (actix `flash_redirect` parity; the one flash helper every controller
+/// and the omniauth renderer share — M-flash: one format everywhere).
+pub(crate) fn flash_redirect(config: &DeviseConfig, target: &str, flash_key: &str) -> Response {
     let mut response = StatusCode::FOUND.into_response();
     let location = HeaderValue::from_str(target).unwrap_or_else(|_| HeaderValue::from_static("/"));
     response.headers_mut().insert(header::LOCATION, location);
-    if let Some(flash) = crate::failure::flash_cookie_header(flash_key) {
-        response.headers_mut().append(header::SET_COOKIE, flash);
+    if let Ok(key) = crate::remember::derive_remember_key(config) {
+        if let Some(flash) = crate::failure::flash_cookie_header(&key, flash_key) {
+            response.headers_mut().append(header::SET_COOKIE, flash);
+        }
     }
     response
 }
@@ -280,6 +291,10 @@ impl<T> FullDeviseModel for T where
 pub struct DeviseWebState<M, A, L> {
     /// Route mapping the mount was built from.
     pub mapping: Mapping,
+    /// The FULL scope registry behind the middleware run (S2): sign-out-all
+    /// and `verify_signed_out_user` iterate every registered scope, like
+    /// Devise iterates `Devise.mappings.keys` — never only this mapping.
+    pub registry: Arc<ScopeRegistry>,
     /// Devise configuration (shared `Arc` with the layer).
     pub config: Arc<DeviseConfig>,
     /// ORM adapter for the scope's model.
@@ -288,9 +303,6 @@ pub struct DeviseWebState<M, A, L> {
     pub mailer: Arc<L>,
     /// Clock for windows/ticks.
     pub clock: Arc<dyn Clock>,
-    /// All scope names sharing the middleware run (used when
-    /// `sign_out_all_scopes` holds); empty falls back to this scope only.
-    pub all_scopes: Vec<String>,
     /// Phantom marker: `M` pins the controller monomorphizations.
     pub marker: std::marker::PhantomData<fn() -> M>,
 }
@@ -302,11 +314,11 @@ impl<M, A, L> Clone for DeviseWebState<M, A, L> {
     fn clone(&self) -> Self {
         Self {
             mapping: self.mapping.clone(),
+            registry: self.registry.clone(),
             config: self.config.clone(),
             adapter: self.adapter.clone(),
             mailer: self.mailer.clone(),
             clock: self.clock.clone(),
-            all_scopes: self.all_scopes.clone(),
             marker: std::marker::PhantomData,
         }
     }
@@ -317,35 +329,31 @@ impl<M, A, L> DeviseWebState<M, A, L> {
     ///
     /// # Errors
     ///
-    /// Returns [`DeviseError::Config`] when the Devise `secret_key` is too
+    /// Returns [`DeviseError::Config`] when the Devise `secret_key` is
+    /// missing (the core [`DeviseConfig::validate`] boot contract) or too
     /// short for the cookie-jar derivation.
     pub fn new(
         mapping: Mapping,
+        registry: Arc<ScopeRegistry>,
         config: Arc<DeviseConfig>,
         adapter: Arc<A>,
         mailer: Arc<L>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, DeviseError> {
         // Fail closed on unusable secrets here so a misconfigured app never
-        // boots: every remember-cookie write would silently skip otherwise.
+        // boots: every token HMAC and remember-cookie write would silently
+        // skip otherwise (Devise's `raise_no_secret_key`).
+        config.validate()?;
         crate::remember::derive_remember_key(&config)?;
-        let all_scopes = vec![mapping.name.clone()];
         Ok(Self {
             mapping,
+            registry,
             config,
             adapter,
             mailer,
             clock,
-            all_scopes,
             marker: std::marker::PhantomData,
         })
-    }
-
-    /// Override the sibling scopes sharing the sign-out-all behavior.
-    #[must_use]
-    pub fn with_all_scopes(mut self, scopes: Vec<String>) -> Self {
-        self.all_scopes = scopes;
-        self
     }
 }
 
@@ -457,8 +465,9 @@ where
     L: Mailer<M> + 'static,
 {
     match (family, action) {
+        ("registration", "new") => mr.get(registrations_new::<M, A, L>),
         (_, "new") => mr.get(new_handler),
-        ("password", "edit") => mr.get(passwords_edit),
+        ("password", "edit") => mr.get(passwords_edit::<M, A, L>),
         ("registration", "edit") => mr.get(registrations_edit::<M, A, L>),
         ("registration", "cancel") => mr.get(registrations_cancel::<M, A, L>),
         ("confirmation", "show") => mr.get(confirmations_show::<M, A, L>),
@@ -613,6 +622,36 @@ fn param_str<'m>(map: &'m Map<String, JsonValue>, key: &str) -> &'m str {
     map.get(key).and_then(JsonValue::as_str).unwrap_or("")
 }
 
+/// Read one credential param honoring Devise's flat shapes:
+/// `{singular}_{key}` (bridge form) then the bare `key` (the `user[key]`
+/// form already collapsed to `key` in [`body_map`]). Mirrors
+/// `Authenticatable#extract_param` (`strategies/authenticatable.rb`).
+fn param_for(map: &Map<String, JsonValue>, singular: &str, key: &str) -> String {
+    map.get(&format!("{singular}_{key}"))
+        .or_else(|| map.get(key))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Devise `devise_parameter_sanitizer.sanitize(action)`
+/// (`parameter_sanitizer.rb`): keep ONLY the action's permitted keys before
+/// a record is built from the params (S7 — mass-assignment guard).
+///
+/// The three actions used here are always registered by
+/// [`ParameterSanitizer::new`], so the unknown-action `Err` (Devise's
+/// `unknown_action!` raise) is unreachable; failing closed to an empty map
+/// keeps a future typo from ever widening the permitted set.
+fn sanitized_params(
+    config: &DeviseConfig,
+    action: &str,
+    params: &Map<String, JsonValue>,
+) -> Map<String, JsonValue> {
+    devise_rust::parameter::ParameterSanitizer::new(config)
+        .sanitize(action, params)
+        .unwrap_or_default()
+}
+
 /// JSON vs HTML split (D-15): JSON when the request content-type or Accept
 /// header names JSON; everything else follows Devise's navigational path.
 fn wants_json(auth_request: &AuthRequest) -> bool {
@@ -657,7 +696,7 @@ fn auth_fail<M, A, L>(
         )
             .into_response();
     }
-    flash_redirect(&st.mapping.sign_in_path(), key)
+    flash_redirect(&st.config, &st.mapping.sign_in_path(), key)
 }
 
 /// Unauthenticated gate for owner-only controller actions (Devise
@@ -689,15 +728,11 @@ fn invalid_response(auth_request: &AuthRequest, errors: &ValidationErrors) -> Re
         .into_response()
 }
 
-/// Scopes that share this middleware run: the state's own scope plus the
-/// declared siblings (tests wire one scope; multi-scope apps pass the full
-/// list through [`DeviseWebState::with_all_scopes`]).
+/// Scopes that share this middleware run: EVERY registered scope, like
+/// Devise's `Devise.mappings.keys` (`controllers/sign_in_out.rb:86-95`) —
+/// never only the request's own mapping (S2).
 fn all_scope_names<M, A, L>(st: &DeviseWebState<M, A, L>) -> Vec<String> {
-    if st.all_scopes.is_empty() {
-        vec![st.mapping.name.clone()]
-    } else {
-        st.all_scopes.clone()
-    }
+    st.registry.scope_names()
 }
 
 /// Cheap scope-session probe for `require_no_authentication` /
@@ -793,6 +828,60 @@ async fn new_handler() -> Response {
         .into_response()
 }
 
+/// `require_no_authentication` for the registrations controller
+/// (`registrations_controller.rb:4`, `devise_controller.rb:116-130`):
+/// a signed-in navigational request is redirected home with the
+/// `already_authenticated` flash instead of reaching new/create/cancel —
+/// without it, a signed-in POST /users created a SECOND account (S13).
+///
+/// Returns `Some(redirect)` when the guard fires.
+async fn require_no_authentication<M, A, L>(
+    session: &Session,
+    handle: &AuthProxyHandle,
+    auth_request: &AuthRequest,
+    st: &DeviseWebState<M, A, L>,
+) -> Option<Response>
+where
+    M: FullDeviseModel,
+    A: OrmAdapter<M> + Send + Sync + 'static,
+    L: Mailer<M> + 'static,
+{
+    // Devise returns early for non-navigational formats; the flash-based
+    // redirect is a navigational behavior (same shape as sessions#create).
+    if wants_json(auth_request) {
+        return None;
+    }
+    let scope = st.mapping.name.as_str();
+    if !scope_session_present(session, scope).await {
+        return None;
+    }
+    let proxy = handle.lock().await;
+    let target = after_sign_in_path_for(scope, &proxy, auth_request).await;
+    drop(proxy);
+    Some(flash_redirect(&st.config, &target, "already_authenticated"))
+}
+
+/// `RegistrationsController#new` (`registrations_controller.rb:9-14`):
+/// the sign-up form, behind `require_no_authentication` (S13).
+async fn registrations_new<M, A, L>(
+    State(st): State<DeviseWebState<M, A, L>>,
+    Extension(session): Extension<Session>,
+    Extension(handle): Extension<AuthProxyHandle>,
+    Extension(auth_request): Extension<AuthRequest>,
+) -> Response
+where
+    M: FullDeviseModel,
+    A: OrmAdapter<M> + Send + Sync + 'static,
+    L: Mailer<M> + 'static,
+{
+    if let Some(redirect) =
+        require_no_authentication(&session, &handle, &auth_request, &st).await
+    {
+        return redirect;
+    }
+    new_handler().await
+}
+
 /// SessionsController#create: authenticate the params, run the lockable
 /// failed-attempt gate and the trackable durable shift, then sign the
 /// user in through the proxy with a cycle-before-insert physical write.
@@ -801,7 +890,7 @@ async fn sessions_create<M, A, L>(
     State(st): State<DeviseWebState<M, A, L>>,
     Extension(session): Extension<Session>,
     Extension(handle): Extension<AuthProxyHandle>,
-    Extension(auth_request): Extension<AuthRequest>,
+    Extension(mut auth_request): Extension<AuthRequest>,
     params: DeviseParams,
 ) -> Response
 where
@@ -818,18 +907,36 @@ where
         let proxy = handle.lock().await;
         let target = after_sign_in_path_for(&scope, &proxy, &auth_request).await;
         drop(proxy);
-        return flash_redirect(&target, "already_authenticated");
+        return flash_redirect(&st.config, &target, "already_authenticated");
     }
-    let params = body_map(params.0, &singular);
-    let email = param_str(&params, "email").to_string();
+    // Devise `allow_params_authentication!` (sessions_controller.rb:5):
+    // the ONLY action that opts into params authentication — the layer
+    // leaves the request flag down everywhere else (S4).
+    auth_request.flags.allow_params_authentication = st.config.params_authenticatable;
+    // S7: `sign_in_params` — the `:sign_in` sanitizer decides what the
+    // controller may read (`sessions_controller.rb:34-36`).
+    let params = sanitized_params(&st.config, "sign_in", &body_map(params.0, &singular));
     let password = param_str(&params, "password").to_string();
     let remember = params
         .get("remember_me")
         .and_then(JsonValue::as_str)
         .is_some_and(rememberable::is_true_value);
 
+    // M-fix: Devise builds the authentication conditions from
+    // `Devise.authentication_keys` — never a hardcoded `email` column —
+    // normalized through the same case/whitespace rules the params strategy
+    // applies (`strategies/database_authenticatable.rb:8-14`).
     let mut conditions = Conditions::new();
-    conditions.insert("email", AdapterValue::String(email));
+    for key in &st.config.authentication_keys {
+        let raw = param_for(&params, &singular, key);
+        let value = devise_rust::model::normalize_credential_value(
+            &raw,
+            key,
+            &st.config.case_insensitive_keys,
+            &st.config.strip_whitespace_keys,
+        );
+        conditions.insert(key.clone(), AdapterValue::String(value));
+    }
     let Some(mut record) =
         M::find_for_authentication(&conditions, st.adapter.as_ref(), &st.config).await
     else {
@@ -879,6 +986,13 @@ where
         }
         LockAttemptOutcome::Authenticated => {}
     }
+
+    // DBAU-07: Devise's DatabaseAuthenticatable strategy fires
+    // `after_database_authentication` immediately after the successful
+    // password check (`strategies/database_authenticatable.rb:40`), before
+    // warden's active-for-authentication gate — the controller mirrors
+    // that order.
+    devise_rust::failure::AnyDeviseModel::after_database_authentication(&record);
 
     // Devise warden `after_set_user` lockable hook: zero the counter on a
     // successful sign-in (durable; the hook owns only the memo copy).
@@ -946,7 +1060,7 @@ where
     if wants_json(&auth_request) {
         axum::Json(serde_json::json!({ "signed_in": true })).into_response()
     } else {
-        flash_redirect(&target, "signed_in")
+        flash_redirect(&st.config, &target, "signed_in")
     }
 }
 
@@ -967,12 +1081,21 @@ where
 {
     let scope = st.mapping.name.clone();
 
-    // Devise `verify_signed_out_user` (sessions_controller.rb:6): nobody was
-    // signed in, so report `already_signed_out` (401 for API callers, Devise's
-    // `non_navigational_status: :unauthorized`).
-    if current_record::<M>(&handle, &scope).await.is_none()
-        && !scope_session_present(&session, &scope).await
-    {
+    // Devise `verify_signed_out_user` → `all_signed_out?`
+    // (`sessions_controller.rb:61-73`): iterate EVERY registered mapping's
+    // session payload, not only this scope's — a sibling scope's active
+    // session means the caller IS signed in somewhere, so the sign-out
+    // proceeds and reports `signed_out` (M-fix).
+    let mut any_scope_signed_in = current_record::<M>(&handle, &scope).await.is_some();
+    if !any_scope_signed_in {
+        for probe in all_scope_names(&st) {
+            if scope_session_present(&session, &probe).await {
+                any_scope_signed_in = true;
+                break;
+            }
+        }
+    }
+    if !any_scope_signed_in {
         return if wants_json(&auth_request) {
             (
                 StatusCode::UNAUTHORIZED,
@@ -980,7 +1103,7 @@ where
             )
                 .into_response()
         } else {
-            flash_redirect("/", "already_signed_out")
+            flash_redirect(&st.config, "/", "already_signed_out")
         };
     }
 
@@ -1015,7 +1138,7 @@ where
     if wants_json(&auth_request) {
         StatusCode::NO_CONTENT.into_response()
     } else {
-        flash_redirect("/", "signed_out")
+        flash_redirect(&st.config, "/", "signed_out")
     }
 }
 
@@ -1051,6 +1174,7 @@ where
 async fn registrations_create<M, A, L>(
     State(st): State<DeviseWebState<M, A, L>>,
     Extension(session): Extension<Session>,
+    Extension(handle): Extension<AuthProxyHandle>,
     Extension(auth_request): Extension<AuthRequest>,
     params: DeviseParams,
 ) -> Response
@@ -1059,8 +1183,19 @@ where
     A: OrmAdapter<M, New = M> + Send + Sync + 'static,
     L: Mailer<M> + 'static,
 {
+    // Devise `require_no_authentication, only: [:new, :create, :cancel]`
+    // (`registrations_controller.rb:4`): a signed-in session never reaches
+    // the create action (S13).
+    if let Some(redirect) =
+        require_no_authentication(&session, &handle, &auth_request, &st).await
+    {
+        return redirect;
+    }
     let singular = st.mapping.singular.clone();
-    let params = body_map(params.0, &singular);
+    // S7: `sign_up_params` — the `:sign_up` sanitizer decides which params
+    // may build a record (`registrations_controller.rb:113-115`); the raw
+    // body map never reaches `new_with_session`.
+    let params = sanitized_params(&st.config, "sign_up", &body_map(params.0, &singular));
     let mut record = M::new_with_session(&params, &JsonValue::Null, &st.config);
 
     let mut errors = record.validate(&st.config);
@@ -1100,7 +1235,7 @@ where
             )
                 .into_response()
         } else {
-            flash_redirect(&st.mapping.sign_in_path(), &key)
+            flash_redirect(&st.config, &st.mapping.sign_in_path(), &key)
         }
     } else {
         let (key, salt) = saved.session_pair();
@@ -1119,7 +1254,7 @@ where
             )
                 .into_response()
         } else {
-            flash_redirect("/", "signed_up")
+            flash_redirect(&st.config, "/", "signed_up")
         }
     }
 }
@@ -1142,7 +1277,15 @@ where
         return unauthenticated_response(&auth_request, &st);
     };
     let singular = st.mapping.singular.clone();
-    let mut params = body_map(params.0, &singular);
+    // S7: `account_update_params` — the `:account_update` sanitizer decides
+    // which params reach `update_with_password`
+    // (`registrations_controller.rb:139-141`); the raw body map never
+    // touches the record.
+    let mut params = sanitized_params(
+        &st.config,
+        "account_update",
+        &body_map(params.0, &singular),
+    );
 
     // Capture the pre-update state Devise's `before_update` callbacks and
     // `set_flash_message_for_update` read after the fact.
@@ -1238,7 +1381,7 @@ where
     if wants_json(&auth_request) {
         axum::Json(serde_json::json!({ "updated": true })).into_response()
     } else {
-        flash_redirect("/", flash_key)
+        flash_redirect(&st.config, "/", flash_key)
     }
 }
 
@@ -1270,19 +1413,29 @@ where
     if wants_json(&auth_request) {
         StatusCode::NO_CONTENT.into_response()
     } else {
-        flash_redirect("/", "destroyed")
+        flash_redirect(&st.config, "/", "destroyed")
     }
 }
 
 async fn registrations_cancel<M, A, L>(
     State(st): State<DeviseWebState<M, A, L>>,
     Extension(session): Extension<Session>,
+    Extension(handle): Extension<AuthProxyHandle>,
+    Extension(auth_request): Extension<AuthRequest>,
 ) -> Response
 where
     M: FullDeviseModel,
     A: OrmAdapter<M> + Send + Sync + 'static,
     L: Mailer<M> + 'static,
 {
+    // Devise `require_no_authentication, only: [:new, :create, :cancel]`
+    // (`registrations_controller.rb:4`): a signed-in session never reaches
+    // the cancel action (S13).
+    if let Some(redirect) =
+        require_no_authentication(&session, &handle, &auth_request, &st).await
+    {
+        return redirect;
+    }
     // Devise registrations#cancel (`registrations_controller.rb:78-81`):
     // expire the session data, then redirect to the sign-up path (no flash).
     let _ = bridge::expire_devise_data(&session, &all_scope_names(&st)).await;
@@ -1333,16 +1486,24 @@ where
         } else {
             "send_instructions"
         };
-        return flash_redirect(&st.mapping.sign_in_path(), key);
+        return flash_redirect(&st.config, &st.mapping.sign_in_path(), key);
     }
     invalid_response(&auth_request, &resource.errors)
 }
 
-async fn passwords_edit(Query(query): Query<HashMap<String, String>>) -> Response {
+async fn passwords_edit<M, A, L>(
+    State(st): State<DeviseWebState<M, A, L>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response
+where
+    M: FullDeviseModel,
+    A: OrmAdapter<M> + Send + Sync + 'static,
+    L: Mailer<M> + 'static,
+{
     // Devise `assert_reset_token_passed`.
     let token = query.get("reset_password_token").map_or("", String::as_str);
     if token.trim().is_empty() {
-        return flash_redirect("/", "no_token");
+        return flash_redirect(&st.config, "/", "no_token");
     }
     (
         StatusCode::OK,
@@ -1400,7 +1561,7 @@ where
         )
             .into_response()
     } else {
-        flash_redirect("/", key)
+        flash_redirect(&st.config, "/", key)
     }
 }
 
@@ -1440,7 +1601,7 @@ where
             )
                 .into_response();
         }
-        return flash_redirect(&st.mapping.sign_in_path(), "confirmed");
+        return flash_redirect(&st.config, &st.mapping.sign_in_path(), "confirmed");
     }
     invalid_response(&auth_request, &resource.errors)
 }
@@ -1485,7 +1646,7 @@ where
             )
                 .into_response();
         }
-        return flash_redirect(&st.mapping.sign_in_path(), key);
+        return flash_redirect(&st.config, &st.mapping.sign_in_path(), key);
     }
     invalid_response(&auth_request, &resource.errors)
 }
@@ -1519,7 +1680,7 @@ where
             )
                 .into_response();
         }
-        return flash_redirect(&st.mapping.sign_in_path(), "unlocked");
+        return flash_redirect(&st.config, &st.mapping.sign_in_path(), "unlocked");
     }
     invalid_response(&auth_request, &resource.errors)
 }
@@ -1564,7 +1725,7 @@ where
             )
                 .into_response();
         }
-        return flash_redirect(&st.mapping.sign_in_path(), key);
+        return flash_redirect(&st.config, &st.mapping.sign_in_path(), key);
     }
     invalid_response(&auth_request, &resource.errors)
 }

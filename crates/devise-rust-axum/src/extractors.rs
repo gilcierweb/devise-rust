@@ -265,7 +265,9 @@ fn render_failure(
     };
     let reason = failure_reason(failure);
     let classified = build_failure(request, mapping, config, reason);
-    AxumFailureRenderer::new().render(&classified, mapping)
+    // S11: the flash rides the SIGNED transport — the renderer carries the
+    // config-derived cookie key, never an unsigned cookie.
+    AxumFailureRenderer::for_config(config).render(&classified, mapping)
 }
 
 // ============================================================================

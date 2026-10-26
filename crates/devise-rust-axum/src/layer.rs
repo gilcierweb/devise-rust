@@ -221,7 +221,7 @@ where
             let mapping: Option<Mapping> = layer.registry.find_by_path(&path).cloned();
 
             // Owned snapshot of the request for core decisions.
-            let mut auth_request = build_auth_request(&req, &layer.config);
+            let mut auth_request = build_auth_request(&req);
 
             // Inbound remember transport (09-02): unwrap the signature on
             // the resolved scope's remember cookie so the core strategy
@@ -237,13 +237,19 @@ where
 
             // Bridge store over the cloned session (Clone + Send + Sync —
             // no owned-extract dance) plus the per-request proxy.
+            // `try_new` validates the configuration (empty `secret_key`
+            // fails closed here instead of forging token HMACs).
             let store = Arc::new(TowerSessionStore::new(session));
-            let mut proxy = AuthProxy::new(
+            let Ok(mut proxy) = AuthProxy::try_new(
                 store,
                 layer.registry.clone(),
                 layer.hooks.clone(),
                 layer.config.clone(),
-            );
+            ) else {
+                let mut response = Response::default();
+                *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                return Ok(response);
+            };
             for (scope, finder) in &layer.finders {
                 proxy.register_finder(scope, finder.clone());
             }
@@ -358,7 +364,11 @@ async fn fetch_session_record(
     let stored_salt = arr.get(1)?.as_str()?;
     let key = DeviseKey::from_str(key_str).ok()?;
     let record = finder.get_boxed(&key).await.ok()??;
-    let current_salt = record.authenticatable_salt()?;
+    // S6: a model without `encrypted_password` has NO salt — `session_pair`
+    // stored `""` (core `unwrap_or_default`), so the fetch must compare the
+    // record's empty salt against the stored empty salt instead of
+    // propagating `None` and logging the user out on every request.
+    let current_salt = record.authenticatable_salt().unwrap_or_default();
     if !devise_rust::crypto::secure_compare(&current_salt, stored_salt) {
         proxy.session_store().remove(&session_key).await;
         return None;
@@ -389,7 +399,7 @@ fn apply_remember_ops<ResBody>(
     let Ok(key) = crate::remember::derive_remember_key(config) else {
         return;
     };
-    for header in crate::remember::ops_as_set_cookie_headers(&key, ops) {
+    for header in crate::remember::ops_as_set_cookie_headers(&key, config, ops) {
         if let Ok(value) = HeaderValue::from_str(&header) {
             response.headers_mut().append(header::SET_COOKIE, value);
         }
@@ -456,6 +466,10 @@ pub fn session_manager_layer_with_secure(
     config: &DeviseConfig,
     secure: bool,
 ) -> Result<SessionManagerLayer<MemoryStore, SignedCookie>, DeviseError> {
+    // Devise's `raise_no_secret_key` boot contract: the canonical
+    // actionable error for an EMPTY secret, before the derivation's
+    // length guard.
+    config.validate()?;
     let key = crate::callbacks::derive_session_key(&config.secret_key)?;
     Ok(SessionManagerLayer::new(MemoryStore::default())
         .with_same_site(SameSite::Lax)
@@ -470,7 +484,12 @@ pub fn session_manager_layer_with_secure(
 /// `Cookie` header, and the query string feeds both `params` and `query`
 /// (matching the actix bridge). The peer address comes from
 /// `ConnectInfo<SocketAddr>` only — never a proxy header (D-20).
-fn build_auth_request<ReqBody>(req: &Request<ReqBody>, config: &DeviseConfig) -> AuthRequest {
+///
+/// Params authentication defaults OFF (S4): Devise sets
+/// `env["devise.allow_params_authentication"]` only from sessions#create's
+/// `allow_params_authentication!` `before_action`, so the layer leaves the
+/// flag down and the sessions controller opts in.
+fn build_auth_request<ReqBody>(req: &Request<ReqBody>) -> AuthRequest {
     let method = HttpMethod::from_str(req.method().as_str()).unwrap_or(HttpMethod::Get);
     let path = req.uri().path().to_string();
 
@@ -503,7 +522,15 @@ fn build_auth_request<ReqBody>(req: &Request<ReqBody>, config: &DeviseConfig) ->
     let query = params.clone();
 
     let flags = RequestFlags {
-        allow_params_authentication: config.params_authenticatable,
+        // S4: params authentication defaults OFF. Devise sets
+        // `env["devise.allow_params_authentication"]` ONLY from
+        // sessions#create's `allow_params_authentication!` before_action
+        // (`sessions_controller.rb:5`); defaulting it from
+        // `Devise.params_authenticatable` on every request let guarded
+        // routes authenticate `?user_email=…&user_password=…` —
+        // credentials leaking into URLs, proxies, and access logs. The
+        // sessions controller opts in below.
+        allow_params_authentication: false,
         ..RequestFlags::default()
     };
 

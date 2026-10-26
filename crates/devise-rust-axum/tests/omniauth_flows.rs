@@ -310,10 +310,16 @@ async fn callback_round_trip_signs_in_with_success_flash() {
         "after_sign_in_path_for resolves the scope root"
     );
     let flash = flash_cookie(&response);
+    // M-flash: ONE flash format everywhere — the BARE I18n key
+    // (`devise.omniauth_callbacks.success`), carried in the SIGNED
+    // envelope (S11) shared with the controllers.
     assert!(
-        flash.contains("Successfully%20authenticated%20from%20Stub%20account")
-            || flash.contains("Successfully authenticated from Stub account"),
-        "success flash rides the devise.flash cookie: {flash}"
+        common::flash_keys_from_cookies(
+            std::slice::from_ref(&flash),
+            &state.config
+        )
+        .contains(&"omniauth_callbacks.success".to_string()),
+        "success flash rides the signed devise.flash cookie: {flash}"
     );
 
     // The identity row exists (provider + uid persisted, D-11).
@@ -409,7 +415,7 @@ async fn unverified_email_collision_creates_new_and_never_links() {
 
 #[tokio::test]
 async fn callback_without_state_fails_closed() {
-    let (_state, app, _stub_addr) = omniauth_app(StubProfile::default()).await;
+    let (state, app, _stub_addr) = omniauth_app(StubProfile::default()).await;
 
     let mut jar = Jar::new();
     let _ = authorize(&app, &mut jar).await;
@@ -426,20 +432,19 @@ async fn callback_without_state_fails_closed() {
         "failure redirects to after_omniauth_failure_path_for"
     );
     let flash = flash_cookie(&response);
+    // M-flash: the failure path carries the BARE
+    // `devise.omniauth_callbacks.failure` key in the SIGNED envelope —
+    // one flash format everywhere.
     assert!(
-        flash.contains("Could%20not%20authenticate%20you%20from%20Stub%20because")
-            || flash.contains("Could not authenticate you from Stub because"),
-        "failure flash renders the en.yml template: {flash}"
-    );
-    assert!(
-        flash.contains("Invalid%20state") || flash.contains("Invalid state"),
-        "missing state reason is symbolic: {flash}"
+        common::flash_keys_from_cookies(std::slice::from_ref(&flash), &state.config)
+            .contains(&"omniauth_callbacks.failure".to_string()),
+        "failure flash rides the signed devise.flash cookie: {flash}"
     );
 }
 
 #[tokio::test]
 async fn callback_with_mismatched_state_fails_closed() {
-    let (_state, app, _stub_addr) = omniauth_app(StubProfile::default()).await;
+    let (state, app, _stub_addr) = omniauth_app(StubProfile::default()).await;
 
     let mut jar = Jar::new();
     let _ = authorize(&app, &mut jar).await;
@@ -460,14 +465,15 @@ async fn callback_with_mismatched_state_fails_closed() {
     );
     let flash = flash_cookie(&response);
     assert!(
-        flash.contains("Invalid%20state") || flash.contains("Invalid state"),
-        "mismatched state reason: {flash}"
+        common::flash_keys_from_cookies(std::slice::from_ref(&flash), &state.config)
+            .contains(&"omniauth_callbacks.failure".to_string()),
+        "mismatched state surfaces as the bare omniauth_callbacks.failure key: {flash}"
     );
 }
 
 #[tokio::test]
 async fn pkce_verifier_mismatch_fails_closed() {
-    let (_state, app, stub_addr) = omniauth_app(StubProfile::default()).await;
+    let (app_state, app, stub_addr) = omniauth_app(StubProfile::default()).await;
 
     // A REAL authorize stashes the app's verifier + state.
     let mut jar = Jar::new();
@@ -516,8 +522,9 @@ async fn pkce_verifier_mismatch_fails_closed() {
     );
     let flash = flash_cookie(&response);
     assert!(
-        flash.contains("Token%20exchange%20failed") || flash.contains("Token exchange failed"),
-        "PKCE mismatch surfaces as the symbolic exchange failure: {flash}"
+        common::flash_keys_from_cookies(std::slice::from_ref(&flash), &app_state.config)
+            .contains(&"omniauth_callbacks.failure".to_string()),
+        "PKCE mismatch surfaces as the bare omniauth_callbacks.failure key: {flash}"
     );
 }
 
@@ -562,9 +569,9 @@ async fn post_callback_variant_completes_the_exchange() {
     assert_eq!(response.status(), StatusCode::FOUND);
     let flash = flash_cookie(&response);
     assert!(
-        flash.contains("Successfully%20authenticated%20from%20Stub%20account")
-            || flash.contains("Successfully authenticated from Stub account"),
-        "POST callback signs in with the success flash: {flash}"
+        common::flash_keys_from_cookies(std::slice::from_ref(&flash), &state.config)
+            .contains(&"omniauth_callbacks.success".to_string()),
+        "POST callback signs in with the bare success flash key: {flash}"
     );
     assert!(
         find_by_identity(&state, "stub-uid-1").await.is_some(),

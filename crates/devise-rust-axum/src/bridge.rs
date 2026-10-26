@@ -192,6 +192,10 @@ fn cycle_error(e: tower_sessions::session::Error) -> DeviseError {
 /// Insert the warden `[key, salt]` payload for a scope (shared by every
 /// insert-shaped transition; the cycle call sites stay literal in each
 /// public helper so the D-04 paths grep cleanly).
+///
+/// Routes through [`TowerSessionStore::insert_value`] so the session-resident
+/// key index tracks the payload (L-fix: a raw `Session::insert_value` here
+/// left the payload invisible to `keys_with_prefix`/`remove_prefix`).
 async fn insert_warden_payload(
     session: &Session,
     scope: &str,
@@ -200,10 +204,9 @@ async fn insert_warden_payload(
 ) -> Result<(), DeviseError> {
     let session_key = keys::scope_session_key(scope);
     let session_value = serde_json::json!([key.to_string(), salt]);
-    session
-        .insert_value(&session_key, session_value)
-        .await
-        .map_err(|e| DeviseError::Internal(format!("session insert failed: {e}")))?;
+    TowerSessionStore::new(session.clone())
+        .insert_value(session_key.as_str(), session_value)
+        .await;
     Ok(())
 }
 
@@ -272,7 +275,8 @@ pub async fn account_update_and_renew(
 }
 
 /// Remove the warden session payload for a scope on the SIGN-OUT path,
-/// cycling the session id first (D-04).
+/// cycling the session id first (D-04). The removal rides the bridge store
+/// so the key index stays consistent (L-fix).
 ///
 /// # Errors
 ///
@@ -281,8 +285,8 @@ pub async fn account_update_and_renew(
 pub async fn sign_out_and_renew(session: &Session, scope: &str) -> Result<(), DeviseError> {
     // D-04 sign-out cycle call site: fires BEFORE the key removal.
     session.cycle_id().await.map_err(cycle_error)?;
-    let session_key = keys::scope_session_key(scope);
-    let _ = session.remove_value(&session_key).await;
+    let store = TowerSessionStore::new(session.clone());
+    store.remove(keys::scope_session_key(scope).as_str()).await;
     Ok(())
 }
 
@@ -305,11 +309,14 @@ pub async fn handle_unverified_request(
     session: &Session,
     scopes: &[String],
 ) -> Result<(), DeviseError> {
+    // Removals ride the bridge store so the key index stays consistent
+    // (L-fix).
+    let store = TowerSessionStore::new(session.clone());
     for scope in scopes {
-        let session_key = keys::scope_session_key(scope);
-        let _ = session.remove_value(&session_key).await;
-        let tick_key = devise_rust::timeoutable::last_request_at_key(scope);
-        let _ = session.remove_value(&tick_key).await;
+        store.remove(keys::scope_session_key(scope).as_str()).await;
+        store
+            .remove(devise_rust::timeoutable::last_request_at_key(scope).as_str())
+            .await;
     }
     session.cycle_id().await.map_err(cycle_error)
 }
@@ -324,11 +331,14 @@ pub async fn handle_unverified_request(
 /// best-effort); the signature stays fallible for symmetry with the other
 /// bridge transitions.
 pub async fn expire_devise_data(session: &Session, scopes: &[String]) -> Result<(), DeviseError> {
+    // Removals ride the bridge store so the key index stays consistent
+    // (L-fix).
+    let store = TowerSessionStore::new(session.clone());
     for scope in scopes {
-        let session_key = keys::scope_session_key(scope);
-        let _ = session.remove_value(&session_key).await;
-        let tick_key = devise_rust::timeoutable::last_request_at_key(scope);
-        let _ = session.remove_value(&tick_key).await;
+        store.remove(keys::scope_session_key(scope).as_str()).await;
+        store
+            .remove(devise_rust::timeoutable::last_request_at_key(scope).as_str())
+            .await;
     }
     Ok(())
 }
@@ -336,8 +346,12 @@ pub async fn expire_devise_data(session: &Session, scopes: &[String]) -> Result<
 /// Remove the warden session payload for every scope on the
 /// SIGN-OUT-ALL-SCOPES path, cycling the session id first (D-04).
 ///
-/// Closes the core gap where `AuthProxy::sign_out_all_scopes` removes
-/// without renewal (proxy.rs sign-out-all path).
+/// S2: the sweep carries Devise's `expire_data_after_sign_in!` shape — per
+/// scope the warden payload AND the timeoutable `last_request_at` tick both
+/// go (Devise iterates every registered mapping,
+/// `controllers/sign_in_out.rb:86-95`); the old bridge removed only the
+/// session keys and leaked the ticks. Callers derive the scope list from
+/// the scope registry (see [`crate::routes`]).
 ///
 /// # Errors
 ///
@@ -349,9 +363,12 @@ pub async fn sign_out_all_scopes_and_renew(
 ) -> Result<(), DeviseError> {
     // D-04 sign-out-all cycle call site: fires BEFORE the removals.
     session.cycle_id().await.map_err(cycle_error)?;
+    let store = TowerSessionStore::new(session.clone());
     for scope in scopes {
-        let session_key = keys::scope_session_key(scope);
-        let _ = session.remove_value(&session_key).await;
+        store.remove(keys::scope_session_key(scope).as_str()).await;
+        store
+            .remove(devise_rust::timeoutable::last_request_at_key(scope).as_str())
+            .await;
     }
     Ok(())
 }
@@ -375,13 +392,17 @@ pub async fn read_last_request_at(
 }
 
 /// Write the integer-epoch `last_request_at` tick for a scope (D-06).
+///
+/// Routes through [`TowerSessionStore::insert_value`] so the key index
+/// tracks the tick (L-fix) — prefix sweeps like the omniauth-stash cleanup
+/// enumerate through the index.
 pub async fn tick_last_request_at(
     session: &Session,
     scope: &str,
     clock: &dyn devise_rust::time::Clock,
 ) {
     let epoch = clock.now().timestamp();
-    let _ = session
+    TowerSessionStore::new(session.clone())
         .insert_value(
             &devise_rust::timeoutable::last_request_at_key(scope),
             serde_json::Value::Number(serde_json::Number::from(epoch)),

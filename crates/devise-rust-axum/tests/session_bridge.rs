@@ -986,8 +986,11 @@ async fn failure_split_navigational_302_api_401() {
         .get_all(header::SET_COOKIE)
         .iter()
         .any(|v| {
-            v.to_str()
-                .is_ok_and(|c| c.contains("devise.flash=unauthenticated"))
+            v.to_str().is_ok_and(|c| {
+                // S11: the flash value is a signed envelope over the bare
+                // key — the name still prefixes the cookie.
+                c.split(';').next().unwrap_or_default().starts_with("devise.flash=")
+            })
         });
     assert!(has_flash, "navigational failures carry the flash cookie");
 
@@ -1014,7 +1017,7 @@ async fn failure_split_navigational_302_api_401() {
 }
 
 /// http_auth-eligible failures render 401 with the `WWW-Authenticate:
-/// Basic realm=...` challenge from config.
+/// Basic realm="..."` challenge from config (RFC 7235 quoted realm).
 #[tokio::test]
 async fn http_auth_failure_carries_www_authenticate_challenge() {
     let config = DeviseConfig {
@@ -1044,7 +1047,35 @@ async fn http_auth_failure_carries_www_authenticate_challenge() {
             .headers()
             .get(header::WWW_AUTHENTICATE)
             .and_then(|v| v.to_str().ok()),
-        Some("Basic realm=Application")
+        Some("Basic realm=\"Application\"")
+    );
+}
+
+/// S4 (security audit): query-string credentials must NOT authenticate a
+/// guarded route. Devise enables params authentication ONLY inside
+/// sessions#create (`allow_params_authentication!`,
+/// `sessions_controller.rb:5`); the layer defaulting the request flag
+/// from `Devise.params_authenticatable` on EVERY request let any
+/// `RequireAuth` route authenticate `?user_email=…&user_password=…` —
+/// credentials leaking into URLs, proxies, and access logs.
+#[tokio::test]
+async fn query_credentials_do_not_authenticate_guarded_routes() {
+    let app = tracer_app().await;
+    // The seeded tracer user's password IS "password123": if the params
+    // strategy ran, this request would authenticate (200). It must not.
+    let mut probe = Request::builder()
+        .method(Method::GET)
+        .uri("/users/dashboard?user_email=tracer@example.com&user_password=password123")
+        .body(Body::empty())
+        .expect("request");
+    probe
+        .headers_mut()
+        .insert(header::ACCEPT, axum::http::HeaderValue::from_static("application/json"));
+    let response = app.oneshot(probe).await.expect("oneshot");
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "query-string credentials must never authenticate a guarded route"
     );
 }
 

@@ -1,5 +1,26 @@
 //! devise-rust-axum — Axum integration for devise-rust
 //!
+//! > ## ⚠️ CSRF: you MUST mount CSRF protection yourself
+//! >
+//! > **This crate does not verify request origins or CSRF tokens.** It
+//! > signs and rotates a session-resident CSRF *token*
+//! > ([`rotate_csrf_token`], honoring `clean_up_csrf_token_on_authentication`)
+//! > but never *checks* it — Devise delegates that to the host framework,
+//! > and axum ships no built-in equivalent. You MUST:
+//! >
+//! > 1. mount a CSRF middleware (e.g. `tower-http`'s CSRF layer, or a
+//! >    signed double-submit cookie scheme) across every state-changing
+//! >    route this crate registers — sign-in, sign-up, password reset,
+//! >    confirmation, unlock, account update, and the omniauth authorize
+//! >    POST; and
+//! > 2. wire [`bridge::handle_unverified_request`] into that
+//! >    middleware's **failure path**, so a rejected request signs out
+//! >    every scope and cycles the session id exactly like Devise's
+//! >    `handle_unverified_request` (`controllers/helpers.rb:254-260`).
+//! >
+//! > Without (2), a survived CSRF failure keeps the pre-check session
+//! > authenticated — the fixation window Devise's override closes.
+//!
 //! Tower-sessions bridge, tower layer, extractors, failure renderer, and
 //! route registration mapping devise-rust core's framework-neutral auth
 //! surface onto axum 0.8's request pipeline.
@@ -94,8 +115,8 @@ pub mod test_helpers;
 
 pub use bridge::{
     TowerSessionStore, account_update_and_renew, bypass_sign_in_and_renew,
-    insert_session_and_renew, read_last_request_at, sign_out_all_scopes_and_renew,
-    sign_out_and_renew, tick_last_request_at,
+    handle_unverified_request, insert_session_and_renew, read_last_request_at,
+    sign_out_all_scopes_and_renew, sign_out_and_renew, tick_last_request_at,
 };
 pub use callbacks::{csrf_token_key, derive_session_key, rotate_csrf_token};
 pub use extractors::{
@@ -104,7 +125,7 @@ pub use extractors::{
     current_scope_record, current_user, group_signed_in, require_no_authentication, scope_session,
     scope_signed_in, user_session, user_signed_in,
 };
-pub use failure::AxumFailureRenderer;
+pub use failure::{AxumFailureRenderer, FlashRead, take_flash, verified_flash_value};
 pub use layer::{
     AuthProxyHandle, DeviseLayer, session_manager_layer, session_manager_layer_with_secure,
 };

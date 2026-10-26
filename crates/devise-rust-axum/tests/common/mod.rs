@@ -126,6 +126,29 @@ impl OrmAdapter<FixtureUser> for IdAssigningAdapter {
     }
 }
 
+/// DBAU-07 observability: emails whose sign-in fired
+/// `after_database_authentication`. Keyed by email so concurrent tests with
+/// fresh fixtures never race on one shared flag.
+pub static AFTER_DB_AUTH_SEEN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Record one `after_database_authentication` firing (see
+/// [`AFTER_DB_AUTH_SEEN`]).
+pub fn record_after_db_auth(email: &str) {
+    if let Ok(mut seen) = AFTER_DB_AUTH_SEEN.lock() {
+        seen.insert(email.to_string());
+    }
+}
+
+/// Whether `after_database_authentication` fired for `email` since the last
+/// reset.
+pub fn after_db_auth_fired(email: &str) -> bool {
+    AFTER_DB_AUTH_SEEN
+        .lock()
+        .is_ok_and(|seen| seen.contains(email))
+}
+
 /// Full-module fixture user: every Devise module trait implemented so the
 /// route matrix can exercise all five controllers against one model.
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -153,6 +176,9 @@ pub struct FixtureUser {
     pub failed_attempts: u32,
     pub unlock_token: Option<String>,
     pub locked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Sign-in identity under a non-default `authentication_keys` config
+    /// (the M-fix matrix: `authentication_keys = ["username"]`).
+    pub username: Option<String>,
     /// Omniauthable identity pair (D-11): the provider name + uid the
     /// default linking policy reads and writes.
     pub provider: Option<String>,
@@ -226,6 +252,12 @@ impl AnyDeviseModel for FixtureUser {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// DBAU-07 observability: record that the sign-in path fired Devise's
+    /// `after_database_authentication` hook for this record's email.
+    fn after_database_authentication(&self) {
+        record_after_db_auth(&self.email);
     }
 
     fn rememberable_value_opt(&self) -> Option<String> {
@@ -317,6 +349,16 @@ impl DatabaseAuthenticatable for FixtureUser {
     fn assign_attributes(&mut self, attrs: &serde_json::Map<String, JsonValue>) {
         if let Some(JsonValue::String(email)) = attrs.get("email") {
             email.clone_into(&mut self.email);
+        }
+        // Mass-assignment probes (S7): a model whose assign_attributes
+        // persists these columns must never see them from a Devise
+        // controller — the ParameterSanitizer drops them first.
+        if let Some(JsonValue::String(unconfirmed)) = attrs.get("unconfirmed_email") {
+            self.unconfirmed_email = Some(unconfirmed.clone());
+        }
+        if let Some(JsonValue::Number(attempts)) = attrs.get("failed_attempts") {
+            self.failed_attempts =
+                u32::try_from(attempts.as_u64().unwrap_or_default()).unwrap_or_default();
         }
     }
 }
@@ -538,8 +580,13 @@ impl devise_rust::omniauthable::Omniauthable for FixtureUser {
         Self: Sized,
         A: devise_rust::adapter::OrmAdapter<Self, New = Self::New> + Send + Sync,
     {
-        let mut outcome =
-            devise_rust::omniauthable::default_from_omniauth(adapter, &profile, &devise_rust::config::DeviseConfig::default(), clock).await;
+        let mut outcome = devise_rust::omniauthable::default_from_omniauth(
+            adapter,
+            &profile,
+            &devise_rust::config::DeviseConfig::default(),
+            clock,
+        )
+        .await;
         // Devise's canonical from_omniauth pattern: a provider-verified
         // identity is confirmed on creation (one home: core helper).
         if outcome.is_valid() {
@@ -573,7 +620,28 @@ impl devise_rust::omniauthable::Omniauthable for FixtureUser {
     }
 }
 
-/// Test configuration: fast `stretches`, fixed 32-byte secret.
+/// Verify every signed `devise.flash` cookie value among captured
+/// `Set-Cookie` pairs, returning the bare flash keys that verified (S11:
+/// the cookie value is a MAC-prefixed signed envelope over the bare I18n
+/// key — exactly the core `devise.*` message stems, never rendered copy).
+pub fn flash_keys_from_cookies(cookies: &[String], config: &DeviseConfig) -> Vec<String> {
+    let key = devise_rust_axum::callbacks::derive_session_key(&config.secret_key)
+        .expect("flash key derives");
+    cookies
+        .iter()
+        .filter_map(|pair| {
+            let value = pair.strip_prefix("devise.flash=")?;
+            let value = value.split(';').next()?;
+            let mut jar = cookie::CookieJar::new();
+            jar.add_original(cookie::Cookie::new("devise.flash", value.to_string()));
+            jar.signed(&key)
+                .get("devise.flash")
+                .map(|cookie| cookie.value().to_string())
+        })
+        .collect()
+}
+
+/// The test configuration with fast `stretches` (4) and a fixed 32-byte secret.
 pub fn test_config() -> DeviseConfig {
     DeviseConfig {
         secret_key: "test-secret-key-for-testing-only-32-bytes-min".to_string(),
@@ -632,8 +700,10 @@ pub fn test_state(mapping: Mapping) -> TestState {
 
 /// Same as [`test_state`] with an explicit config.
 pub fn test_state_with_config(mapping: Mapping, config: DeviseConfig) -> TestState {
+    let registry = registry_with(std::slice::from_ref(&mapping));
     DeviseWebState::new(
         mapping,
+        registry,
         Arc::new(config),
         Arc::new(IdAssigningAdapter::new()),
         Arc::new(TestMailer::default()),
@@ -770,6 +840,71 @@ pub fn build_app(state: TestState) -> (TestState, Router) {
 }
 
 // ============================================================================
+// Two-scope app (S2 / M-fix matrix): sibling `admin` mapping over the SAME
+// FixtureUser model + adapter, for the registry-derived sign-out-all and
+// the all-scopes `verify_signed_out_user` behavior.
+// ============================================================================
+
+/// The sibling `admin` mapping over the fixture user.
+pub fn admin_mapping() -> Mapping {
+    Mapping {
+        name: "admin".to_string(),
+        class_name: "FixtureUser".to_string(),
+        path: "admins".to_string(),
+        singular: "admin".to_string(),
+        ..default_mapping()
+    }
+}
+
+/// Wired TWO-scope app: `user` + `admin` devise mounts sharing one adapter
+/// and config, both behind the same `DeviseLayer` (registry carries both).
+pub fn build_two_scope_app() -> (TestState, Router) {
+    let user_mapping = default_mapping();
+    let admin_mapping = admin_mapping();
+    let config = Arc::new(test_config());
+    let adapter = Arc::new(IdAssigningAdapter::new());
+    let mailer = Arc::new(TestMailer::default());
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+    let registry = registry_with(&[user_mapping.clone(), admin_mapping.clone()]);
+    let state_user = DeviseWebState::new(
+        user_mapping.clone(),
+        registry.clone(),
+        config.clone(),
+        adapter.clone(),
+        mailer.clone(),
+        clock.clone(),
+    )
+    .expect("user state builds");
+    let state_admin = DeviseWebState::new(
+        admin_mapping.clone(),
+        registry.clone(),
+        config.clone(),
+        adapter.clone(),
+        mailer.clone(),
+        clock.clone(),
+    )
+    .expect("admin state builds");
+
+    let mut hooks = HookRegistry::new();
+    devise_rust::hooks::register_devise_hooks(&mut hooks, &state_user.mapping);
+
+    let finder: Arc<dyn ModelFinder> = Arc::new(AdapterBridge::new(adapter.as_ref().clone()));
+    let devise_layer = DeviseLayer::new(registry, config.clone())
+        .with_hooks(Arc::new(hooks))
+        .with_finder("user", finder.clone())
+        .with_finder("admin", finder.clone());
+    let session_layer = session_manager_layer(&config).expect("session layer builds");
+
+    let app = Router::new()
+        .merge(devise_for_router(state_user.clone()))
+        .merge(devise_for_router(state_admin.clone()))
+        .layer(devise_layer)
+        .layer(session_layer);
+    (state_user, app)
+}
+
+// ============================================================================
 // Omniauth flow fixtures (09-04): the omniauthable mapping variant, the
 // provider-allowlist config, and the omniauth-aware wired app.
 // ============================================================================
@@ -804,8 +939,10 @@ pub fn build_omniauth_app(
     config: DeviseConfig,
     providers: std::collections::HashMap<String, devise_rust::omniauthable::OAuthProviderConfig>,
 ) -> (TestState, Router) {
+    let registry = registry_with(std::slice::from_ref(&mapping));
     let state = DeviseWebState::new(
         mapping,
+        registry,
         Arc::new(config),
         Arc::new(IdAssigningAdapter::new()),
         Arc::new(TestMailer::default()),

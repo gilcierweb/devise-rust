@@ -86,32 +86,57 @@ pub fn cookie_for_set(value: &str, attrs: &RememberableCookieAttrs) -> Cookie<'s
 }
 
 /// Build the tombstone cookie for a `Clear` op (Devise `cookies.delete`).
+///
+/// S9: the tombstone carries the SAME path/domain/secure attributes the
+/// Set rendered from `rememberable_options` — a `Path=/` tombstone never
+/// deletes a cookie scoped to `/app`, which would leave a live remember
+/// login in the browser after sign-out.
 #[must_use]
-pub fn removal_cookie(name: &str) -> Cookie<'static> {
+pub fn removal_cookie(name: &str, config: &DeviseConfig) -> Cookie<'static> {
+    let path = config
+        .rememberable_options
+        .get("path")
+        .cloned()
+        .unwrap_or_else(|| "/".to_string());
     let mut cookie = Cookie::build((name.to_string(), String::new()))
-        .path("/".to_string())
+        .path(path)
         .build();
+    if let Some(domain) = config.rememberable_options.get("domain") {
+        cookie.set_domain(domain.clone());
+    }
+    if devise_rust::rememberable::cookie_secure_flag(config) {
+        cookie.set_secure(true);
+    }
     cookie.make_removal();
     cookie
 }
 
 /// Execute one core [`RememberCookieOp`] against the signed jar: `Set`
-/// signs the hardened cookie, `Clear` signs the tombstone.
-pub fn apply_op<J: BorrowMut<CookieJar>>(jar: &mut SignedJar<J>, op: &RememberCookieOp) {
+/// signs the hardened cookie, `Clear` signs the tombstone (S9: the
+/// tombstone carries the config's path/domain/secure attributes).
+pub fn apply_op<J: BorrowMut<CookieJar>>(
+    jar: &mut SignedJar<J>,
+    op: &RememberCookieOp,
+    config: &DeviseConfig,
+) {
     match op {
         RememberCookieOp::Set { value, attrs, .. } => {
             jar.add(cookie_for_set(value, attrs));
         }
         RememberCookieOp::Clear { key, .. } => {
-            jar.add(removal_cookie(key));
+            jar.add(removal_cookie(key, config));
         }
     }
 }
 
 /// Execute every op in order against the signed jar.
-pub fn apply_ops<J: BorrowMut<CookieJar>>(jar: &mut SignedJar<J>, ops: &[RememberCookieOp]) {
+pub fn apply_ops<J: BorrowMut<CookieJar>>(
+    jar: &mut SignedJar<J>,
+    ops: &[RememberCookieOp],
+    config: &DeviseConfig,
+) {
     for op in ops {
-        apply_op(jar, op);
+        apply_op(jar, op, config);
     }
 }
 
@@ -121,11 +146,16 @@ pub fn apply_ops<J: BorrowMut<CookieJar>>(jar: &mut SignedJar<J>, ops: &[Remembe
 /// One fresh `CookieJar` per call: each op signs onto the jar, and the
 /// delta renders as the header strings the response carries. The Key is
 /// handed in already derived (the layer derives once per response that has
-/// ops); the secret only ever crosses module boundaries as bytes.
+/// ops); the secret only ever crosses module boundaries as bytes. The
+/// config drives the `Clear` tombstone's path/domain/secure (S9).
 #[must_use]
-pub fn ops_as_set_cookie_headers(key: &Key, ops: &[RememberCookieOp]) -> Vec<String> {
+pub fn ops_as_set_cookie_headers(
+    key: &Key,
+    config: &DeviseConfig,
+    ops: &[RememberCookieOp],
+) -> Vec<String> {
     let mut jar = CookieJar::new();
-    apply_ops(&mut jar.signed_mut(key), ops);
+    apply_ops(&mut jar.signed_mut(key), ops, config);
     jar.delta().map(ToString::to_string).collect()
 }
 

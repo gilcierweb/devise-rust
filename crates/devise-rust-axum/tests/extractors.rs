@@ -253,6 +253,57 @@ async fn bridge_sign_out_user(Extension(session): Extension<Session>) -> StatusC
     StatusCode::OK
 }
 
+/// Sign out EVERY scope the registry carries (the registry-derived
+/// `Devise.sign_out_all_scopes` shape, `helpers.rb:86-95`) — exercising the
+/// bridge's sweep from the test app.
+async fn bridge_sign_out_all(Extension(session): Extension<Session>) -> StatusCode {
+    let scopes = vec!["user".to_string(), "admin".to_string()];
+    devise_rust_axum::sign_out_all_scopes_and_renew(&session, &scopes)
+        .await
+        .expect("sign out all");
+    StatusCode::OK
+}
+
+/// Bridge dump: the key-index state the bridge maintains (`_devise_rust_session_keys`)
+async fn bridge_dump(session: Session) -> axum::Json<serde_json::Value> {
+    use devise_rust::session::SessionStore as _;
+    let store = devise_rust_axum::TowerSessionStore::new(session);
+    let warden_keys = store.keys_with_prefix("warden.").await;
+    let user_payload = store
+        .get_value(&devise_rust::session::keys::scope_session_key("user"))
+        .await;
+    let admin_payload = store
+        .get_value(&devise_rust::session::keys::scope_session_key("admin"))
+        .await;
+    let user_tick = store
+        .get_value(&devise_rust::timeoutable::last_request_at_key("user"))
+        .await;
+    let admin_tick = store
+        .get_value(&devise_rust::timeoutable::last_request_at_key("admin"))
+        .await;
+    let index = store
+        .get_value(devise_rust_axum::bridge::KEY_INDEX)
+        .await;
+    axum::Json(serde_json::json!({
+        "warden_keys": warden_keys,
+        "user_payload": user_payload,
+        "admin_payload": admin_payload,
+        "user_tick": user_tick,
+        "admin_tick": admin_tick,
+        "index": index,
+    }))
+}
+
+/// Seed the timeoutable `last_request_at` ticks for both scopes directly
+/// through the bridge (the sweep test needs ticks present BEFORE a
+/// sign-out-all).
+async fn bridge_seed_ticks(session: Session) -> StatusCode {
+    let clock = devise_rust::time::SystemClock;
+    devise_rust_axum::tick_last_request_at(&session, "user", &clock).await;
+    devise_rust_axum::tick_last_request_at(&session, "admin", &clock).await;
+    StatusCode::OK
+}
+
 /// Build the extractor test app: devise + session layers over the probe
 /// routes, with `state` shared into the test-only bridge routes.
 fn test_app(state: Arc<TestAppState>) -> Router {
@@ -279,6 +330,9 @@ fn test_app(state: Arc<TestAppState>) -> Router {
         .route("/devise-test/sign-in", get(bridge_sign_in))
         .route("/devise-test/admin-sign-in", get(bridge_sign_in_admin))
         .route("/devise-test/sign-out-user", get(bridge_sign_out_user))
+        .route("/devise-test/sign-out-all", get(bridge_sign_out_all))
+        .route("/devise-test/seed-ticks", get(bridge_seed_ticks))
+        .route("/devise-test/bridge-dump", get(bridge_dump))
         .with_state(state)
         .layer(devise_layer)
         .layer(session_layer)
@@ -317,6 +371,24 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("json body")
 }
 
+/// Verify the signed `devise.flash` cookie values among captured
+/// `Set-Cookie` pairs (S11): returns the bare flash keys that verified.
+fn flash_keys(cookies: &[String], config: &DeviseConfig) -> Vec<String> {
+    let key =
+        devise_rust_axum::callbacks::derive_session_key(&config.secret_key).expect("key derives");
+    cookies
+        .iter()
+        .filter_map(|pair| {
+            let value = pair.strip_prefix("devise.flash=")?.split(';').next()?;
+            let mut jar = cookie::CookieJar::new();
+            jar.add_original(cookie::Cookie::new("devise.flash", value.to_string()));
+            jar.signed(&key)
+                .get("devise.flash")
+                .map(|cookie| cookie.value().to_string())
+        })
+        .collect()
+}
+
 /// Anonymous navigational request: 302 to the mapping's `sign_in_path`
 /// with the `unauthenticated` flash; the GET target is remembered via
 /// `store_location!` (replayed probe reads it back).
@@ -340,10 +412,8 @@ async fn anonymous_html_redirects_with_flash_and_stored_location() {
     );
     let cookies = set_cookie_pairs(&response);
     assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=unauthenticated")),
-        "flash cookie carries the unauthenticated key: {cookies:?}"
+        flash_keys(&cookies, &state.config).contains(&"unauthenticated".to_string()),
+        "flash cookie carries the signed unauthenticated key: {cookies:?}"
     );
 
     // store_location wrote the session: replay the cookie into the probe.
@@ -590,4 +660,208 @@ async fn strict_auth_reuses_the_layer_memo() {
     let user: AuthUser =
         serde_json::from_value(body_json(response).await).expect("typed user body");
     assert_eq!(user.email, "memo@example.com");
+}
+
+/// S6 (security audit): a record whose `authenticatable_salt` is empty
+/// (models without `encrypted_password`) must stay signed in — the fetch
+/// compares the stored `""` salt against the record's `""` salt instead of
+/// propagating `None` and logging the user out on every request.
+#[tokio::test]
+async fn saltless_record_session_fetch_stays_signed_in() {
+    let state = Arc::new(TestAppState::new());
+    state
+        .user_adapter
+        .create(AuthUser {
+            id: 1,
+            email: "saltless@example.com".to_string(),
+            encrypted_password: String::new(),
+        })
+        .await
+        .expect("seed saltless user");
+
+    let app = test_app(state);
+    // The bridge bypass writes the `session_pair()` payload — `""` salt for
+    // a salt-less record — exactly what a sign-in would persist.
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/devise-test/sign-in",
+            "text/html",
+            None,
+        ))
+        .await
+        .expect("bridge sign in");
+    let cookies = set_cookie_pairs(&response).join("; ");
+
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/users/private",
+            "text/html",
+            Some(&cookies),
+        ))
+        .await
+        .expect("strict");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a salt-less record must stay signed in across requests"
+    );
+    let user: AuthUser =
+        serde_json::from_value(body_json(response).await).expect("typed user body");
+    assert_eq!(user.email, "saltless@example.com");
+}
+
+/// L-fix (security audit): the bridge's session writes must route through
+/// `TowerSessionStore` so the session-resident key index tracks every
+/// `warden.*` key it inserts — `insert_warden_payload` bypassed
+/// `index_insert`, so `keys_with_prefix` never saw the payloads and the
+/// index never stayed consistent.
+#[tokio::test]
+async fn warden_keys_are_tracked_in_the_bridge_index() {
+    let state = Arc::new(TestAppState::new());
+    state.seed_user(1, "indexed@example.com").await;
+    state.seed_admin(1, "admin@example.com").await;
+    let app = test_app(state);
+
+    // Bridge sign-in for both scopes.
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/devise-test/sign-in",
+            "text/html",
+            None,
+        ))
+        .await
+        .expect("sign in");
+    let cookies = set_cookie_pairs(&response).join("; ");
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/devise-test/admin-sign-in",
+            "text/html",
+            Some(&cookies),
+        ))
+        .await
+        .expect("admin sign in");
+    let cookies = set_cookie_pairs(&response).join("; ");
+
+    let dump = body_json(
+        app.clone()
+            .oneshot(request(
+                Method::GET,
+                "/devise-test/bridge-dump",
+                "text/html",
+                Some(&cookies),
+            ))
+            .await
+            .expect("dump"),
+    )
+    .await;
+    let warden_keys: Vec<String> = dump["warden_keys"]
+        .as_array()
+        .map(|keys| {
+            keys.iter()
+                .map(|key| key.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        warden_keys.len(),
+        2,
+        "both scopes' warden payloads must be index-tracked: {dump}"
+    );
+    assert!(!dump["user_payload"].is_null(), "user payload present");
+    assert!(!dump["admin_payload"].is_null(), "admin payload present");
+}
+
+/// S2 (security audit): `sign_out_all_scopes` must sweep EVERY registry
+/// scope's warden payload AND the timeoutable `last_request_at` ticks
+/// (Devise iterates `Devise.mappings.keys`,
+/// `controllers/sign_in_out.rb:86-95`); the old bridge removed only the
+/// listed scopes' session keys and never swept the ticks.
+#[tokio::test]
+async fn sign_out_all_sweeps_every_scope_payload_and_tick() {
+    let state = Arc::new(TestAppState::new());
+    state.seed_user(1, "sweep@example.com").await;
+    state.seed_admin(1, "admin-sweep@example.com").await;
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/devise-test/sign-in",
+            "text/html",
+            None,
+        ))
+        .await
+        .expect("sign in");
+    let cookies = set_cookie_pairs(&response).join("; ");
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/devise-test/admin-sign-in",
+            "text/html",
+            Some(&cookies),
+        ))
+        .await
+        .expect("admin sign in");
+    let cookies = set_cookie_pairs(&response).join("; ");
+
+    // Seed the timeoutable ticks directly (the sweep must remove them along
+    // with the warden payloads).
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/devise-test/seed-ticks",
+            "text/html",
+            Some(&cookies),
+        ))
+        .await
+        .expect("seed ticks");
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookies = set_cookie_pairs(&response).join("; ");
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/devise-test/sign-out-all",
+            "text/html",
+            Some(&cookies),
+        ))
+        .await
+        .expect("sign out all");
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookies = set_cookie_pairs(&response).join("; ");
+
+    let dump = body_json(
+        app.oneshot(request(
+            Method::GET,
+            "/devise-test/bridge-dump",
+            "text/html",
+            Some(&cookies),
+        ))
+        .await
+        .expect("dump"),
+    )
+    .await;
+    assert!(
+        dump["user_payload"].is_null() && dump["admin_payload"].is_null(),
+        "sign-out-all must sweep every scope's warden payload: {dump}"
+    );
+    assert!(
+        dump["user_tick"].is_null() && dump["admin_tick"].is_null(),
+        "sign-out-all must sweep every scope's timeoutable tick: {dump}"
+    );
+    assert!(
+        dump["index"].is_null(),
+        "a fully signed-out session must drop the empty key index: {dump}"
+    );
 }

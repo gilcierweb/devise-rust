@@ -238,7 +238,10 @@ async fn stub_token(
     };
     let digest = Sha256::digest(verifier.as_bytes());
     let computed = BASE64_URLSAFE_NO_PAD.encode(digest);
-    if computed != grant.code_challenge {
+    // M-fix (audit): constant-time compare — the same `Devise.secure_compare`
+    // the transport paths use; a `!=` here leaked a timing signal on the
+    // verifier prefix (test-only code, but the stub feeds the OMN-03 matrix).
+    if !devise_rust::crypto::secure_compare(&computed, &grant.code_challenge) {
         return token_error("pkce verification failed");
     }
     let token = format!("stub-token-{}", stub.next_id());

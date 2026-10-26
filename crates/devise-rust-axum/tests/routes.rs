@@ -27,6 +27,7 @@ use devise_rust::rememberable::{RememberCookieOp, encode_cookie_value};
 use devise_rust::scope::{Mapping, Module, PathNames, SignOutVia};
 use devise_rust::time::Clock as _;
 use devise_rust_axum::remember as axum_remember;
+use devise_rust_axum::{DeviseWebState, take_flash};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
@@ -232,6 +233,40 @@ async fn unlock_routes_vanish_without_email_unlock_strategy() {
     }
 }
 
+/// Boot contract (Devise `raise_no_secret_key`, `rails/routes.rb:228`): an
+/// EMPTY `secret_key` must fail state construction with the actionable
+/// `must be set` Config error — it keys every token HMAC, so a boot
+/// without it is a silent account-takeover channel.
+#[test]
+fn web_state_refuses_empty_secret_key_at_boot() {
+    let result = DeviseWebState::<
+        FixtureUser,
+        common::IdAssigningAdapter,
+        devise_rust::mailer::TestMailer,
+    >::new(
+        default_mapping(),
+        common::registry_with(&[default_mapping()]),
+        std::sync::Arc::new(DeviseConfig {
+            secret_key: "   ".to_string(),
+            ..test_config()
+        }),
+        std::sync::Arc::new(common::IdAssigningAdapter::new()),
+        std::sync::Arc::new(devise_rust::mailer::TestMailer::default()),
+        std::sync::Arc::new(SystemClock),
+    );
+    let Err(err) = result else {
+        panic!("an empty secret_key must fail at boot");
+    };
+    assert!(
+        matches!(
+            &err,
+            devise_rust::error::DeviseError::Config(message)
+                if message.contains("secret_key must be set")
+        ),
+        "the boot failure must carry the raise_no_secret_key contract: {err:?}"
+    );
+}
+
 /// Sessions controller: correct credentials sign in (302 + `signed_in`
 /// flash toward the scope root for HTML; JSON callers get 200), wrong
 /// credentials split per format.
@@ -265,9 +300,7 @@ async fn sessions_controller_happy_path_and_flash_split() {
     );
     let cookies = set_cookie_pairs(&response);
     assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=signed_in")),
+        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"signed_in".to_string()),
         "flash cookie carries signed_in: {cookies:?}"
     );
     assert!(
@@ -392,9 +425,7 @@ async fn passwords_controller_basics() {
     assert_eq!(response.status(), StatusCode::FOUND);
     let cookies = set_cookie_pairs(&response);
     assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=no_token")),
+        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"no_token".to_string()),
         "{cookies:?}"
     );
 }
@@ -457,9 +488,7 @@ async fn confirmations_controller_happy_path() {
     );
     let cookies = set_cookie_pairs(&response);
     assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=confirmed")),
+        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"confirmed".to_string()),
         "{cookies:?}"
     );
 
@@ -515,9 +544,7 @@ async fn unlocks_controller_happy_path() {
     );
     let cookies = set_cookie_pairs(&response);
     assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=unlocked")),
+        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"unlocked".to_string()),
         "{cookies:?}"
     );
 
@@ -666,8 +693,11 @@ async fn stale_signed_cookie_yields_clear_and_pass_through() {
     assert_eq!(clear_scope, "user");
 
     // Applying the clear renders a signed tombstone (delete + pass).
-    let headers =
-        axum_remember::ops_as_set_cookie_headers(&key, std::slice::from_ref(clear.as_ref()));
+    let headers = axum_remember::ops_as_set_cookie_headers(
+        &key,
+        &config,
+        std::slice::from_ref(clear.as_ref()),
+    );
     assert_eq!(headers.len(), 1, "one tombstone delta");
     let tombstone = &headers[0];
     assert!(tombstone.starts_with("remember_user_token="), "{tombstone}");
@@ -701,4 +731,134 @@ async fn secure_opt_out_renders_no_secure_attribute() {
         .insert("key".to_string(), "custom_remember".to_string());
     let attrs = axum_remember::attrs_for_scope("user", &keyed, &clock);
     assert_eq!(attrs.key, "custom_remember");
+}
+
+/// S9 (security audit): the remember `Clear` tombstone must carry the SAME
+/// path/domain/secure attributes as the Set — a `Path=/` tombstone never
+/// deletes a cookie the app scoped to `/app`, leaving a live remember
+/// login in the browser after sign-out (a T-09-07 regression).
+#[test]
+fn clear_tombstone_carries_the_configured_path_domain_and_secure() {
+    use devise_rust::time::Clock as _;
+
+    let mut config = common::test_config();
+    config
+        .rememberable_options
+        .insert("path".to_string(), "/app".to_string());
+    config
+        .rememberable_options
+        .insert("domain".to_string(), "example.com".to_string());
+    let clock = SystemClock;
+    let attrs = axum_remember::attrs_for_scope("user", &config, &clock);
+
+    // The Set cookie renders with the configured attrs.
+    let value = encode_cookie_value("1", "raw-token", &clock.now().timestamp().to_string());
+    let set = axum_remember::cookie_for_set(&value, &attrs);
+    assert_eq!(set.path(), Some("/app"));
+    assert_eq!(set.domain(), Some("example.com"));
+    assert_eq!(set.secure(), Some(true));
+
+    // The tombstone must match the Set attrs exactly.
+    let clear = axum_remember::clear_op("user", &config);
+    let RememberCookieOp::Clear { key: clear_key, .. } = &clear else {
+        panic!("clear op");
+    };
+    let removal = axum_remember::removal_cookie(clear_key, &config);
+    assert_eq!(
+        removal.path(),
+        Some("/app"),
+        "tombstone must carry the Set cookie's path"
+    );
+    assert_eq!(
+        removal.domain(),
+        Some("example.com"),
+        "tombstone must carry the Set cookie's domain"
+    );
+    assert_eq!(
+        removal.secure(),
+        Some(true),
+        "tombstone must carry the Set cookie's Secure flag"
+    );
+}
+
+/// S11: `take_flash` is the read-once consumer — a signed envelope yields
+/// the bare flash key PLUS the clearing tombstone the caller must attach;
+/// with the cookie consumed (absent), the next read is `None`.
+#[test]
+fn flash_take_flash_reads_once_and_clears() {
+    let config = common::test_config();
+    let key = devise_rust_axum::callbacks::derive_session_key(&config.secret_key)
+        .expect("flash key derives");
+
+    // Mint a signed flash envelope exactly like `flash_cookie_header`.
+    let mut jar = cookie::CookieJar::new();
+    jar.signed_mut(&key).add(cookie::Cookie::new(
+        "devise.flash",
+        "signed_in".to_string(),
+    ));
+    let raw = jar
+        .iter()
+        .find(|c| c.name() == "devise.flash")
+        .map(|c| c.value().to_string())
+        .expect("signed envelope renders");
+    assert_ne!(raw, "signed_in", "the envelope is MAC-prefixed, not bare");
+
+    let mut request =
+        devise_rust::request::AuthRequest::new(devise_rust::request::HttpMethod::Get, "/".to_string());
+    request
+        .cookies
+        .insert("devise.flash".to_string(), raw);
+    let read = take_flash(&request, &config);
+    assert_eq!(read.key.as_deref(), Some("signed_in"));
+    let clear = read.clear.expect("read-once hands back the tombstone");
+    assert!(
+        String::from_utf8_lossy(clear.as_bytes()).contains("Max-Age=0"),
+        "the tombstone clears the cookie: {clear:?}"
+    );
+
+    // Consumed: no cookie left, so nothing reads back and nothing clears.
+    let consumed =
+        devise_rust::request::AuthRequest::new(devise_rust::request::HttpMethod::Get, "/".to_string());
+    let read = take_flash(&consumed, &config);
+    assert!(read.key.is_none() && read.clear.is_none());
+}
+
+/// S11: a TAMPERED flash envelope never yields a key — and is still
+/// cleared, so a forged flash neither renders nor survives.
+#[test]
+fn flash_take_flash_rejects_tampered_values() {
+    let config = common::test_config();
+    let key = devise_rust_axum::callbacks::derive_session_key(&config.secret_key)
+        .expect("flash key derives");
+
+    let mut jar = cookie::CookieJar::new();
+    jar.signed_mut(&key).add(cookie::Cookie::new(
+        "devise.flash",
+        "signed_in".to_string(),
+    ));
+    let raw = jar
+        .iter()
+        .find(|c| c.name() == "devise.flash")
+        .map(|c| c.value().to_string())
+        .expect("signed envelope renders");
+    // Flip one character inside the MAC region.
+    let mut tampered = raw;
+    let first = if tampered.starts_with('X') { 'Y' } else { 'X' };
+    tampered.replace_range(0..1, &first.to_string());
+
+    let mut request =
+        devise_rust::request::AuthRequest::new(devise_rust::request::HttpMethod::Get, "/".to_string());
+    request
+        .cookies
+        .insert("devise.flash".to_string(), tampered);
+    let read = take_flash(&request, &config);
+    assert!(
+        read.key.is_none(),
+        "a tampered flash envelope must never yield a key: {:?}",
+        read.key
+    );
+    assert!(
+        read.clear.is_some(),
+        "a tampered flash must still be cleared"
+    );
 }

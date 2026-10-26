@@ -62,8 +62,8 @@ use devise_rust::adapter::OrmAdapter;
 use devise_rust::error::DeviseError;
 use devise_rust::failure::{FailureReason, FailureRenderer, build_failure};
 use devise_rust::omniauthable::{
-    OAuthProviderConfig, Omniauthable, ProviderProfile, authorize_start, basic_client,
-    failure_message, http_client, success_message, verify_state,
+    OAuthProviderConfig, Omniauthable, ProviderProfile, authorize_start, basic_client, http_client,
+    success_message, verify_state,
 };
 use devise_rust::proxy::{SetUserEvent, SetUserOpts};
 use devise_rust::request::AuthRequest;
@@ -223,45 +223,25 @@ where
     L: Send + Sync + 'static,
 {
     let failure = build_failure(auth_request, &st.devise.mapping, &st.devise.config, reason);
-    AxumFailureRenderer::new().render(&failure, &st.devise.mapping)
+    AxumFailureRenderer::for_config(&st.devise.config).render(&failure, &st.devise.mapping)
 }
 
 fn internal_error() -> Response {
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
-/// 302 + the `devise.flash` cookie carrying the RENDERED omniauth flash
-/// message (kind + reason interpolation per T-09-14 — the value derives
-/// from the provider name and symbolic reasons, never user input or
-/// tokens).
-fn omniauth_flash_redirect(target: &str, message: &str) -> Response {
-    let mut response = StatusCode::FOUND.into_response();
-    let location = HeaderValue::from_str(target).unwrap_or_else(|_| HeaderValue::from_static("/"));
-    response.headers_mut().insert(header::LOCATION, location);
-    let mut cookie =
-        tower_sessions::cookie::Cookie::new(crate::failure::FLASH_COOKIE, message.to_string());
-    cookie.set_path("/");
-    cookie.set_http_only(true);
-    cookie.set_same_site(tower_sessions::cookie::SameSite::Lax);
-    if let Ok(value) = HeaderValue::from_str(&cookie.to_string()) {
-        response.headers_mut().append(header::SET_COOKIE, value);
-    }
-    response
-}
-
-/// The omniauth failure path: `devise.omniauth_callbacks.failure` flash
-/// with the camelize'd kind and symbolic reason, redirecting to
-/// `after_omniauth_failure_path_for` (Devise: the scope's new-session
-/// path).
+/// The omniauth failure path: the `devise.omniauth_callbacks.failure`
+/// flash key (the BARE key — one flash format everywhere, M-flash; the
+/// app renders it through I18n) redirecting to `after_omniauth_failure_path_for`
+/// (Devise: the scope's new-session path).
 fn omniauth_failure<M, A, L>(
     st: &OmniauthWebState<M, A, L>,
     provider: &str,
-    reason: &str,
+    _reason: &str,
 ) -> Response {
-    let kind = omniauth_kind(provider);
-    let message = failure_message(&kind, reason);
+    let _ = omniauth_kind(provider);
     let target = st.devise.mapping.sign_in_path();
-    omniauth_flash_redirect(&target, &message)
+    crate::routes::flash_redirect(&st.devise.config, &target, "omniauth_callbacks.failure")
 }
 
 /// Register the mapping's omniauth route pair (POST-only authorize plus
@@ -611,8 +591,14 @@ where
     }
     rotate_csrf_token(store.session(), &scope, &devise.config).await;
 
-    // Success: the devise.omniauth_callbacks.success flash with the
-    // camelize'd kind, redirecting to after_sign_in_path_for.
-    let message = success_message(&omniauth_kind(&provider));
-    omniauth_flash_redirect(&target, &message)
+    // Success: the `devise.omniauth_callbacks.success` flash — the BARE
+    // I18n key (one flash format everywhere, M-flash), carried by the same
+    // signed transport the controllers use — redirecting to
+    // after_sign_in_path_for.
+    let _ = success_message(&omniauth_kind(&provider));
+    crate::routes::flash_redirect(
+        &devise.config,
+        &target,
+        "omniauth_callbacks.success",
+    )
 }
