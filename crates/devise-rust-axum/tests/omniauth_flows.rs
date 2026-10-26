@@ -314,11 +314,8 @@ async fn callback_round_trip_signs_in_with_success_flash() {
     // (`devise.omniauth_callbacks.success`), carried in the SIGNED
     // envelope (S11) shared with the controllers.
     assert!(
-        common::flash_keys_from_cookies(
-            std::slice::from_ref(&flash),
-            &state.config
-        )
-        .contains(&"omniauth_callbacks.success".to_string()),
+        common::flash_keys_from_cookies(std::slice::from_ref(&flash), &state.config)
+            .contains(&"omniauth_callbacks.success".to_string()),
         "success flash rides the signed devise.flash cookie: {flash}"
     );
 

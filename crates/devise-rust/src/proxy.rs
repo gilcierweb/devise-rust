@@ -580,11 +580,7 @@ impl AuthProxy {
                     // CSRF-failure request flag.
                     return Ok((
                         user,
-                        crate::strategy::session_should_store(
-                            strategy.as_ref(),
-                            &config,
-                            request,
-                        ),
+                        crate::strategy::session_should_store(strategy.as_ref(), &config, request),
                     ));
                 }
                 Ok(AuthOutcome::SuccessWithCookieRefresh {
@@ -603,11 +599,7 @@ impl AuthProxy {
                     self.queue_remember_refresh(scope, cookie_key, cookie_value, expires);
                     return Ok((
                         user,
-                        crate::strategy::session_should_store(
-                            strategy.as_ref(),
-                            &config,
-                            request,
-                        ),
+                        crate::strategy::session_should_store(strategy.as_ref(), &config, request),
                     ));
                 }
                 Ok(AuthOutcome::ClearCookieAndPass { cookie_key }) => {

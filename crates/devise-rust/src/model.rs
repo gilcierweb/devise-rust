@@ -1289,7 +1289,10 @@ pub trait Authenticatable: AnyDeviseModel {
     {
         let mut present = Conditions::new();
         for attr in attrs {
-            if let Some(value) = conditions.get_raw(attr).filter(|v| !condition_value_blank(v)) {
+            if let Some(value) = conditions
+                .get_raw(attr)
+                .filter(|v| !condition_value_blank(v))
+            {
                 present.insert((*attr).to_string(), value.clone());
             }
         }
@@ -1323,9 +1326,7 @@ pub trait Authenticatable: AnyDeviseModel {
         record.seed_initialized_attributes(&seeded);
         let mut errors = ValidationErrors::new();
         for attr in attrs {
-            let blank = conditions
-                .get_raw(attr)
-                .is_none_or(condition_value_blank);
+            let blank = conditions.get_raw(attr).is_none_or(condition_value_blank);
             errors.add(attr, if blank { ":blank" } else { error });
         }
         ResourceWithErrors::new(record, errors)
@@ -1760,10 +1761,7 @@ mod tests {
     impl crate::adapter::OrmAdapter<TestUser> for CountingAdapter<'_> {
         type New = TestUser;
 
-        async fn get(
-            &self,
-            id: &DeviseKey,
-        ) -> Result<Option<TestUser>, crate::adapter::OrmError> {
+        async fn get(&self, id: &DeviseKey) -> Result<Option<TestUser>, crate::adapter::OrmError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail_reads {
                 return Err(crate::adapter::OrmError::Connection {
@@ -2039,7 +2037,10 @@ mod tests {
             "current_password".to_string(),
             JsonValue::String("secret123".to_string()),
         );
-        params.insert("password".to_string(), JsonValue::String("  \t ".to_string()));
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("  \t ".to_string()),
+        );
         params.insert(
             "password_confirmation".to_string(),
             JsonValue::String("  \t ".to_string()),
@@ -2287,7 +2288,10 @@ mod tests {
         );
 
         let hash = user.serializable_hash();
-        assert_eq!(hash.get("email").and_then(JsonValue::as_str), Some("test@example.com"));
+        assert_eq!(
+            hash.get("email").and_then(JsonValue::as_str),
+            Some("test@example.com")
+        );
         assert!(
             hash.get("unconfirmed_email").is_none(),
             "the default hash must filter UNSAFE attributes: {hash}"
@@ -2627,7 +2631,10 @@ mod tests {
 
         let required = ["email", "username"];
         let mut conditions = Conditions::new();
-        conditions.insert("email", AdapterValue::String("test@example.com".to_string()));
+        conditions.insert(
+            "email",
+            AdapterValue::String("test@example.com".to_string()),
+        );
 
         let resource = TestUser::find_or_initialize_with_errors(
             &required,
@@ -2730,7 +2737,10 @@ mod tests {
 
         let required = ["email", "username"];
         let mut conditions = Conditions::new();
-        conditions.insert("email", AdapterValue::String("test@example.com".to_string()));
+        conditions.insert(
+            "email",
+            AdapterValue::String("test@example.com".to_string()),
+        );
         conditions.insert("username", AdapterValue::String(" tester ".to_string()));
 
         let miss = TestUser::find_or_initialize_with_errors(
@@ -2766,7 +2776,10 @@ mod tests {
             &config,
         )
         .await;
-        assert!(hit.is_valid(), "one required key that matches finds the record");
+        assert!(
+            hit.is_valid(),
+            "one required key that matches finds the record"
+        );
         assert_eq!(hit.record.id, 1);
     }
 

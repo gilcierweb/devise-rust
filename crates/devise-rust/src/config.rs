@@ -546,7 +546,9 @@ mod tests {
     #[test]
     fn test_validate_rejects_empty_secret_key() {
         let config = DeviseConfig::default();
-        let error = config.validate().expect_err("default config must not validate");
+        let error = config
+            .validate()
+            .expect_err("default config must not validate");
         assert!(
             matches!(error, DeviseError::Config(ref message) if message.contains("secret_key")),
             "unexpected error: {error:?}"

@@ -129,7 +129,6 @@ async fn tracer_session_roundtrip_via_middleware() -> Result<(), actix_web::Erro
     let key =
         devise_rust_actix::callbacks::derive_actix_key(&config.secret_key).expect("derive key");
 
-
     // A user-model adapter shared across the request pipeline.
     let adapter = Arc::new(MemoryAdapter::<TracerUser>::new());
 

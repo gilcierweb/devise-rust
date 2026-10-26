@@ -1092,7 +1092,10 @@ mod tests {
             self.inner.increment_counter(key, column).await
         }
 
-        async fn delete(&self, id: &crate::adapter::DeviseKey) -> Result<(), crate::adapter::OrmError> {
+        async fn delete(
+            &self,
+            id: &crate::adapter::DeviseKey,
+        ) -> Result<(), crate::adapter::OrmError> {
             self.inner.delete(id).await
         }
     }
@@ -1150,9 +1153,7 @@ mod tests {
                 // The competing failure lands between the caller's read and
                 // its absolute write - last-write-wins clobbers it.
                 self.commits.fetch_add(1, Ordering::SeqCst);
-                self.inner
-                    .increment_counter(key, "failed_attempts")
-                    .await?;
+                self.inner.increment_counter(key, "failed_attempts").await?;
             }
             self.inner.update_columns(key, fields).await
         }
@@ -1165,7 +1166,10 @@ mod tests {
             self.inner.increment_counter(key, column).await
         }
 
-        async fn delete(&self, id: &crate::adapter::DeviseKey) -> Result<(), crate::adapter::OrmError> {
+        async fn delete(
+            &self,
+            id: &crate::adapter::DeviseKey,
+        ) -> Result<(), crate::adapter::OrmError> {
             self.inner.delete(id).await
         }
     }

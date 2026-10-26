@@ -62,7 +62,6 @@ async fn seed_user_unconfirmed(state: &TestState, email: &str, password: &str) -
     state.adapter.create(user).await.expect("seed")
 }
 
-
 /// The session (`id=`) cookie pair of a response, for flash probe replay
 /// (the flash rides the signed session now, S11).
 fn session_cookie(resp: &actix_web::dev::ServiceResponse) -> String {
@@ -217,7 +216,9 @@ async fn flow_sign_in_unknown_email_reports_not_found() {
     let resp = form_sign_in(&app, "ghost@example.com", "secret123").await;
     assert_eq!(resp.status(), 302);
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("not_found_in_database"),
         "not_found_in_database flash on unknown email"
     );
@@ -239,7 +240,9 @@ async fn flow_sign_in_unknown_email_paranoid_reports_invalid() {
     let resp = form_sign_in(&app, "ghost@example.com", "secret123").await;
     assert_eq!(resp.status(), 302);
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("invalid"),
         "unified invalid flash under paranoid"
     );
@@ -255,7 +258,9 @@ async fn flow_sign_in_failure_formats() {
     let resp = form_sign_in(&app, "flow2@example.com", "wrongpass").await;
     assert_eq!(resp.status(), 302);
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("invalid"),
         "invalid flash on HTML miss"
     );
@@ -372,7 +377,9 @@ async fn flow_account_update_email_postpones_until_confirmation() {
     .await;
     assert_eq!(resp.status(), 302);
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("update_needs_confirmation"),
         "update_needs_confirmation flash expected"
     );
@@ -481,7 +488,9 @@ async fn flow_account_update_plain_flash() {
     .await;
     assert_eq!(resp.status(), 302);
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("updated"),
         "plain update flash expected"
     );
@@ -504,7 +513,9 @@ async fn flow_reset_token_errors() {
     .await;
     assert_eq!(resp.status(), 302);
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("no_token")
     );
 
@@ -584,7 +595,9 @@ async fn flow_confirm_by_token_blank_and_legacy_paths() {
     .await;
     assert_eq!(resp.status(), 302);
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("confirmed")
     );
 }
@@ -635,7 +648,9 @@ async fn flow_unlock_by_token() {
     .await;
     assert_eq!(resp.status(), 302);
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("unlocked")
     );
 
@@ -643,7 +658,9 @@ async fn flow_unlock_by_token() {
     let resp = form_sign_in(&app, "flow7@example.com", "secret123").await;
     assert_eq!(resp.status(), 302);
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("signed_in")
     );
 }
@@ -870,7 +887,9 @@ async fn flow_sign_out_again_reports_already_signed_out() {
     let resp = sign_out_request(&app, &jar.header()).await;
     assert_eq!(resp.status(), 302);
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("already_signed_out"),
         "already_signed_out flash expected"
     );
@@ -892,7 +911,9 @@ async fn flow_sign_in_while_signed_in_reports_already_authenticated() {
         form_sign_in_with(&app, "flow10@example.com", "secret123", Some(&jar.header())).await;
     assert_eq!(resp.status(), 302);
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("already_authenticated"),
         "already_authenticated flash expected"
     );
@@ -977,7 +998,9 @@ async fn flow_sign_in_lock_under_paranoid_reports_invalid() {
 
     let resp = form_sign_in(&app, "flow12@example.com", "wrongpass").await;
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("invalid"),
         "threshold lock under paranoid reports invalid"
     );
@@ -985,7 +1008,9 @@ async fn flow_sign_in_lock_under_paranoid_reports_invalid() {
     // The account is now locked; even the correct password stays unified.
     let resp = form_sign_in(&app, "flow12@example.com", "secret123").await;
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("invalid"),
         "locked + correct password stays unified"
     );
@@ -1008,7 +1033,9 @@ async fn flow_sign_in_lock_without_paranoid_reports_locked() {
     let _ = form_sign_in(&app, "flow13@example.com", "wrongpass").await;
     let resp = form_sign_in(&app, "flow13@example.com", "wrongpass").await;
     assert_eq!(
-        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
         Some("locked"),
         "threshold lock without paranoid reports locked"
     );

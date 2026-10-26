@@ -874,9 +874,7 @@ where
     A: OrmAdapter<M> + Send + Sync + 'static,
     L: Mailer<M> + 'static,
 {
-    if let Some(redirect) =
-        require_no_authentication(&session, &handle, &auth_request, &st).await
-    {
+    if let Some(redirect) = require_no_authentication(&session, &handle, &auth_request, &st).await {
         return redirect;
     }
     new_handler().await
@@ -1186,9 +1184,7 @@ where
     // Devise `require_no_authentication, only: [:new, :create, :cancel]`
     // (`registrations_controller.rb:4`): a signed-in session never reaches
     // the create action (S13).
-    if let Some(redirect) =
-        require_no_authentication(&session, &handle, &auth_request, &st).await
-    {
+    if let Some(redirect) = require_no_authentication(&session, &handle, &auth_request, &st).await {
         return redirect;
     }
     let singular = st.mapping.singular.clone();
@@ -1281,11 +1277,7 @@ where
     // which params reach `update_with_password`
     // (`registrations_controller.rb:139-141`); the raw body map never
     // touches the record.
-    let mut params = sanitized_params(
-        &st.config,
-        "account_update",
-        &body_map(params.0, &singular),
-    );
+    let mut params = sanitized_params(&st.config, "account_update", &body_map(params.0, &singular));
 
     // Capture the pre-update state Devise's `before_update` callbacks and
     // `set_flash_message_for_update` read after the fact.
@@ -1431,9 +1423,7 @@ where
     // Devise `require_no_authentication, only: [:new, :create, :cancel]`
     // (`registrations_controller.rb:4`): a signed-in session never reaches
     // the cancel action (S13).
-    if let Some(redirect) =
-        require_no_authentication(&session, &handle, &auth_request, &st).await
-    {
+    if let Some(redirect) = require_no_authentication(&session, &handle, &auth_request, &st).await {
         return redirect;
     }
     // Devise registrations#cancel (`registrations_controller.rb:78-81`):

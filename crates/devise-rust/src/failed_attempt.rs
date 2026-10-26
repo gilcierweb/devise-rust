@@ -139,8 +139,8 @@ mod tests {
     use crate::config::DeviseConfig;
     use crate::failure::AnyDeviseModel;
     use crate::lockable::Lockable;
-    use crate::mailer::TestMailer;
     use crate::mailer::HasEmail;
+    use crate::mailer::TestMailer;
     use crate::model::Authenticatable;
     use chrono::{DateTime, Utc};
     use serde::{Deserialize, Serialize};
@@ -223,10 +223,7 @@ mod tests {
         async fn get(&self, id: &DeviseKey) -> Result<Option<SinkUser>, OrmError> {
             self.inner.get(id).await
         }
-        async fn find_first(
-            &self,
-            conditions: &Conditions,
-        ) -> Result<Option<SinkUser>, OrmError> {
+        async fn find_first(&self, conditions: &Conditions) -> Result<Option<SinkUser>, OrmError> {
             self.inner.find_first(conditions).await
         }
         async fn create(&self, model: SinkUser) -> Result<SinkUser, OrmError> {
@@ -278,16 +275,13 @@ mod tests {
             secret_key: "test-secret-key".to_string(),
             ..DeviseConfig::default()
         });
-        let sink = LockableFailedAttemptSink::<
-            SinkUser,
-            FailingCounterAdapter<'_>,
-            TestMailer,
-        >::new(
-            Arc::new(failing),
-            Arc::new(TestMailer::default()),
-            config,
-            Arc::new(crate::time::SystemClock),
-        );
+        let sink =
+            LockableFailedAttemptSink::<SinkUser, FailingCounterAdapter<'_>, TestMailer>::new(
+                Arc::new(failing),
+                Arc::new(TestMailer::default()),
+                config,
+                Arc::new(crate::time::SystemClock),
+            );
 
         let verdict = sink.record(&key, false).await;
         assert!(

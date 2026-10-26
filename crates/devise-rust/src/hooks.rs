@@ -768,7 +768,8 @@ mod tests {
             Vec::new()
         }
         async fn renew(&self) -> Result<(), crate::error::DeviseError> {
-            self.renewed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.renewed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn reset(&self) -> Result<(), crate::error::DeviseError> {

@@ -29,8 +29,7 @@ pub trait Strategy: Send + Sync {
     /// `strategies/authenticatable.rb:77-90`): a disabled strategy is
     /// simply not valid and the chain moves on - it never aborts the
     /// request.
-    async fn valid(&self, request: &AuthRequest, mapping: &Mapping, config: &DeviseConfig)
-    -> bool;
+    async fn valid(&self, request: &AuthRequest, mapping: &Mapping, config: &DeviseConfig) -> bool;
 
     /// Attempt authentication.
     ///
@@ -76,12 +75,7 @@ pub trait Strategy: Send + Sync {
 
 #[async_trait]
 impl Strategy for Box<dyn Strategy> {
-    async fn valid(
-        &self,
-        request: &AuthRequest,
-        mapping: &Mapping,
-        config: &DeviseConfig,
-    ) -> bool {
+    async fn valid(&self, request: &AuthRequest, mapping: &Mapping, config: &DeviseConfig) -> bool {
         (**self).valid(request, mapping, config).await
     }
 
@@ -286,12 +280,7 @@ impl ParamsStrategy {
 
 #[async_trait]
 impl Strategy for ParamsStrategy {
-    async fn valid(
-        &self,
-        request: &AuthRequest,
-        mapping: &Mapping,
-        config: &DeviseConfig,
-    ) -> bool {
+    async fn valid(&self, request: &AuthRequest, mapping: &Mapping, config: &DeviseConfig) -> bool {
         // Devise gates the capability inside `valid?`
         // (`valid_for_params_auth?`): a disabled strategy is skipped, never
         // fatal to the chain.
@@ -658,12 +647,7 @@ impl<S: Strategy> ParanoidStrategy<S> {
 
 #[async_trait]
 impl<S: Strategy + Send + Sync> Strategy for ParanoidStrategy<S> {
-    async fn valid(
-        &self,
-        request: &AuthRequest,
-        mapping: &Mapping,
-        config: &DeviseConfig,
-    ) -> bool {
+    async fn valid(&self, request: &AuthRequest, mapping: &Mapping, config: &DeviseConfig) -> bool {
         self.inner.valid(request, mapping, config).await
     }
 
@@ -881,7 +865,11 @@ mod tests {
             skip_session_storage: vec![],
             ..test_config()
         };
-        assert!(session_should_store(http_basic.as_ref(), &storing, &request));
+        assert!(session_should_store(
+            http_basic.as_ref(),
+            &storing,
+            &request
+        ));
 
         // The CSRF-failure flag (`devise.skip_storage`) suppresses storage
         // for every strategy.
@@ -900,9 +888,10 @@ mod tests {
         let strategies = strategies_for(&mapping, &config);
 
         let mut request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
-        request
-            .headers
-            .insert("authorization".to_string(), "Basic dXNlcjpwYXNz".to_string());
+        request.headers.insert(
+            "authorization".to_string(),
+            "Basic dXNlcjpwYXNz".to_string(),
+        );
         let disabled = DeviseConfig {
             http_authenticatable: false,
             ..test_config()

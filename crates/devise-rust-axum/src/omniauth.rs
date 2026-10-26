@@ -596,9 +596,5 @@ where
     // signed transport the controllers use — redirecting to
     // after_sign_in_path_for.
     let _ = success_message(&omniauth_kind(&provider));
-    crate::routes::flash_redirect(
-        &devise.config,
-        &target,
-        "omniauth_callbacks.success",
-    )
+    crate::routes::flash_redirect(&devise.config, &target, "omniauth_callbacks.success")
 }

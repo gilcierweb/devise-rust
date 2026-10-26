@@ -792,10 +792,8 @@ fn flash_take_flash_reads_once_and_clears() {
 
     // Mint a signed flash envelope exactly like `flash_cookie_header`.
     let mut jar = cookie::CookieJar::new();
-    jar.signed_mut(&key).add(cookie::Cookie::new(
-        "devise.flash",
-        "signed_in".to_string(),
-    ));
+    jar.signed_mut(&key)
+        .add(cookie::Cookie::new("devise.flash", "signed_in".to_string()));
     let raw = jar
         .iter()
         .find(|c| c.name() == "devise.flash")
@@ -803,11 +801,11 @@ fn flash_take_flash_reads_once_and_clears() {
         .expect("signed envelope renders");
     assert_ne!(raw, "signed_in", "the envelope is MAC-prefixed, not bare");
 
-    let mut request =
-        devise_rust::request::AuthRequest::new(devise_rust::request::HttpMethod::Get, "/".to_string());
-    request
-        .cookies
-        .insert("devise.flash".to_string(), raw);
+    let mut request = devise_rust::request::AuthRequest::new(
+        devise_rust::request::HttpMethod::Get,
+        "/".to_string(),
+    );
+    request.cookies.insert("devise.flash".to_string(), raw);
     let read = take_flash(&request, &config);
     assert_eq!(read.key.as_deref(), Some("signed_in"));
     let clear = read.clear.expect("read-once hands back the tombstone");
@@ -817,8 +815,10 @@ fn flash_take_flash_reads_once_and_clears() {
     );
 
     // Consumed: no cookie left, so nothing reads back and nothing clears.
-    let consumed =
-        devise_rust::request::AuthRequest::new(devise_rust::request::HttpMethod::Get, "/".to_string());
+    let consumed = devise_rust::request::AuthRequest::new(
+        devise_rust::request::HttpMethod::Get,
+        "/".to_string(),
+    );
     let read = take_flash(&consumed, &config);
     assert!(read.key.is_none() && read.clear.is_none());
 }
@@ -832,10 +832,8 @@ fn flash_take_flash_rejects_tampered_values() {
         .expect("flash key derives");
 
     let mut jar = cookie::CookieJar::new();
-    jar.signed_mut(&key).add(cookie::Cookie::new(
-        "devise.flash",
-        "signed_in".to_string(),
-    ));
+    jar.signed_mut(&key)
+        .add(cookie::Cookie::new("devise.flash", "signed_in".to_string()));
     let raw = jar
         .iter()
         .find(|c| c.name() == "devise.flash")
@@ -846,11 +844,11 @@ fn flash_take_flash_rejects_tampered_values() {
     let first = if tampered.starts_with('X') { 'Y' } else { 'X' };
     tampered.replace_range(0..1, &first.to_string());
 
-    let mut request =
-        devise_rust::request::AuthRequest::new(devise_rust::request::HttpMethod::Get, "/".to_string());
-    request
-        .cookies
-        .insert("devise.flash".to_string(), tampered);
+    let mut request = devise_rust::request::AuthRequest::new(
+        devise_rust::request::HttpMethod::Get,
+        "/".to_string(),
+    );
+    request.cookies.insert("devise.flash".to_string(), tampered);
     let read = take_flash(&request, &config);
     assert!(
         read.key.is_none(),

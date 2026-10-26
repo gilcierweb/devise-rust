@@ -363,7 +363,8 @@ mod tests {
     /// serializer carries resolves through [`Rememberable`].
     #[tokio::test]
     async fn session_remember_facet_feeds_the_production_cookie_serializer() {
-        let mut tokenized = TestUser::new(1, "user@example.com", "$2a$12$salt123456789012345678901234");
+        let mut tokenized =
+            TestUser::new(1, "user@example.com", "$2a$12$salt123456789012345678901234");
         tokenized.remember_token = Some("remember-token-value".to_string());
         assert_eq!(
             tokenized.rememberable_value(),

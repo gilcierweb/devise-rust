@@ -58,8 +58,8 @@ use actix_web::{HttpRequest, HttpResponse, Scope, web};
 use devise_rust::adapter::{OrmAdapter, Value as AdapterValue};
 use devise_rust::error::DeviseError;
 use devise_rust::omniauthable::{
-    OAuthProviderConfig, Omniauthable, ProviderProfile, authorize_start, basic_client,
-    http_client, verify_state,
+    OAuthProviderConfig, Omniauthable, ProviderProfile, authorize_start, basic_client, http_client,
+    verify_state,
 };
 use devise_rust::scope::RouteSpec;
 use oauth2::{AuthorizationCode, PkceCodeVerifier, TokenResponse};
@@ -196,21 +196,14 @@ fn internal_error() -> HttpResponse {
 /// app renders every flash through the one catalog; the omniauth module
 /// no longer writes pre-rendered sentences into a slot the controllers
 /// fill with keys).
-fn omniauth_flash_redirect(
-    session: &Session,
-    location: &str,
-    flash_key: &str,
-) -> HttpResponse {
+fn omniauth_flash_redirect(session: &Session, location: &str, flash_key: &str) -> HttpResponse {
     crate::routes::flash_redirect(session, location, flash_key)
 }
 
 /// The omniauth failure path: the bare `devise.omniauth_callbacks.failure`
 /// flash key, redirecting to `after_omniauth_failure_path_for` (Devise: the
 /// scope's new-session path).
-fn omniauth_failure<M, A, L>(
-    session: &Session,
-    st: &OmniauthWebState<M, A, L>,
-) -> HttpResponse {
+fn omniauth_failure<M, A, L>(session: &Session, st: &OmniauthWebState<M, A, L>) -> HttpResponse {
     omniauth_flash_redirect(
         session,
         &st.devise.mapping.sign_in_path(),
@@ -527,12 +520,15 @@ where
     {
         Ok(response) if response.status().is_success() => match response.text().await {
             Ok(text) => text,
-            Err(_) => return omniauth_failure(&session, &state) /* Userinfo fetch failed */,
+            // Userinfo fetch failed.
+            Err(_) => return omniauth_failure(&session, &state),
         },
-        _ => return omniauth_failure(&session, &state) /* Userinfo fetch failed */,
+        // Userinfo fetch failed.
+        _ => return omniauth_failure(&session, &state),
     };
     let Ok(claims) = serde_json::from_str::<JsonValue>(&raw_claims) else {
-        return omniauth_failure(&session, &state) /* Userinfo fetch failed */;
+        // Userinfo fetch failed.
+        return omniauth_failure(&session, &state);
     };
 
     // Auth-hash build (the OmniAuth middleware role): uid from `sub` or
@@ -543,7 +539,8 @@ where
         .and_then(JsonValue::as_str)
         .or_else(|| claims.get("uid").and_then(JsonValue::as_str))
     else {
-        return omniauth_failure(&session, &state) /* Userinfo fetch failed */;
+        // Userinfo fetch failed.
+        return omniauth_failure(&session, &state);
     };
     let profile = ProviderProfile {
         provider: provider.clone(),

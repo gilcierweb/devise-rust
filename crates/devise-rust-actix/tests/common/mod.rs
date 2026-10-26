@@ -341,8 +341,7 @@ impl DatabaseAuthenticatable for FixtureUser {
             self.unconfirmed_email = Some(unconfirmed_email.clone());
         }
         if let Some(JsonValue::Number(count)) = attrs.get("failed_attempts") {
-            self.failed_attempts =
-                u32::try_from(count.as_u64().unwrap_or(0)).unwrap_or(0);
+            self.failed_attempts = u32::try_from(count.as_u64().unwrap_or(0)).unwrap_or(0);
         }
     }
 }
@@ -564,9 +563,13 @@ impl devise_rust::omniauthable::Omniauthable for FixtureUser {
         Self: Sized,
         A: devise_rust::adapter::OrmAdapter<Self, New = Self::New> + Send + Sync,
     {
-        let mut outcome =
-            devise_rust::omniauthable::default_from_omniauth(adapter, &profile, &test_config(), clock)
-                .await;
+        let mut outcome = devise_rust::omniauthable::default_from_omniauth(
+            adapter,
+            &profile,
+            &test_config(),
+            clock,
+        )
+        .await;
         // Devise's canonical from_omniauth pattern: a provider-verified
         // identity is confirmed on creation (one home: core helper).
         if outcome.is_valid() {
@@ -750,11 +753,9 @@ pub async fn build_app_with(
     let scope_name = state.mapping.name.clone();
     let finder: Arc<dyn devise_rust::model::ModelFinder> =
         Arc::new(AdapterBridge::new(state.adapter.as_ref().clone()));
-    let middleware = DeviseMiddleware::new(
-        registry_with(state.mapping.clone()),
-        state.config.clone(),
-    )
-    .with_finder(&scope_name, finder);
+    let middleware =
+        DeviseMiddleware::new(registry_with(state.mapping.clone()), state.config.clone())
+            .with_finder(&scope_name, finder);
 
     let data_state = state.clone();
     let mut app = App::new()
@@ -840,11 +841,9 @@ pub async fn build_omniauth_service(
     let scope_name = state.mapping.name.clone();
     let finder: Arc<dyn devise_rust::model::ModelFinder> =
         Arc::new(AdapterBridge::new(state.adapter.as_ref().clone()));
-    let middleware = DeviseMiddleware::new(
-        registry_with(state.mapping.clone()),
-        state.config.clone(),
-    )
-    .with_finder(&scope_name, finder);
+    let middleware =
+        DeviseMiddleware::new(registry_with(state.mapping.clone()), state.config.clone())
+            .with_finder(&scope_name, finder);
 
     let omniauth_state = devise_rust_actix::OmniauthWebState::new(state.clone(), providers);
     let data_state = state.clone();

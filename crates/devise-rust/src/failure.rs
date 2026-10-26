@@ -901,7 +901,10 @@ mod tests {
         // Protocol-relative backslash: passes no prefix check but browsers
         // normalize `\` to `/` - an off-host redirect.
         store
-            .insert_value(&stored_location_key("user"), serde_json::json!("/\\evil.example"))
+            .insert_value(
+                &stored_location_key("user"),
+                serde_json::json!("/\\evil.example"),
+            )
             .await;
         assert!(
             stored_location_for("user", &store).await.is_none(),
@@ -916,7 +919,10 @@ mod tests {
 
         // A valid path still round-trips.
         store
-            .insert_value(&stored_location_key("user"), serde_json::json!("/landing?tab=1"))
+            .insert_value(
+                &stored_location_key("user"),
+                serde_json::json!("/landing?tab=1"),
+            )
             .await;
         assert_eq!(
             stored_location_for("user", &store).await.as_deref(),

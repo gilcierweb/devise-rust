@@ -182,9 +182,12 @@ async fn sessions_controller_happy_path_and_flash_split() {
     let session_cookie = cookies
         .iter()
         .find(|c| c.starts_with("id="))
-        .expect("session cookie").clone();
+        .expect("session cookie")
+        .clone();
     assert_eq!(
-        common::flash_of(&app, session_cookie.as_str()).await.as_deref(),
+        common::flash_of(&app, session_cookie.as_str())
+            .await
+            .as_deref(),
         Some("signed_in"),
         "flash session carries signed_in"
     );
@@ -300,9 +303,12 @@ async fn passwords_controller_basics() {
     let session_cookie = cookies
         .iter()
         .find(|c| c.starts_with("id="))
-        .expect("session cookie").clone();
+        .expect("session cookie")
+        .clone();
     assert_eq!(
-        common::flash_of(&app, session_cookie.as_str()).await.as_deref(),
+        common::flash_of(&app, session_cookie.as_str())
+            .await
+            .as_deref(),
         Some("no_token"),
         "no_token flash staged in the session"
     );

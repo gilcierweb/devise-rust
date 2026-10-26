@@ -852,7 +852,13 @@ mod tests {
             Self: Sized,
             A: OrmAdapter<Self, New = Self::New> + Send + Sync,
         {
-            default_from_omniauth(adapter, &profile, &crate::config::DeviseConfig::default(), clock).await
+            default_from_omniauth(
+                adapter,
+                &profile,
+                &crate::config::DeviseConfig::default(),
+                clock,
+            )
+            .await
         }
 
         fn new_from_profile(profile: &ProviderProfile, now: DateTime<Utc>) -> Self::New {
@@ -897,7 +903,6 @@ mod tests {
             .await
             .expect("seed row");
     }
-
 
     fn test_config() -> crate::config::DeviseConfig {
         crate::config::DeviseConfig {
@@ -1101,7 +1106,8 @@ mod tests {
         // A profile with no email at all: nothing to collide with, and the
         // default policy cannot look up by a nonexistent column value.
         let outcome: ResourceWithErrors<OmniUser> =
-            default_from_omniauth(&adapter, &omni_profile(None, false), &test_config(), &clock).await;
+            default_from_omniauth(&adapter, &omni_profile(None, false), &test_config(), &clock)
+                .await;
 
         assert!(outcome.is_valid());
         assert_eq!(outcome.record.provider.as_deref(), Some("stub"));

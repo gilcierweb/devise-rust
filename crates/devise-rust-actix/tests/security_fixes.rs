@@ -12,10 +12,10 @@ mod common;
 
 use std::sync::Arc;
 
+use actix_web::HttpMessage;
 use actix_web::cookie::CookieJar;
 use actix_web::http::StatusCode;
 use actix_web::test;
-use actix_web::HttpMessage;
 use common::FixtureUser;
 use devise_rust::adapter::OrmAdapter;
 use devise_rust::config::DeviseConfig;
@@ -33,14 +33,12 @@ use devise_rust::time::SystemClock;
 #[actix_web::test]
 async fn s9_clear_tombstone_carries_configured_path_and_domain() {
     let mut config = common::test_config();
-    config.rememberable_options.insert(
-        "path".to_string(),
-        "/app".to_string(),
-    );
-    config.rememberable_options.insert(
-        "domain".to_string(),
-        "app.example.test".to_string(),
-    );
+    config
+        .rememberable_options
+        .insert("path".to_string(), "/app".to_string());
+    config
+        .rememberable_options
+        .insert("domain".to_string(), "app.example.test".to_string());
 
     let key = devise_rust_actix::derive_remember_key(&config).expect("derive");
     let op: RememberCookieOp = devise_rust_actix::remember::forget_op("user", &config);
@@ -92,8 +90,7 @@ async fn s4_query_credentials_do_not_authenticate_guarded_routes() {
     state.adapter.create(user).await.expect("seed");
 
     let probe = actix_web::web::get().to(params_probe);
-    let (_state, app) =
-        common::build_app_with(state, vec![("/users_params_probe", probe)]).await;
+    let (_state, app) = common::build_app_with(state, vec![("/users_params_probe", probe)]).await;
 
     // Raw '@' in the query (RFC 3986 allows it): the middleware snapshot
     // copies the raw pair values, so the lookup key matches the stored row.
@@ -181,7 +178,8 @@ async fn s13_signed_in_sign_up_is_rejected_no_second_account() {
     let session_cookie = cookies
         .iter()
         .find(|c| c.starts_with("id="))
-        .expect("session cookie").clone();
+        .expect("session cookie")
+        .clone();
     jar.insert("session", session_cookie);
 
     // Signed-in HTML POST /users: redirected with already_authenticated and
@@ -194,7 +192,11 @@ async fn s13_signed_in_sign_up_is_rejected_no_second_account() {
         .set_payload("user[email]=second@example.com&user[password]=secret123&user[password_confirmation]=secret123")
         .to_request();
     let resp = test::call_service(&app, resp).await;
-    assert_eq!(resp.status(), StatusCode::FOUND, "signed-in POST is rejected");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "signed-in POST is rejected"
+    );
     let cookies = devise_rust_actix::test_helpers::set_cookie_pairs(&resp);
     let rejection_session = cookies
         .iter()
@@ -202,7 +204,9 @@ async fn s13_signed_in_sign_up_is_rejected_no_second_account() {
         .cloned()
         .unwrap_or_else(|| jar.get("session").cloned().unwrap_or_default());
     assert_eq!(
-        common::flash_of(&app, rejection_session.as_str()).await.as_deref(),
+        common::flash_of(&app, rejection_session.as_str())
+            .await
+            .as_deref(),
         Some("already_authenticated"),
         "already_authenticated flash expected"
     );
@@ -233,7 +237,9 @@ async fn s13_signed_in_sign_up_is_rejected_no_second_account() {
             .cloned()
             .unwrap_or_else(|| jar.get("session").cloned().unwrap_or_default());
         assert_eq!(
-            common::flash_of(&app, rejection_session.as_str()).await.as_deref(),
+            common::flash_of(&app, rejection_session.as_str())
+                .await
+                .as_deref(),
             Some("already_authenticated"),
             "already_authenticated flash on {path}"
         );
@@ -247,7 +253,11 @@ async fn s13_signed_in_sign_up_is_rejected_no_second_account() {
         .set_payload("user[email]=anon@example.com&user[password]=secret123&user[password_confirmation]=secret123")
         .to_request();
     let resp = test::call_service(&app, resp).await;
-    assert_eq!(resp.status(), StatusCode::FOUND, "anonymous sign-up creates");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "anonymous sign-up creates"
+    );
     let mut conditions = devise_rust::adapter::Conditions::new();
     conditions.insert(
         "email",
@@ -340,8 +350,9 @@ async fn m_authentication_keys_username_signs_in() {
     ))
     .await;
 
-    let mut user = FixtureUser::new_with_password("m-auth@example.com", "secret123", &common::test_config())
-        .confirmed_now(&common::SystemClock);
+    let mut user =
+        FixtureUser::new_with_password("m-auth@example.com", "secret123", &common::test_config())
+            .confirmed_now(&common::SystemClock);
     user.username = Some("alice".to_string());
     state.adapter.create(user).await.expect("seed");
 
@@ -354,14 +365,21 @@ async fn m_authentication_keys_username_signs_in() {
         .set_payload("username=ALICE&password=secret123")
         .to_request();
     let resp = test::call_service(&app, resp).await;
-    assert_eq!(resp.status(), StatusCode::FOUND, "username sign-in succeeds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "username sign-in succeeds"
+    );
     let cookies = devise_rust_actix::test_helpers::set_cookie_pairs(&resp);
     let session_cookie = cookies
         .iter()
         .find(|c| c.starts_with("id="))
-        .expect("session cookie").clone();
+        .expect("session cookie")
+        .clone();
     assert_eq!(
-        common::flash_of(&app, session_cookie.as_str()).await.as_deref(),
+        common::flash_of(&app, session_cookie.as_str())
+            .await
+            .as_deref(),
         Some("signed_in"),
         "signed_in flash expected"
     );
@@ -380,12 +398,9 @@ async fn m_authentication_keys_username_signs_in() {
 async fn m_after_database_authentication_fires_on_sign_in() {
     let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
 
-    let user = FixtureUser::new_with_password(
-        "m-dbau@example.com",
-        "secret123",
-        &common::test_config(),
-    )
-    .confirmed_now(&common::SystemClock);
+    let user =
+        FixtureUser::new_with_password("m-dbau@example.com", "secret123", &common::test_config())
+            .confirmed_now(&common::SystemClock);
     let flag = user.after_db_auth_flag.clone();
     state.adapter.create(user).await.expect("seed");
     assert!(
@@ -442,7 +457,9 @@ async fn m_remember_me_json_bool_is_honored() {
     assert_eq!(resp.status(), StatusCode::OK);
     let cookies = devise_rust_actix::test_helpers::set_cookie_pairs(&resp);
     assert!(
-        cookies.iter().any(|c| c.starts_with("remember_user_token=")),
+        cookies
+            .iter()
+            .any(|c| c.starts_with("remember_user_token=")),
         "boolean remember_me must issue the remember cookie: {cookies:?}"
     );
 }
@@ -554,7 +571,9 @@ async fn m_failed_confirmation_mail_surfaces_as_error() {
                     .cookie_secure(false)
                     .build(),
             )
-            .service(devise_rust_actix::devise_for_users(web::Data::new(data_state))),
+            .service(devise_rust_actix::devise_for_users(web::Data::new(
+                data_state,
+            ))),
     )
     .await;
 
@@ -667,22 +686,19 @@ async fn two_scope_app() -> (
 
     let key =
         devise_rust_actix::derive_actix_key(&user_state.config.secret_key).expect("derive key");
-    let middleware = devise_rust_actix::DeviseMiddleware::new(
-        registry,
-        user_state.config.clone(),
-    )
-    .with_finder(
-        "user",
-        Arc::new(devise_rust::model::AdapterBridge::new(
-            user_state.adapter.as_ref().clone(),
-        )) as Arc<dyn devise_rust::model::ModelFinder>,
-    )
-    .with_finder(
-        "admin",
-        Arc::new(devise_rust::model::AdapterBridge::new(
-            admin_state.adapter.as_ref().clone(),
-        )) as Arc<dyn devise_rust::model::ModelFinder>,
-    );
+    let middleware = devise_rust_actix::DeviseMiddleware::new(registry, user_state.config.clone())
+        .with_finder(
+            "user",
+            Arc::new(devise_rust::model::AdapterBridge::new(
+                user_state.adapter.as_ref().clone(),
+            )) as Arc<dyn devise_rust::model::ModelFinder>,
+        )
+        .with_finder(
+            "admin",
+            Arc::new(devise_rust::model::AdapterBridge::new(
+                admin_state.adapter.as_ref().clone(),
+            )) as Arc<dyn devise_rust::model::ModelFinder>,
+        );
 
     let app = test::init_service(
         App::new()
@@ -693,7 +709,9 @@ async fn two_scope_app() -> (
                     .build(),
             )
             .app_data(web::Data::new(admin_state.clone()))
-            .service(devise_rust_actix::devise_for_users(web::Data::new(user_state.clone())))
+            .service(devise_rust_actix::devise_for_users(web::Data::new(
+                user_state.clone(),
+            )))
             .route(
                 "/devise-test/admin-sign-in",
                 web::get().to(admin_bridge_sign_in),
@@ -728,7 +746,8 @@ async fn s2_sign_out_all_scopes_clears_every_mapping() {
     let session_cookie = cookies
         .iter()
         .find(|c| c.starts_with("id="))
-        .expect("session cookie").clone();
+        .expect("session cookie")
+        .clone();
     jar.insert("session", session_cookie);
 
     let resp = test::TestRequest::get()
@@ -771,7 +790,10 @@ async fn s2_sign_out_all_scopes_clears_every_mapping() {
         .to_request();
     let body: serde_json::Value = test::read_body_json(test::call_service(&app, resp).await).await;
     assert_eq!(body["user"], false, "user signed out: {body}");
-    assert_eq!(body["admin"], false, "admin must be signed out too (S2): {body}");
+    assert_eq!(
+        body["admin"], false,
+        "admin must be signed out too (S2): {body}"
+    );
 }
 
 /// M (`verify_signed_out_user)`: Devise checks `all_signed_out?` over EVERY
@@ -794,7 +816,8 @@ async fn m_verify_signed_out_user_iterates_all_scopes() {
     let session_cookie = cookies
         .iter()
         .find(|c| c.starts_with("id="))
-        .expect("session cookie").clone();
+        .expect("session cookie")
+        .clone();
     jar.insert("session", session_cookie);
 
     let resp = test::TestRequest::get()
@@ -904,7 +927,8 @@ async fn s6_empty_salt_record_stays_signed_in() {
     let session_cookie = cookies
         .iter()
         .find(|c| c.starts_with("id="))
-        .expect("session cookie").clone();
+        .expect("session cookie")
+        .clone();
 
     // The middleware fetch must resolve the empty-salt session (S6).
     let resp = test::TestRequest::get()
@@ -977,7 +1001,8 @@ async fn m_stored_location_keeps_query_string() {
     let session_cookie = cookies
         .iter()
         .find(|c| c.starts_with("id="))
-        .expect("session cookie").clone();
+        .expect("session cookie")
+        .clone();
 
     // Sign in on the same session: the stored location (with query) wins.
     let resp = test::TestRequest::post()
@@ -1034,11 +1059,14 @@ async fn s11_flash_reads_once_then_clears() {
     let session_cookie = cookies
         .iter()
         .find(|c| c.starts_with("id="))
-        .expect("session cookie").clone();
+        .expect("session cookie")
+        .clone();
 
     // First read returns the key and clears it (read-once).
     assert_eq!(
-        common::flash_of(&app, session_cookie.as_str()).await.as_deref(),
+        common::flash_of(&app, session_cookie.as_str())
+            .await
+            .as_deref(),
         Some("signed_in"),
         "the flash key must be readable once"
     );
@@ -1083,7 +1111,8 @@ async fn s11_tampered_flash_is_rejected() {
     let session_cookie = cookies
         .iter()
         .find(|c| c.starts_with("id="))
-        .expect("session cookie").clone();
+        .expect("session cookie")
+        .clone();
 
     // Tamper: flip a byte in the signed session cookie.
     let mut chars: Vec<char> = session_cookie.chars().collect();
@@ -1133,7 +1162,8 @@ async fn m_omniauth_flash_carries_bare_key() {
     let session_cookie = cookies
         .iter()
         .find(|c| c.starts_with("id=") || c.starts_with("actix-session="))
-        .expect("session cookie").clone();
+        .expect("session cookie")
+        .clone();
 
     let resp = test::TestRequest::get()
         .uri("/users/auth/stub/callback?code=x&state=tampered")
@@ -1173,10 +1203,8 @@ async fn m_omniauth_flash_carries_bare_key() {
 #[actix_web::test]
 async fn m_no_silently_inert_session_store_surface() {
     let registry = common::registry_with(common::default_mapping());
-    let middleware = devise_rust_actix::DeviseMiddleware::new(
-        registry,
-        Arc::new(common::test_config()),
-    );
+    let middleware =
+        devise_rust_actix::DeviseMiddleware::new(registry, Arc::new(common::test_config()));
     let _ = middleware;
 }
 

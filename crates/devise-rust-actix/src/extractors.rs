@@ -237,9 +237,7 @@ impl<M: AnyDeviseModel + Send + Sync + 'static> FromRequest for RequireAuth<M> {
                     target.push('?');
                     target.push_str(&pairs.join("&"));
                 }
-                if let Some(stored) =
-                    devise_rust::request::AuthRequest::parse_stored_uri(&target)
-                {
+                if let Some(stored) = devise_rust::request::AuthRequest::parse_stored_uri(&target) {
                     use actix_session::SessionExt as _;
                     let session = req.get_session();
                     let key = devise_rust::failure::stored_location_key(&mapping.name);
@@ -528,10 +526,7 @@ pub fn require_no_authentication(req: &HttpRequest) -> Result<(), HttpResponse> 
     {
         use actix_session::SessionExt as _;
         let session = req.get_session();
-        crate::bridge::set_flash(
-            &session,
-            FailureReason::AlreadyAuthenticated.flash_key(),
-        );
+        crate::bridge::set_flash(&session, FailureReason::AlreadyAuthenticated.flash_key());
     }
     Err(HttpResponse::Found()
         .insert_header((header::LOCATION, target))

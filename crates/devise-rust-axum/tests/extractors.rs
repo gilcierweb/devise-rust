@@ -281,9 +281,7 @@ async fn bridge_dump(session: Session) -> axum::Json<serde_json::Value> {
     let admin_tick = store
         .get_value(&devise_rust::timeoutable::last_request_at_key("admin"))
         .await;
-    let index = store
-        .get_value(devise_rust_axum::bridge::KEY_INDEX)
-        .await;
+    let index = store.get_value(devise_rust_axum::bridge::KEY_INDEX).await;
     axum::Json(serde_json::json!({
         "warden_keys": warden_keys,
         "user_payload": user_payload,

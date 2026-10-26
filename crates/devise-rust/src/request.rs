@@ -165,45 +165,45 @@ impl AuthRequest {
         self
     }
 
-/// Resolve the winning media range of an `Accept` header.
-///
-/// Picks the entry with the highest quality (`q=`); on equal quality the
-/// first listed entry wins, matching how browsers order their preferences.
-/// An empty or unparsable header yields `*/*` (the browser default).
-fn best_media_range(accept: &str) -> &str {
-    let mut best: Option<(&str, f32)> = None;
-    for entry in accept.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let (mime, quality) = match entry.split_once(';') {
-            Some((mime, params)) => {
-                let quality = params
-                    .split(';')
-                    .find_map(|param| {
-                        let param = param.trim();
-                        param
-                            .strip_prefix("q=")
-                            .and_then(|value| value.parse::<f32>().ok())
-                    })
-                    .unwrap_or(1.0);
-                (mime.trim(), quality)
+    /// Resolve the winning media range of an `Accept` header.
+    ///
+    /// Picks the entry with the highest quality (`q=`); on equal quality the
+    /// first listed entry wins, matching how browsers order their preferences.
+    /// An empty or unparsable header yields `*/*` (the browser default).
+    fn best_media_range(accept: &str) -> &str {
+        let mut best: Option<(&str, f32)> = None;
+        for entry in accept.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
             }
-            None => (entry, 1.0),
-        };
-        if mime.is_empty() {
-            continue;
+            let (mime, quality) = match entry.split_once(';') {
+                Some((mime, params)) => {
+                    let quality = params
+                        .split(';')
+                        .find_map(|param| {
+                            let param = param.trim();
+                            param
+                                .strip_prefix("q=")
+                                .and_then(|value| value.parse::<f32>().ok())
+                        })
+                        .unwrap_or(1.0);
+                    (mime.trim(), quality)
+                }
+                None => (entry, 1.0),
+            };
+            if mime.is_empty() {
+                continue;
+            }
+            match best {
+                Some((_, best_quality)) if quality <= best_quality => {}
+                _ => best = Some((mime, quality)),
+            }
         }
-        match best {
-            Some((_, best_quality)) if quality <= best_quality => {}
-            _ => best = Some((mime, quality)),
-        }
+        best.map_or("*/*", |(mime, _)| mime)
     }
-    best.map_or("*/*", |(mime, _)| mime)
-}
 
-/// Check if request is a navigational format (HTML/Turbo Stream)
+    /// Check if request is a navigational format (HTML/Turbo Stream)
     ///
     /// Mirrors Devise's `is_navigational_format?` - Rails resolves
     /// `request.format.ref` from the Accept header and asks whether it is in

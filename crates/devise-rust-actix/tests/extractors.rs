@@ -240,18 +240,16 @@ macro_rules! test_app {
         let state: Arc<TestAppState> = $state;
         let key = devise_rust_actix::callbacks::derive_actix_key(&state.config.secret_key)
             .expect("derive key");
-        let middleware = DeviseMiddleware::new(
-            state.scope_registry.clone(),
-            Arc::new(state.config.clone()),
-        )
-        .with_finder(
-            "user",
-            Arc::new(AdapterBridge::new(state.user_adapter.clone())),
-        )
-        .with_finder(
-            "admin",
-            Arc::new(AdapterBridge::new(state.admin_adapter.clone())),
-        );
+        let middleware =
+            DeviseMiddleware::new(state.scope_registry.clone(), Arc::new(state.config.clone()))
+                .with_finder(
+                    "user",
+                    Arc::new(AdapterBridge::new(state.user_adapter.clone())),
+                )
+                .with_finder(
+                    "admin",
+                    Arc::new(AdapterBridge::new(state.admin_adapter.clone())),
+                );
         test::init_service(
             App::new()
                 .wrap(middleware)

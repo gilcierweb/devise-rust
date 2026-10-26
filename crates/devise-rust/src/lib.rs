@@ -37,7 +37,6 @@
 //! - `timeoutable` - `Timeoutable` inactivity timeout (chain position 8, after `Lockable`): `<=` boundary, epoch tick, remember exemption
 //! - `trackable` - `Trackable` sign-in auditing (chain position 9, last): field shift, socket-peer IP, new-record guard
 
-
 #![warn(clippy::all, clippy::pedantic, unsafe_code)]
 
 // Initialize rust-i18n at crate root - loads translations from `locales/*.yml`

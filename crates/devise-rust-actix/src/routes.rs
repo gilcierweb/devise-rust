@@ -37,7 +37,7 @@ use devise_rust::lockable::{LockAttemptOutcome, Lockable};
 use devise_rust::mailer::Mailer;
 use devise_rust::model::{Recoverable, Registerable, Validatable};
 use devise_rust::rememberable::{self, RememberCookieOp, Rememberable, remember_cookie_key};
-use devise_rust::scope::{Mapping, ScopeRegistry, RouteSpec};
+use devise_rust::scope::{Mapping, RouteSpec, ScopeRegistry};
 use devise_rust::time::Clock;
 use serde_json::{Map, Value as JsonValue};
 
@@ -177,8 +177,7 @@ where
             resource = match (spec.method.as_str(), spec.action.as_str()) {
                 (_, "new") => {
                     if spec.name.contains("registration") {
-                        resource
-                            .route(method_guard(&spec.method).to(registrations_new::<M, A, L>))
+                        resource.route(method_guard(&spec.method).to(registrations_new::<M, A, L>))
                     } else {
                         resource.route(method_guard(&spec.method).to(new_handler::<M, A, L>))
                     }
@@ -516,7 +515,10 @@ where
     // `devise.allow_params_authentication = true`. The middleware defaults
     // the flag to false on every request (S4); the controller flips it for
     // its own sign-in run, exactly where Devise's prepend_before_action does.
-    if let Some(staged) = req.extensions_mut().get_mut::<devise_rust::request::AuthRequest>() {
+    if let Some(staged) = req
+        .extensions_mut()
+        .get_mut::<devise_rust::request::AuthRequest>()
+    {
         staged.flags.allow_params_authentication = true;
     }
     // Devise `require_no_authentication` (sessions_controller.rb:4): an
@@ -920,7 +922,11 @@ where
         let key = format!("signed_up_but_{message}");
         // Devise `expire_data_after_sign_in!`: the inactive branch must not
         // leave any signed-in state behind (registrations_controller.rb:26-29).
-        drop(expire_devise_data_sync(&session, &all_scope_names(&state), &state.config));
+        drop(expire_devise_data_sync(
+            &session,
+            &all_scope_names(&state),
+            &state.config,
+        ));
         if wants_json(&req) {
             HttpResponse::Created()
                 .json(serde_json::json!({ "signed_up": true, "inactive": message }))

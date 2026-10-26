@@ -232,7 +232,8 @@ async fn flow_sign_in_unknown_email_reports_not_found() {
     assert_eq!(resp.status(), StatusCode::FOUND);
     let cookies = set_cookie_pairs(&resp);
     assert!(
-        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"not_found_in_database".to_string()),
+        common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"not_found_in_database".to_string()),
         "not_found_in_database flash on unknown email: {cookies:?}"
     );
 }
@@ -254,7 +255,8 @@ async fn flow_sign_in_unknown_email_paranoid_reports_invalid() {
         "unified invalid flash under paranoid: {cookies:?}"
     );
     assert!(
-        !common::flash_keys_from_cookies(&cookies, &state.config).contains(&"not_found_in_database".to_string()),
+        !common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"not_found_in_database".to_string()),
         "paranoid must not leak account absence: {cookies:?}"
     );
 }
@@ -395,7 +397,8 @@ async fn flow_account_update_email_postpones_until_confirmation() {
     assert_eq!(resp.status(), StatusCode::FOUND);
     let cookies = set_cookie_pairs(&resp);
     assert!(
-        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"update_needs_confirmation".to_string()),
+        common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"update_needs_confirmation".to_string()),
         "update_needs_confirmation flash expected: {cookies:?}"
     );
     // The bypass re-sign-in cycles the session id; a browser follows the
@@ -1061,7 +1064,8 @@ async fn flow_sign_out_again_reports_already_signed_out() {
     assert_eq!(resp.status(), StatusCode::FOUND);
     let cookies = set_cookie_pairs(&resp);
     assert!(
-        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"already_signed_out".to_string()),
+        common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"already_signed_out".to_string()),
         "already_signed_out flash expected: {cookies:?}"
     );
 }
@@ -1086,7 +1090,8 @@ async fn flow_sign_in_while_signed_in_reports_already_authenticated() {
     assert_eq!(resp.status(), StatusCode::FOUND);
     let cookies = set_cookie_pairs(&resp);
     assert!(
-        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"already_authenticated".to_string()),
+        common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"already_authenticated".to_string()),
         "already_authenticated flash expected: {cookies:?}"
     );
 }
@@ -1165,7 +1170,8 @@ async fn flow_sign_up_while_signed_in_is_rejected_with_already_authenticated() {
     );
     let cookies = set_cookie_pairs(&resp);
     assert!(
-        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"already_authenticated".to_string()),
+        common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"already_authenticated".to_string()),
         "already_authenticated flash expected: {cookies:?}"
     );
 
@@ -1174,11 +1180,7 @@ async fn flow_sign_up_while_signed_in_is_rejected_with_already_authenticated() {
         "email",
         Value::String("second-account@example.com".to_string()),
     );
-    let second = state
-        .adapter
-        .find_first(&conditions)
-        .await
-        .expect("lookup");
+    let second = state.adapter.find_first(&conditions).await.expect("lookup");
     assert!(
         second.is_none(),
         "no second account may be created while signed in"
@@ -1203,7 +1205,8 @@ async fn flow_sign_up_while_signed_in_is_rejected_with_already_authenticated() {
         );
         let cookies = set_cookie_pairs(&resp);
         assert!(
-            common::flash_keys_from_cookies(&cookies, &state.config).contains(&"already_authenticated".to_string()),
+            common::flash_keys_from_cookies(&cookies, &state.config)
+                .contains(&"already_authenticated".to_string()),
             "already_authenticated flash expected on {uri}: {cookies:?}"
         );
     }
@@ -1234,7 +1237,10 @@ async fn flow_sign_up_while_signed_in_is_rejected_with_already_authenticated() {
         .await
         .expect("lookup")
         .expect("record");
-    assert_ne!(fresh.encrypted_password, "", "the anonymous sign-up persists a password");
+    assert_ne!(
+        fresh.encrypted_password, "",
+        "the anonymous sign-up persists a password"
+    );
 }
 
 /// S7 (security audit): Devise's strong-parameters contract — the
@@ -1297,17 +1303,11 @@ async fn flow_sign_up_mass_assignment_is_dropped_by_sanitizer() {
 async fn flow_sign_in_with_username_authentication_key() {
     let mut config = common::test_config();
     config.authentication_keys = vec!["username".to_string()];
-    let (state, app) = common::build_app(common::test_state_with_config(
-        default_mapping(),
-        config,
-    ));
+    let (state, app) = common::build_app(common::test_state_with_config(default_mapping(), config));
 
-    let mut user = FixtureUser::new_with_password(
-        "username-identity@example.com",
-        "secret123",
-        &state.config,
-    )
-    .confirmed_now(&SystemClock);
+    let mut user =
+        FixtureUser::new_with_password("username-identity@example.com", "secret123", &state.config)
+            .confirmed_now(&SystemClock);
     user.username = Some("alice".to_string());
     state.adapter.create(user).await.expect("seed");
 
@@ -1316,10 +1316,7 @@ async fn flow_sign_in_with_username_authentication_key() {
         Request::builder()
             .method(Method::POST)
             .uri("/users/sign_in")
-            .header(
-                header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(Body::from("username=alice&password=secret123"))
             .expect("request"),
     )
@@ -1368,10 +1365,7 @@ async fn flow_sign_out_with_sibling_scope_signed_in_is_not_already_signed_out() 
         Request::builder()
             .method(Method::POST)
             .uri("/admins/sign_in")
-            .header(
-                header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(Body::from("email=sibling%40example.com&password=secret123"))
             .expect("request"),
     )
@@ -1400,11 +1394,13 @@ async fn flow_sign_out_with_sibling_scope_signed_in_is_not_already_signed_out() 
     );
     let cookies = set_cookie_pairs(&resp);
     assert!(
-        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"signed_out".to_string()),
+        common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"signed_out".to_string()),
         "signed_out flash expected: {cookies:?}"
     );
     assert!(
-        !common::flash_keys_from_cookies(&cookies, &state.config).contains(&"already_signed_out".to_string()),
+        !common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"already_signed_out".to_string()),
         "already_signed_out must not fire while a sibling scope is signed in: {cookies:?}"
     );
 }

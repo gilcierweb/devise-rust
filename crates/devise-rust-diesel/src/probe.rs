@@ -44,9 +44,7 @@ struct Hit {
 /// sqlx `fetch_optional(...).map_err(map_sqlx_error)?` and sea-orm
 /// `query_one(...).map_err(map_sea_orm_error)?` seams, and with this module's
 /// own doc contract).
-fn classify_probe_result(
-    result: Result<Hit, diesel::result::Error>,
-) -> Result<bool, OrmError> {
+fn classify_probe_result(result: Result<Hit, diesel::result::Error>) -> Result<bool, OrmError> {
     match result {
         Ok(hit) => Ok(hit.hit == 1),
         Err(diesel::result::Error::NotFound) => Ok(false),
@@ -124,8 +122,14 @@ mod tests {
     /// value is absent — both `Ok`, never an error.
     #[test]
     fn hit_row_reports_presence() {
-        assert!(matches!(classify_probe_result(Ok(Hit { hit: 1 })), Ok(true)));
-        assert!(matches!(classify_probe_result(Ok(Hit { hit: 0 })), Ok(false)));
+        assert!(matches!(
+            classify_probe_result(Ok(Hit { hit: 1 })),
+            Ok(true)
+        ));
+        assert!(matches!(
+            classify_probe_result(Ok(Hit { hit: 0 })),
+            Ok(false)
+        ));
     }
 
     /// diesel reports "zero rows" as `NotFound`; that is the absent answer,
@@ -144,8 +148,7 @@ mod tests {
     /// `is_ok_and` swallowed every error into "absent".
     #[test]
     fn catalog_failure_is_not_swallowed_into_absent() {
-        let result =
-            classify_probe_result(Err(diesel::result::Error::RollbackTransaction));
+        let result = classify_probe_result(Err(diesel::result::Error::RollbackTransaction));
         assert!(
             result.is_err(),
             "a catalog failure must map to Err, not Ok(false): {result:?}"

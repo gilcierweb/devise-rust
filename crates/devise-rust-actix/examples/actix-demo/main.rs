@@ -916,8 +916,8 @@ fn app_factory(
     let admin_finder: Arc<dyn ModelFinder> = Arc::new(AdapterBridge::new(adapter));
 
     let middleware = DeviseMiddleware::new(registry, config)
-    .with_finder("user", user_finder)
-    .with_finder("admin", admin_finder);
+        .with_finder("user", user_finder)
+        .with_finder("admin", admin_finder);
 
     App::new()
         .wrap(middleware)

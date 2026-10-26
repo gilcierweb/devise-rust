@@ -989,7 +989,10 @@ async fn failure_split_navigational_302_api_401() {
             v.to_str().is_ok_and(|c| {
                 // S11: the flash value is a signed envelope over the bare
                 // key — the name still prefixes the cookie.
-                c.split(';').next().unwrap_or_default().starts_with("devise.flash=")
+                c.split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .starts_with("devise.flash=")
             })
         });
     assert!(has_flash, "navigational failures carry the flash cookie");
@@ -1068,9 +1071,10 @@ async fn query_credentials_do_not_authenticate_guarded_routes() {
         .uri("/users/dashboard?user_email=tracer@example.com&user_password=password123")
         .body(Body::empty())
         .expect("request");
-    probe
-        .headers_mut()
-        .insert(header::ACCEPT, axum::http::HeaderValue::from_static("application/json"));
+    probe.headers_mut().insert(
+        header::ACCEPT,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
     let response = app.oneshot(probe).await.expect("oneshot");
     assert_eq!(
         response.status(),

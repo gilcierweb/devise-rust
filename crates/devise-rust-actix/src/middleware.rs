@@ -325,9 +325,8 @@ fn drain_remember_clears<B>(
     let staged: Vec<(String, String)> = guard.clone();
     drop(guard);
     for (scope, name) in staged {
-        let attrs = devise_rust::rememberable::RememberableCookieAttrs::for_scope(
-            &scope, config, clock,
-        );
+        let attrs =
+            devise_rust::rememberable::RememberableCookieAttrs::for_scope(&scope, config, clock);
         let _ = response
             .response_mut()
             .add_removal_cookie(&crate::remember::removal_cookie(&name, &attrs));
