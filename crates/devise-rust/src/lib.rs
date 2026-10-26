@@ -18,6 +18,7 @@
 //! - `adapter` - `OrmAdapter` trait (`get`/`find_first`/`create`+`insert` alias/`update`/`update_columns`/`increment_counter`/`delete` + defaults), `OrmError`, `Conditions`, `ChangeSet`, `DeviseKey`, in-memory adapter
 //! - `time` - `Clock` trait for time abstraction
 //! - `error` - `DeviseError`, `ValidationErrors`, `ResourceWithErrors`, `BlankRecord`
+//! - `failed_attempt` - object-safe lockable accounting seam for the strategy chain
 //! - `failure` - `Failure` enum, `AuthOutcome`, `AnyDeviseModel` trait
 //! - `helpers` - per-scope auth helpers, path helpers, groups, `devise_helpers!`
 //! - `hooks` - `HookRegistry`, `HookFilter`, `Event`, bridge traits
@@ -33,9 +34,9 @@
 //! - `scope` - `Module`, `Mapping`, `ScopeRegistry`, `RouteSpec`
 //! - `session` - `SessionStore` trait, serializer, key naming
 //! - `strategy` - `Strategy` chain: params, HTTP Basic, rememberable, paranoid
-//! - `time` - `Clock` trait for time abstraction
 //! - `timeoutable` - `Timeoutable` inactivity timeout (chain position 8, after `Lockable`): `<=` boundary, epoch tick, remember exemption
 //! - `trackable` - `Trackable` sign-in auditing (chain position 9, last): field shift, socket-peer IP, new-record guard
+
 
 #![warn(clippy::all, clippy::pedantic, unsafe_code)]
 

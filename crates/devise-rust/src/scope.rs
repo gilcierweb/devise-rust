@@ -209,10 +209,27 @@ impl Mapping {
     /// Mirrors `Mapping#fullpath` with the `.squeeze('/')` slash collapsing devise applies.
     #[must_use]
     pub fn full_path(&self) -> String {
-        match &self.path_prefix {
+        let joined = match &self.path_prefix {
             Some(prefix) => format!("/{prefix}/{}", self.path),
             None => format!("/{}", self.path),
+        };
+        // Devise `.squeeze('/')` (`mapping.rb:102-104`): a prefix like
+        // "/api/" must not double the slashes ("//api//users" matches no
+        // router).
+        let mut squeezed = String::with_capacity(joined.len());
+        let mut previous_was_slash = false;
+        for ch in joined.chars() {
+            if ch == '/' {
+                if !previous_was_slash {
+                    squeezed.push(ch);
+                }
+                previous_was_slash = true;
+            } else {
+                squeezed.push(ch);
+                previous_was_slash = false;
+            }
         }
+        squeezed
     }
 
     /// Get the scoped path for nested routes
@@ -418,9 +435,18 @@ impl Mapping {
             "edit",
             format!("edit_{}", self.named("registration")),
         ));
+        // Devise `resource :registration, path: names.registration` with the
+        // default empty name emits the scope's base path for update/create/
+        // destroy (rails/routes.rb:401-418) - a trailing slash would match
+        // neither the update verb nor the destroy row in a real router.
+        let registration_path = if self.path_names.registration.is_empty() {
+            base.clone()
+        } else {
+            self.scoped(&self.path_names.registration)
+        };
         for method in ["PATCH", "PUT"] {
             specs.push(RouteSpec::new(
-                self.scoped(&self.path_names.registration),
+                registration_path.clone(),
                 method,
                 "update",
                 self.named("registration"),
@@ -1082,6 +1108,55 @@ mod tests {
         assert_eq!(mapping.sign_in_path(), "/api/users/sign_in");
     }
 
+    /// Devise `Mapping#fullpath` applies `.squeeze('/')`
+    /// (`mapping.rb:102-104`): a sloppy `path_prefix` like `"/api/"` must
+    /// not emit `"//api//users"`, which no router would match.
+    #[test]
+    fn test_mapping_full_path_squeezes_redundant_slashes() {
+        let mapping_with_slashed_prefix = Mapping {
+            path_prefix: Some("/api/".to_string()),
+            path: "users".to_string(),
+            ..mapping_fixture()
+        };
+        assert_eq!(mapping_with_slashed_prefix.full_path(), "/api/users");
+
+        let mapping_with_plain_prefix = Mapping {
+            path_prefix: Some("api".to_string()),
+            path: "users".to_string(),
+            ..mapping_fixture()
+        };
+        assert_eq!(mapping_with_plain_prefix.full_path(), "/api/users");
+
+        let mapping_without_prefix = Mapping {
+            path_prefix: None,
+            path: "users".to_string(),
+            ..mapping_fixture()
+        };
+        assert_eq!(mapping_without_prefix.full_path(), "/users");
+    }
+
+    /// Minimal mapping fixture for path-shape tests.
+    fn mapping_fixture() -> Mapping {
+        Mapping {
+            name: "user".to_string(),
+            class_name: "User".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![Module::DatabaseAuthenticatable],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: SignOutVia::Delete,
+            failure_app: None,
+        }
+    }
+
     #[test]
     fn test_mapping_effective_modules() {
         let mut mapping = Mapping {
@@ -1180,6 +1255,48 @@ mod tests {
         let specs = mapping.route_specs();
         // sign_up GET, create POST, cancel GET, edit GET, update PATCH/PUT, destroy DELETE
         assert_eq!(specs.len(), 7);
+    }
+
+    #[test]
+    fn test_registration_update_path_has_no_trailing_slash() {
+        // Devise `resource :registration, path: ""` emits /users for update
+        // (rails/routes.rb:401-418); a "/users/" row matches neither the
+        // update nor the destroy path in a real router.
+        let mapping = Mapping {
+            name: "user".to_string(),
+            class_name: "User".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![Module::Registerable],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: SignOutVia::Delete,
+            failure_app: None,
+        };
+
+        let specs = mapping.route_specs();
+        for method in ["PATCH", "PUT"] {
+            let row = specs
+                .iter()
+                .find(|spec| spec.method == method)
+                .expect("registration update row exists");
+            assert_eq!(
+                row.path, "/users",
+                "{method} registration path must not carry a trailing slash"
+            );
+        }
+        let destroy = specs
+            .iter()
+            .find(|spec| spec.method == "DELETE")
+            .expect("registration destroy row exists");
+        assert_eq!(destroy.path, "/users");
     }
 
     #[test]
