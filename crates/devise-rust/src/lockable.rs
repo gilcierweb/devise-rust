@@ -7,10 +7,12 @@
 //! unlock tokens with raw-token restore, paranoid message suppression, and
 //! the sign-in reset hook semantics.
 //!
-//! Persistence always goes through `update_columns` (the forced-write verb,
-//! never the diff-only `update`) plus a re-get, mirroring Devise's
-//! `increment_counter` plus `reload` so concurrent increments read from the
-//! store. Every time read takes `&dyn Clock`.
+//! Persistence goes through `update_columns` (the forced-write verb, never the
+//! diff-only `update`) plus a re-get, EXCEPT the counter: `failed_attempts`
+//! rides the adapter's atomic [`OrmAdapter::increment_counter`] (one
+//! `SET failed_attempts = failed_attempts + 1`), because a read-modify-write
+//! loses increments under concurrent failures. Every time read takes
+//! `&dyn Clock`.
 //!
 //! == Options
 //!
@@ -404,37 +406,30 @@ pub trait Lockable: Authenticatable + HasEmail {
         Ok(())
     }
 
-    /// `increment_failed_attempts` (LCK-01): re-read the counter from the
-    /// store, add one, persist via `update_columns`, and reload the record.
+    /// `increment_failed_attempts` (LCK-01): one atomic `increment_counter`
+    /// call, and the reloaded row becomes the caller's copy.
     ///
-    /// The re-get mirrors Devise's `increment_counter` plus `reload`: two
-    /// concurrent processes each read the committed value, so no increment
-    /// is lost to a stale in-memory copy. Diesel backends must keep this a
-    /// single-statement increment (one `UPDATE ... SET failed_attempts =
-    /// failed_attempts + 1`); the re-get here only refreshes the caller's
-    /// copy afterwards.
+    /// Devise's `increment_counter(:failed_attempts, id)` plus `reload`. The
+    /// increment MUST ride [`OrmAdapter::increment_counter`]: a
+    /// read-modify-write (`get` -> `saturating_add(1)` -> `update_columns`
+    /// with an ABSOLUTE value) is last-write-wins, so two concurrent failures
+    /// that read the same committed value write the same number back and lose
+    /// one increment - the failure mode D-11's counter contract exists to
+    /// prevent. The returned row is the post-increment store state, so the
+    /// caller never trusts a stale in-memory counter.
     ///
     /// # Errors
     ///
-    /// `DeviseError::NotFound` when the record is not in the store,
-    /// `DeviseError::Adapter` on other persistence failures.
+    /// `DeviseError::Adapter` on any persistence failure (including
+    /// `OrmError::NotFound` for an unknown key, which the adapter maps
+    /// without a separate pre-check).
     async fn increment_failed_attempts<A>(&mut self, adapter: &A) -> Result<(), DeviseError>
     where
         Self: Sized,
         A: OrmAdapter<Self> + Send + Sync,
     {
-        let fresh = adapter
-            .get(&self.to_key())
-            .await
-            .map_err(DeviseError::Adapter)?
-            .ok_or(DeviseError::NotFound)?;
-        let next = fresh.failed_attempts().saturating_add(1);
-        let fields = HashMap::from([(
-            "failed_attempts".to_string(),
-            Value::Integer(i64::from(next)),
-        )]);
         let updated = adapter
-            .update_columns(&self.to_key(), &fields)
+            .increment_counter(&self.to_key(), "failed_attempts")
             .await
             .map_err(DeviseError::Adapter)?;
         *self = updated;
@@ -961,6 +956,216 @@ mod tests {
             id: &crate::adapter::DeviseKey,
         ) -> Result<(), crate::adapter::OrmError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete(id).await
+        }
+    }
+
+    /// S8 / D-11: `increment_failed_attempts` must ride the adapter's ATOMIC
+    /// `increment_counter` verb, never the read-modify-write of
+    /// `get` -> `saturating_add(1)` -> `update_columns` with an ABSOLUTE value.
+    ///
+    /// The spy below shows the verb selection: the absolute-write shape lets
+    /// two concurrent failures that both read the same value write the same
+    /// number back (a lost increment), which is exactly what
+    /// `OrmAdapter::increment_counter`'s contract forbids D-11 from riding.
+    #[tokio::test]
+    async fn lockable_increment_failed_attempts_rides_the_atomic_verb() {
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mut user = TestUser::fresh(1, "atomic@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        let key = user.to_key();
+
+        let increments = Arc::new(AtomicUsize::new(0));
+        let absolute_writes = Arc::new(AtomicUsize::new(0));
+        let spy = SpyWriteAdapter {
+            inner: &adapter,
+            increments: Arc::clone(&increments),
+            absolute_writes: Arc::clone(&absolute_writes),
+        };
+
+        user.increment_failed_attempts(&spy).await.unwrap();
+        assert_eq!(user.failed_attempts(), 1);
+
+        assert_eq!(
+            increments.load(Ordering::SeqCst),
+            1,
+            "the increment must ride the adapter's atomic verb"
+        );
+        assert_eq!(
+            absolute_writes.load(Ordering::SeqCst),
+            0,
+            "an absolute failed_attempts write is the lost-update shape D-11 forbids"
+        );
+
+        // The record the caller holds is the adapter's reloaded row.
+        let stored = adapter.get(&key).await.unwrap().unwrap();
+        assert_eq!(stored.failed_attempts, 1);
+        assert_eq!(user.failed_attempts(), stored.failed_attempts);
+    }
+
+    /// S8: the lost update itself. A second failing attempt commits INSIDE
+    /// this increment's read-modify-write window - the interleaving two
+    /// concurrent sign-ins produce - and the absolute write clobbers it.
+    /// Riding the atomic verb keeps both increments.
+    #[tokio::test]
+    async fn lockable_increment_failed_attempts_loses_no_update_under_a_racing_write() {
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mut user = TestUser::fresh(1, "race@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        let key = user.to_key();
+
+        let racy = RacyWriteAdapter {
+            inner: &adapter,
+            commits: Arc::new(AtomicUsize::new(0)),
+        };
+
+        // One recorded failure while another failure lands in the window
+        // between the caller's read and the caller's write.
+        user.increment_failed_attempts(&racy).await.unwrap();
+
+        let stored = adapter.get(&key).await.unwrap().unwrap();
+        assert_eq!(
+            stored.failed_attempts,
+            u32::try_from(racy.commits()).unwrap_or(0) + 1,
+            "the racing increment plus our own must both survive: {} committed, store holds {}",
+            racy.commits(),
+            stored.failed_attempts
+        );
+    }
+
+    /// Adapter that records WHICH write verb the caller used: the atomic
+    /// `increment_counter`, or an absolute `update_columns` on the counter
+    /// column (the lost-update shape D-11 forbids).
+    struct SpyWriteAdapter<'a> {
+        inner: &'a MemoryAdapter<TestUser>,
+        increments: Arc<AtomicUsize>,
+        absolute_writes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::adapter::OrmAdapter<TestUser> for SpyWriteAdapter<'_> {
+        type New = TestUser;
+
+        async fn get(
+            &self,
+            id: &crate::adapter::DeviseKey,
+        ) -> Result<Option<TestUser>, crate::adapter::OrmError> {
+            self.inner.get(id).await
+        }
+
+        async fn find_first(
+            &self,
+            conditions: &crate::adapter::Conditions,
+        ) -> Result<Option<TestUser>, crate::adapter::OrmError> {
+            self.inner.find_first(conditions).await
+        }
+
+        async fn create(&self, model: TestUser) -> Result<TestUser, crate::adapter::OrmError> {
+            self.inner.create(model).await
+        }
+
+        async fn update(
+            &self,
+            key: &crate::adapter::DeviseKey,
+            changes: &crate::adapter::ChangeSet,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            self.inner.update(key, changes).await
+        }
+
+        async fn update_columns(
+            &self,
+            key: &crate::adapter::DeviseKey,
+            fields: &HashMap<String, Value>,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            if matches!(fields.get("failed_attempts"), Some(Value::Integer(_))) {
+                self.absolute_writes.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.update_columns(key, fields).await
+        }
+
+        async fn increment_counter(
+            &self,
+            key: &crate::adapter::DeviseKey,
+            column: &'static str,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            self.increments.fetch_add(1, Ordering::SeqCst);
+            self.inner.increment_counter(key, column).await
+        }
+
+        async fn delete(&self, id: &crate::adapter::DeviseKey) -> Result<(), crate::adapter::OrmError> {
+            self.inner.delete(id).await
+        }
+    }
+
+    /// Adapter simulating a concurrent failing attempt committing inside the
+    /// caller's read-modify-write window: every `failed_attempts` write is
+    /// preceded by a competing `increment_counter`.
+    struct RacyWriteAdapter<'a> {
+        inner: &'a MemoryAdapter<TestUser>,
+        commits: Arc<AtomicUsize>,
+    }
+
+    impl RacyWriteAdapter<'_> {
+        fn commits(&self) -> usize {
+            self.commits.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl crate::adapter::OrmAdapter<TestUser> for RacyWriteAdapter<'_> {
+        type New = TestUser;
+
+        async fn get(
+            &self,
+            id: &crate::adapter::DeviseKey,
+        ) -> Result<Option<TestUser>, crate::adapter::OrmError> {
+            self.inner.get(id).await
+        }
+
+        async fn find_first(
+            &self,
+            conditions: &crate::adapter::Conditions,
+        ) -> Result<Option<TestUser>, crate::adapter::OrmError> {
+            self.inner.find_first(conditions).await
+        }
+
+        async fn create(&self, model: TestUser) -> Result<TestUser, crate::adapter::OrmError> {
+            self.inner.create(model).await
+        }
+
+        async fn update(
+            &self,
+            key: &crate::adapter::DeviseKey,
+            changes: &crate::adapter::ChangeSet,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            self.inner.update(key, changes).await
+        }
+
+        async fn update_columns(
+            &self,
+            key: &crate::adapter::DeviseKey,
+            fields: &HashMap<String, Value>,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            if matches!(fields.get("failed_attempts"), Some(Value::Integer(_))) {
+                // The competing failure lands between the caller's read and
+                // its absolute write - last-write-wins clobbers it.
+                self.commits.fetch_add(1, Ordering::SeqCst);
+                self.inner
+                    .increment_counter(key, "failed_attempts")
+                    .await?;
+            }
+            self.inner.update_columns(key, fields).await
+        }
+
+        async fn increment_counter(
+            &self,
+            key: &crate::adapter::DeviseKey,
+            column: &'static str,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            self.inner.increment_counter(key, column).await
+        }
+
+        async fn delete(&self, id: &crate::adapter::DeviseKey) -> Result<(), crate::adapter::OrmError> {
             self.inner.delete(id).await
         }
     }

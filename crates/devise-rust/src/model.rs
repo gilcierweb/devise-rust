@@ -79,7 +79,8 @@ pub fn normalize_attribute_map(
     normalized
 }
 
-/// Normalize auth conditions per Devise config (AUTH-06).///
+/// Normalize auth conditions per Devise config (AUTH-06).
+///
 /// Applies [`normalize_credential_value`] to every string entry, returning
 /// a new map. Concrete models call this on their condition maps before
 /// validation and lookup.
@@ -101,6 +102,41 @@ pub fn normalize_auth_conditions(conditions: &Conditions, config: &DeviseConfig)
         normalized.insert(key.clone(), value);
     }
     normalized
+}
+
+/// Single home for the password-family blank predicate.
+///
+/// Devise gates every password path on Ruby's `String#present?`, which is
+/// `false` for `nil`, `""`, AND whitespace-only strings (`"   "`). The bare
+/// `is_empty` check that a port reaches for first treats `"   "` as a real
+/// password: it gets bcrypt-hashed into `encrypted_password`, survives as a
+/// credential, and then reports `:too_short` instead of Devise's `:blank`.
+/// `set_password`, the `update_with_password` blank-strip, `reset_password`'s
+/// guard, and `Validatable::validate` all read this one function so the
+/// definition of "present" cannot drift between the write, the validation,
+/// and the reset paths.
+fn value_present(value: Option<&str>) -> Option<&str> {
+    value.filter(|item| !item.trim().is_empty())
+}
+
+fn value_blank(value: Option<&str>) -> bool {
+    value_present(value).is_none()
+}
+
+/// The adapter-value half of the same blank predicate: Ruby's `blank?` is
+/// `false` for every non-nil, non-empty (after trimming) value, so `0`,
+/// `false`, and typed JSON scalars stay present while a whitespace-only
+/// string does not.
+///
+/// Shares [`value_blank`]'s trim rule so the password path and the
+/// `find_or_initialize_with_errors` slice cannot disagree about what counts
+/// as a submitted value.
+fn condition_value_blank(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        _ => false,
+    }
 }
 
 /// Password-checking facet for `DatabaseAuthenticatable` models.
@@ -164,9 +200,10 @@ pub trait DatabaseAuthenticatable: Authenticatable {
 
     /// `password=` setter (DBAU-01): encrypts via `Encryptor::digest`
     /// (stretches, pepper) and stores to `encrypted_password` ONLY when the
-    /// password is present (Devise `password.present?` - None or empty skips).
+    /// password is present (Devise `password.present?` - `None`, empty, or
+    /// whitespace-only skips: a blank value is never hashed).
     fn set_password(&mut self, password: Option<String>, config: &DeviseConfig) {
-        if let Some(plain) = password.as_deref().filter(|p| !p.is_empty()) {
+        if let Some(plain) = value_present(password.as_deref()) {
             let digest = crate::crypto::encryptor::digest(plain, config);
             self.set_encrypted_password(Some(digest));
         }
@@ -241,10 +278,9 @@ pub trait DatabaseAuthenticatable: Authenticatable {
         let current = params
             .remove("current_password")
             .and_then(|v| v.as_str().map(str::to_string));
-        if params
-            .get("password")
-            .is_none_or(|p| p.as_str().is_none_or(str::is_empty))
-        {
+        // Devise's `password.present?` strip: a whitespace-only param is
+        // blank, so the pair is dropped instead of hashed.
+        if value_blank(params.get("password").and_then(JsonValue::as_str)) {
             params.remove("password");
             params.remove("password_confirmation");
         }
@@ -784,7 +820,7 @@ pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
         A: OrmAdapter<Self, New = Self> + Send + Sync,
     {
         let mut errors = ValidationErrors::new();
-        let Some(plain) = new_password.filter(|p| !p.is_empty()) else {
+        let Some(plain) = value_present(new_password.as_deref()).map(str::to_string) else {
             errors.add("password", ":blank");
             return Ok(Err(errors));
         };
@@ -956,6 +992,23 @@ pub trait Validatable: DatabaseAuthenticatable {
         None
     }
 
+    /// Devise `devise_will_save_change_to_email?`: whether this validation
+    /// round is writing a NEW email address.
+    ///
+    /// Devise gates the uniqueness and format validations on it
+    /// (`validates_uniqueness_of :email, if: :devise_will_save_change_to_email?`,
+    /// `validatable.rb:34-35`), so an update that leaves the address alone
+    /// never runs the lookup. The trait holds no in-memory copy of the
+    /// persisted address (an app model owns its columns), so the default
+    /// reports `true` and the self-exclusion in
+    /// [`email_uniqueness_taken`](Self::email_uniqueness_taken) keeps an
+    /// untouched update clean; a model that tracks its original email (or the
+    /// framework bridge, which knows which params it assigned) overrides this
+    /// to return `false` and skip the lookup entirely.
+    fn email_changed(&self) -> bool {
+        true
+    }
+
     /// Match `email` against the configured `email_regexp` (Devise default
     /// `\\A[^@\\s]+@[^@\\s]+\\z`; `\\A`/`\\z` anchors translated for the
     /// `regex` crate).
@@ -985,8 +1038,8 @@ pub trait Validatable: DatabaseAuthenticatable {
         }
 
         if self.password_required() {
-            match self.password() {
-                Some(password) if !password.is_empty() => {
+            match value_present(self.password()) {
+                Some(password) => {
                     if let Some(confirmation) = self.password_confirmation() {
                         if confirmation != password {
                             errors.add("password_confirmation", ":confirmation");
@@ -1016,16 +1069,61 @@ pub trait Validatable: DatabaseAuthenticatable {
         Self: Sized,
         A: OrmAdapter<Self> + Send + Sync,
     {
-        let Some(email) = self.email_value().filter(|e| !e.is_empty()) else {
-            return;
+        // TODO(propagate): an adapter failure (`Err`) is Devise's 500, not a
+        // clean record, and the swallowing is forced by the call shape - see
+        // `email_uniqueness_taken`'s docs for the propagating core.
+        if matches!(self.email_uniqueness_taken(adapter).await, Ok(true)) {
+            errors.add("email", ":taken");
+        }
+    }
+
+    /// Whether ANOTHER record already holds this record's email (VAL-01).
+    ///
+    /// The propagating core behind
+    /// [`validate_email_uniqueness`](Self::validate_email_uniqueness), carrying
+    /// Devise's two exclusion rules:
+    /// * the email-change gate ([`email_changed`](Self::email_changed)) - an
+    ///   untouched address never touches the store;
+    /// * self-exclusion - the lookup meeting the record under validation is
+    ///   Devise's `unless: ->(record) { record.id == id }`, decided on the
+    ///   primary key rather than a nullable scope id whose `None` arm used to
+    ///   flag every self-update as `:taken`. A model whose key cannot express
+    ///   identity (a composite uniqueness scope) narrows the exclusion
+    ///   through [`uniqueness_scope_id`](Self::uniqueness_scope_id).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::adapter::OrmError`] when the lookup fails: a backend
+    /// outage is a 500, never a silent "the email is free".
+    async fn email_uniqueness_taken<A>(&self, adapter: &A) -> Result<bool, crate::adapter::OrmError>
+    where
+        Self: Sized,
+        A: OrmAdapter<Self> + Send + Sync,
+    {
+        if !self.email_changed() {
+            return Ok(false);
+        }
+        let Some(email) = value_present(self.email_value()) else {
+            return Ok(false);
         };
         let mut conditions = Conditions::new();
         conditions.insert("email", Value::String(email.to_string()));
-        if let Ok(Some(existing)) = adapter.find_first(&conditions).await {
-            let existing_id = existing.uniqueness_scope_id();
-            if existing_id.is_none() || existing_id != self.uniqueness_scope_id() {
-                errors.add("email", ":taken");
-            }
+        let Some(existing) = adapter.find_first(&conditions).await? else {
+            return Ok(false);
+        };
+        // The lookup met this very record: not a uniqueness violation. Both
+        // sides must be persisted rows for the key to mean anything - a
+        // store that hands back a pre-insert model (the in-memory oracle's
+        // `create`) leaves a placeholder id on every row, so two DIFFERENT
+        // records can share one key and must not be read as the same row.
+        if existing.persisted() && self.persisted() && existing.to_key() == self.to_key() {
+            return Ok(false);
+        }
+        // A model that cannot express identity through its key narrows the
+        // self-exclusion through `uniqueness_scope_id` (composite scopes).
+        match (existing.uniqueness_scope_id(), self.uniqueness_scope_id()) {
+            (Some(existing), Some(own)) => Ok(existing != own),
+            _ => Ok(true),
         }
     }
 }
@@ -1078,22 +1176,44 @@ pub trait Authenticatable: AnyDeviseModel {
 
     /// Deserialize a session payload back to the record with salt validation.
     ///
-    /// Returns `None` on missing record or salt mismatch (the caller deletes
-    /// the session key on mismatch, per warden fetch semantics).
-    async fn serialize_from_session<A>(key: &DeviseKey, salt: &str, adapter: &A) -> Option<Self>
+    /// `Ok(None)` is the warden fetch verdict - a missing record or a salt
+    /// mismatch (the caller deletes the session key), matching Devise. An
+    /// adapter failure returns `Err` instead of silently becoming "not
+    /// logged in": a backend outage on the fetch path used to read as a
+    /// valid "no user", logging every signed-in visitor out at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::adapter::OrmError`] when the backend fails.
+    async fn serialize_from_session<A>(
+        key: &DeviseKey,
+        salt: &str,
+        adapter: &A,
+    ) -> Result<Option<Self>, crate::adapter::OrmError>
     where
         Self: Sized,
         A: OrmAdapter<Self> + Send + Sync,
     {
-        let record = adapter.get(key).await.ok()??;
-        let current_salt = record.authenticatable_salt()?;
+        let Some(record) = adapter.get(key).await? else {
+            return Ok(None);
+        };
+        let Some(current_salt) = record.authenticatable_salt() else {
+            return Ok(None);
+        };
         if !crate::crypto::secure_compare(&current_salt, salt) {
-            return None;
+            return Ok(None);
         }
-        Some(record)
+        Ok(Some(record))
     }
 
     /// Find a record for authentication with normalized conditions.
+    ///
+    /// A backend failure is reported as `None` here. TODO(propagate): the
+    /// actix/axum bridges call `M::find_for_authentication(...).await` and use
+    /// the result as an `Option`, so returning a `Result` would leave their
+    /// call sites discarding a `must_use` value and trip the workspace's
+    /// `-D warnings` gate; the propagating sibling belongs on the adapter
+    /// seam (`find_first_strict`).
     async fn find_for_authentication<A>(
         conditions: &Conditions,
         adapter: &A,
@@ -1104,6 +1224,8 @@ pub trait Authenticatable: AnyDeviseModel {
         A: OrmAdapter<Self> + Send + Sync,
     {
         let filtered = Self::normalize_auth_attributes_static(conditions, config);
+        // TODO(propagate): see the method docs - the Option return shape is
+        // pinned by the bridges' call sites.
         adapter.find_first(&filtered).await.ok().flatten()
     }
 
@@ -1122,7 +1244,9 @@ pub trait Authenticatable: AnyDeviseModel {
 
     /// Find by one attribute or return a blank record carrying `error`.
     ///
-    /// Mirrors Devise's `find_or_initialize_with_error_by`.
+    /// Mirrors Devise's `find_or_initialize_with_error_by`, which is a thin
+    /// wrapper over the group form - so the blank handling lives in exactly
+    /// one place.
     async fn find_or_initialize_with_error_by<A>(
         attr: &str,
         value: &str,
@@ -1136,19 +1260,22 @@ pub trait Authenticatable: AnyDeviseModel {
     {
         let mut conditions = Conditions::new();
         conditions.insert(attr.to_string(), Value::String(value.to_string()));
-        let filtered = Self::normalize_auth_attributes_static(&conditions, config);
-        if let Ok(Some(record)) = adapter.find_first(&filtered).await {
-            ResourceWithErrors::new(record, ValidationErrors::new())
-        } else {
-            let mut errors = ValidationErrors::new();
-            errors.add(attr, error);
-            ResourceWithErrors::new(Self::default(), errors)
-        }
+        Self::find_or_initialize_with_errors(&[attr], &conditions, error, adapter, config).await
     }
 
     /// Find by several attributes or return a blank record with errors.
     ///
-    /// Mirrors Devise's `find_or_initialize_with_errors`.
+    /// Mirrors Devise's `find_or_initialize_with_errors`
+    /// (`authenticatable.rb:277-292`) step for step:
+    /// 1. `slice(*required_attributes).delete_if { |k, v| v.blank? }` - only
+    ///    the required keys survive, and only when their submitted value is
+    ///    present (a whitespace-only string is blank, per Ruby's `blank?`);
+    /// 2. `if attributes.size == required_attributes.size` - the lookup runs
+    ///    ONLY when EVERY required key survived, so a partial key set can
+    ///    never revive an arbitrary row on a permissive backend;
+    /// 3. otherwise an unsaved record seeded with the surviving attributes,
+    ///    each required key carrying `:blank` when its submitted value was
+    ///    blank and the caller's error otherwise.
     async fn find_or_initialize_with_errors<A>(
         attrs: &[&str],
         conditions: &Conditions,
@@ -1160,24 +1287,92 @@ pub trait Authenticatable: AnyDeviseModel {
         Self: Sized + Default,
         A: OrmAdapter<Self> + Send + Sync,
     {
-        let filtered = Self::normalize_auth_attributes_static(conditions, config);
-        if let Ok(Some(record)) = adapter.find_first(&filtered).await {
-            ResourceWithErrors::new(record, ValidationErrors::new())
-        } else {
-            let mut errors = ValidationErrors::new();
-            for attr in attrs {
-                errors.add(attr, error);
+        let mut present = Conditions::new();
+        for attr in attrs {
+            if let Some(value) = conditions.get_raw(attr).filter(|v| !condition_value_blank(v)) {
+                present.insert((*attr).to_string(), value.clone());
             }
-            ResourceWithErrors::new(Self::default(), errors)
         }
+
+        // Step 2: lookup only with the complete key set.
+        if present.iter().count() == attrs.len() {
+            let filtered = Self::normalize_auth_attributes_static(&present, config);
+            // TODO(propagate): the call sites (recoverable, confirmable, lockable)
+            // consume this as a record-and-errors value, so an adapter failure
+            // here is currently reported as "not found"; a Result-returning
+            // sibling belongs on those call sites.
+            if let Ok(Some(record)) = adapter.find_first(&filtered).await {
+                return ResourceWithErrors::new(record, ValidationErrors::new());
+            }
+        }
+
+        // Step 3: unsaved record seeded with the normalized surviving
+        // attributes (Devise's `new(devise_parameter_filter.filter(attributes))`),
+        // plus one error per required key.
+        let filtered = Self::normalize_auth_attributes_static(&present, config);
+        let seeded: serde_json::Map<String, JsonValue> = filtered
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    serde_json::to_value(value).unwrap_or(JsonValue::Null),
+                )
+            })
+            .collect();
+        let mut record = Self::default();
+        record.seed_initialized_attributes(&seeded);
+        let mut errors = ValidationErrors::new();
+        for attr in attrs {
+            let blank = conditions
+                .get_raw(attr)
+                .is_none_or(condition_value_blank);
+            errors.add(attr, if blank { ":blank" } else { error });
+        }
+        ResourceWithErrors::new(record, errors)
+    }
+
+    /// Seed a freshly initialized record with filtered attributes.
+    ///
+    /// The "initialize" half of Devise's `find_or_initialize_with_errors`,
+    /// whose miss branch returns `new(devise_parameter_filter.filter(attributes))`
+    /// rather than a bare `new`. The base trait cannot bound
+    /// `DatabaseAuthenticatable` (whose `assign_attributes` is the write
+    /// seam), so the default is a no-op and app models wire it:
+    ///
+    /// ```ignore
+    /// fn seed_initialized_attributes(&mut self, attributes: &serde_json::Map<String, JsonValue>) {
+    ///     self.assign_attributes(attributes);
+    /// }
+    /// ```
+    fn seed_initialized_attributes(&mut self, _attributes: &serde_json::Map<String, JsonValue>) {}
+
+    /// The model's own serializable fields, BEFORE the unsafe-attribute
+    /// filter runs.
+    ///
+    /// App models override this instead of [`serializable_hash`](Self::serializable_hash):
+    /// the default `serializable_hash` composes this field map with
+    /// [`filter_unsafe_attributes`](crate::error::filter_unsafe_attributes), so
+    /// the CONCERNS #6 filter is applied by construction and cannot be
+    /// forgotten the way the old "override `serializable_hash` and remember to
+    /// filter" contract could be.
+    fn serializable_fields(&self) -> serde_json::Map<String, JsonValue> {
+        serde_json::Map::new()
     }
 
     /// Serializable hash excluding unsafe attributes.
     ///
-    /// Concrete models override this to serialize their fields while
-    /// filtering [`UNSAFE_ATTRIBUTES_FOR_SERIALIZATION`](crate::error::UNSAFE_ATTRIBUTES_FOR_SERIALIZATION).
+    /// Default composition: [`serializable_fields`](Self::serializable_fields)
+    /// through [`filter_unsafe_attributes`](crate::error::filter_unsafe_attributes)
+    /// - so a model that publishes `encrypted_password`, a reset/confirmation
+    /// token, `unconfirmed_email`, or a sign-in IP through its fields still
+    /// never leaks it (Devise's `serializable_hash` filters
+    /// [`UNSAFE_ATTRIBUTES_FOR_SERIALIZATION`](crate::error::UNSAFE_ATTRIBUTES_FOR_SERIALIZATION)).
+    /// A model may still override this to hand-build the JSON; it then owns the
+    /// filter call itself.
     fn serializable_hash(&self) -> JsonValue {
-        JsonValue::Object(serde_json::Map::new())
+        JsonValue::Object(crate::error::filter_unsafe_attributes(
+            &self.serializable_fields(),
+        ))
     }
 
     /// Normalize conditions per config (delegates to [`normalize_auth_conditions`]).
@@ -1220,17 +1415,20 @@ pub fn chain_active_for_authentication(confirmable_active: bool, lockable_active
 
 /// First-failing inactive message for the canonical chain.
 ///
-/// The confirmable slice wins over the lockable slice (`unconfirmed` before
-/// `locked`, mirroring Devise's `super`-chain evaluation); `inactive` when
-/// every gate defers.
+/// The lockable slice wins over the confirmable slice (`locked` before
+/// `unconfirmed`, mirroring Devise's `super`-chain evaluation: lockable is
+/// included after confirmable in `Devise::ALL` order, so it is the
+/// outermost link and `lockable.rb:95-97` checks `access_locked?` first);
+/// `inactive` when every gate defers.
 ///
 /// == Examples
 ///
 /// ```
 /// use devise_rust::model::chain_inactive_message;
 ///
-/// assert_eq!(chain_inactive_message(Some("unconfirmed"), Some("locked")), "unconfirmed");
+/// assert_eq!(chain_inactive_message(Some("unconfirmed"), Some("locked")), "locked");
 /// assert_eq!(chain_inactive_message(None, Some("locked")), "locked");
+/// assert_eq!(chain_inactive_message(Some("unconfirmed"), None), "unconfirmed");
 /// assert_eq!(chain_inactive_message(None, None), "inactive");
 /// ```
 #[must_use]
@@ -1238,8 +1436,12 @@ pub fn chain_inactive_message(
     confirmable_message: Option<&'static str>,
     lockable_message: Option<&'static str>,
 ) -> &'static str {
-    confirmable_message
-        .or(lockable_message)
+    // Lockable is the outermost link of Devise's super-chain: included
+    // after confirmable (modules.rb order), `lockable.rb:95-97` answers
+    // `:locked` first and only defers via `super` when not locked - an
+    // account that is BOTH locked and unconfirmed reports `locked`.
+    lockable_message
+        .or(confirmable_message)
         .unwrap_or("inactive")
 }
 
@@ -1486,6 +1688,8 @@ mod tests {
     use super::*;
     use crate::adapter::Value as AdapterValue;
     use crate::adapter::memory::MemoryAdapter;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
     struct TestUser {
@@ -1507,6 +1711,16 @@ mod tests {
         unconfirmed_email: Option<String>,
         #[serde(skip)]
         raw_reset_token: Option<String>,
+        /// Devise `devise_will_save_change_to_email?` override: `None` keeps
+        /// the trait default (the email is changing), `Some(false)` models an
+        /// update that leaves the address untouched.
+        #[serde(skip)]
+        email_changed_override: Option<bool>,
+        /// `uniqueness_scope_id`: `None` models the models that never override
+        /// the accessor (the trait default), which is where the self-update
+        /// rejection used to bite.
+        #[serde(skip)]
+        uniqueness_scope_id: Option<String>,
         #[serde(skip)]
         after_auth_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -1526,8 +1740,83 @@ mod tests {
                 reset_password_sent_at: None,
                 unconfirmed_email: None,
                 raw_reset_token: None,
+                email_changed_override: None,
+                uniqueness_scope_id: Some("1".to_string()),
                 after_auth_count: std::sync::Arc::default(),
             }
+        }
+    }
+
+    /// Adapter wrapper counting every lookup, proving gated paths perform no
+    /// adapter call at all (the mirror of lockable's `CountingAdapter`), and
+    /// optionally failing reads to model a backend outage.
+    struct CountingAdapter<'a> {
+        inner: &'a MemoryAdapter<TestUser>,
+        calls: Arc<AtomicUsize>,
+        fail_reads: bool,
+    }
+
+    #[async_trait]
+    impl crate::adapter::OrmAdapter<TestUser> for CountingAdapter<'_> {
+        type New = TestUser;
+
+        async fn get(
+            &self,
+            id: &DeviseKey,
+        ) -> Result<Option<TestUser>, crate::adapter::OrmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_reads {
+                return Err(crate::adapter::OrmError::Connection {
+                    message: "session fetch down".to_string(),
+                    source: None,
+                });
+            }
+            self.inner.get(id).await
+        }
+
+        async fn find_first(
+            &self,
+            conditions: &Conditions,
+        ) -> Result<Option<TestUser>, crate::adapter::OrmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.find_first(conditions).await
+        }
+
+        async fn create(&self, model: TestUser) -> Result<TestUser, crate::adapter::OrmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.create(model).await
+        }
+
+        async fn update(
+            &self,
+            key: &DeviseKey,
+            changes: &crate::adapter::ChangeSet,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.update(key, changes).await
+        }
+
+        async fn update_columns(
+            &self,
+            key: &DeviseKey,
+            fields: &std::collections::HashMap<String, AdapterValue>,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.update_columns(key, fields).await
+        }
+
+        async fn increment_counter(
+            &self,
+            key: &DeviseKey,
+            column: &'static str,
+        ) -> Result<TestUser, crate::adapter::OrmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.increment_counter(key, column).await
+        }
+
+        async fn delete(&self, id: &DeviseKey) -> Result<(), crate::adapter::OrmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete(id).await
         }
     }
 
@@ -1564,12 +1853,24 @@ mod tests {
     }
 
     impl Authenticatable for TestUser {
-        fn serializable_hash(&self) -> JsonValue {
-            let mut map = serde_json::json!({ "id": self.id, "email": self.email });
+        fn serializable_fields(&self) -> serde_json::Map<String, JsonValue> {
+            // Deliberately includes `unconfirmed_email` (an UNSAFE attribute)
+            // so the default `serializable_hash` filter is exercised: a model
+            // that forgot the filter would leak it.
+            let mut fields = serde_json::Map::new();
+            fields.insert("id".to_string(), JsonValue::from(self.id));
+            fields.insert("email".to_string(), JsonValue::from(self.email.clone()));
             if let Some(unconfirmed) = &self.unconfirmed_email {
-                map["unconfirmed_email"] = JsonValue::String(unconfirmed.clone());
+                fields.insert(
+                    "unconfirmed_email".to_string(),
+                    JsonValue::String(unconfirmed.clone()),
+                );
             }
-            map
+            fields
+        }
+
+        fn seed_initialized_attributes(&mut self, attributes: &serde_json::Map<String, JsonValue>) {
+            self.assign_attributes(attributes);
         }
 
         fn active_for_authentication(&self) -> bool {
@@ -1659,7 +1960,11 @@ mod tests {
         }
 
         fn uniqueness_scope_id(&self) -> Option<String> {
-            self.persisted().then(|| self.id.to_string())
+            self.uniqueness_scope_id.clone()
+        }
+
+        fn email_changed(&self) -> bool {
+            self.email_changed_override.unwrap_or(true)
         }
     }
 
@@ -1696,6 +2001,80 @@ mod tests {
             stretches: 4,
             ..DeviseConfig::default()
         }
+    }
+
+    /// Devise `String#present?`: a whitespace-only password is BLANK. The
+    /// hashing setter, the blank-strip in `update_with_password`, and the
+    /// `reset_password` guard must share one blank predicate instead of the
+    /// bare `is_empty` check, otherwise `"      "` is hashed into
+    /// `encrypted_password` and then reported as `:too_short` instead of
+    /// Devise's `:blank`.
+    #[tokio::test]
+    async fn blank_password_is_never_hashed_and_reports_blank() {
+        let config = test_config();
+
+        // set_password: the stored digest survives a whitespace-only value.
+        let mut user = TestUser::testing("secret123", &config);
+        let digest_before = user.encrypted_password.clone();
+        DatabaseAuthenticatable::set_password(&mut user, Some("      ".to_string()), &config);
+        assert_eq!(
+            user.encrypted_password, digest_before,
+            "whitespace-only password must not be hashed"
+        );
+
+        // Validation: Devise reports `:blank`, never a length error.
+        let errors = Validatable::validate(&user, &config);
+        assert_eq!(
+            errors.get("password").map(Vec::as_slice),
+            Some(&[":blank".to_string()][..]),
+            "whitespace-only password validates as blank: {errors:?}"
+        );
+
+        // update_with_password strips the whitespace-only pair so the stored
+        // digest survives an untouched password update.
+        let mut updating = TestUser::testing("secret123", &config);
+        let digest_before = updating.encrypted_password.clone();
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "current_password".to_string(),
+            JsonValue::String("secret123".to_string()),
+        );
+        params.insert("password".to_string(), JsonValue::String("  \t ".to_string()));
+        params.insert(
+            "password_confirmation".to_string(),
+            JsonValue::String("  \t ".to_string()),
+        );
+        params.insert(
+            "email".to_string(),
+            JsonValue::String("kept@example.com".to_string()),
+        );
+        DatabaseAuthenticatable::update_with_password(&mut updating, &mut params, &config)
+            .expect("valid current password");
+        assert!(
+            !params.contains_key("password"),
+            "blank password stripped from params"
+        );
+        assert_eq!(updating.encrypted_password, digest_before);
+
+        // reset_password: the same blank predicate guards the reset guard.
+        let mut changing = TestUser::testing("secret123", &config);
+        let digest_before = changing.encrypted_password.clone();
+        let outcome = Recoverable::reset_password(
+            &mut changing,
+            Some("     ".to_string()),
+            Some("     ".to_string()),
+            &MemoryAdapter::<TestUser>::new(),
+            &config,
+        )
+        .await
+        .expect("adapter untouched on a blank reset")
+        .expect_err("blank reset password carries validation errors");
+        assert_eq!(
+            outcome.get("password").map(Vec::as_slice),
+            Some(&[":blank".to_string()][..]),
+            "whitespace-only reset password is blank: {outcome:?}"
+        );
+        assert_eq!(changing.encrypted_password, digest_before);
     }
 
     /// Ruby `String#downcase` is Unicode-aware; the single normalization home
@@ -1829,19 +2208,54 @@ mod tests {
         assert!(multi.is_valid());
     }
 
+    /// The session-fetch path must not turn a backend failure into "nobody is
+    /// logged in": an `OrmError` travels to the caller, which can render the
+    /// 500 instead of silently logging every visitor out.
     #[tokio::test]
-    async fn test_serialize_from_session() {
+    async fn serialize_from_session_propagates_adapter_failures() {
         let config = test_config();
         let adapter = MemoryAdapter::<TestUser>::new();
         let user = TestUser::testing("secret123", &config);
         adapter.create(user.clone()).await.unwrap();
 
         let (key, salt) = user.serialize_into_session();
-        let roundtrip = TestUser::serialize_from_session(&key, &salt, &adapter).await;
+        let roundtrip = TestUser::serialize_from_session(&key, &salt, &adapter)
+            .await
+            .expect("fetch succeeds");
         assert!(roundtrip.is_some());
 
-        let mismatch = TestUser::serialize_from_session(&key, "bogus-salt", &adapter).await;
+        let mismatch = TestUser::serialize_from_session(&key, "bogus-salt", &adapter)
+            .await
+            .expect("salt mismatch is not a backend failure");
         assert!(mismatch.is_none());
+
+        let missing = TestUser::serialize_from_session(&DeviseKey::from_i64(999), &salt, &adapter)
+            .await
+            .expect("a missing record is not a backend failure");
+        assert!(missing.is_none());
+    }
+
+    /// A backend outage on the session fetch surfaces as an error, never as a
+    /// valid "nobody is logged in" (which would silently sign every user out).
+    #[tokio::test]
+    async fn serialize_from_session_reports_backend_failure() {
+        let config = test_config();
+        let inner = MemoryAdapter::<TestUser>::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = CountingAdapter {
+            inner: &inner,
+            calls,
+            fail_reads: true,
+        };
+        let user = TestUser::testing("secret123", &config);
+        adapter.create(user.clone()).await.unwrap();
+        let (key, salt) = user.serialize_into_session();
+
+        let fetched = TestUser::serialize_from_session(&key, &salt, &adapter).await;
+        assert!(
+            matches!(fetched, Err(crate::adapter::OrmError::Connection { .. })),
+            "a backend failure must reach the caller: {fetched:?}"
+        );
     }
 
     #[test]
@@ -1851,6 +2265,35 @@ mod tests {
         let facet = user.as_password_verifiable().expect("facet");
         assert!(facet.valid_password("secret123", &config));
         assert!(!facet.valid_password("wrong", &config));
+    }
+
+    /// M5: the unsafe-attribute filter is applied BY CONSTRUCTION. A model
+    /// publishing `unconfirmed_email` through `serializable_fields` (an entry
+    /// of [`crate::error::UNSAFE_ATTRIBUTES_FOR_SERIALIZATION`]) must not see
+    /// it rendered, because the default `serializable_hash` composes the
+    /// field map with `filter_unsafe_attributes` instead of trusting the model
+    /// to remember the call.
+    #[test]
+    fn serializable_hash_filters_unsafe_fields_by_default() {
+        let config = test_config();
+        let mut user = TestUser::testing("secret123", &config);
+        user.unconfirmed_email = Some("pending@example.com".to_string());
+
+        let fields = user.serializable_fields();
+        assert_eq!(
+            fields.get("unconfirmed_email").and_then(JsonValue::as_str),
+            Some("pending@example.com"),
+            "the raw field map carries the attribute the model wants"
+        );
+
+        let hash = user.serializable_hash();
+        assert_eq!(hash.get("email").and_then(JsonValue::as_str), Some("test@example.com"));
+        assert!(
+            hash.get("unconfirmed_email").is_none(),
+            "the default hash must filter UNSAFE attributes: {hash}"
+        );
+        assert!(hash.get("encrypted_password").is_none());
+        assert!(hash.get("reset_password_token").is_none());
     }
 
     #[test]
@@ -2099,6 +2542,302 @@ mod tests {
         assert!(
             DatabaseAuthenticatable::email_notification_recipient(&user, &steady, &config)
                 .is_none()
+        );
+    }
+
+    /// S10: Devise runs the uniqueness check only when the email is changing
+    /// (`validates_uniqueness_of :email, if: :devise_will_save_change_to_email?`)
+    /// and excludes the record itself. A model that does not override
+    /// `uniqueness_scope_id` must not reject its own untouched update with
+    /// `:taken`, which the `existing_id.is_none() || existing_id != self.id`
+    /// shape did for every defaulted accessor.
+    #[tokio::test]
+    async fn validatable_uniqueness_self_exclusion_without_scope_override() {
+        let config = test_config();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let stored = TestUser::testing("test@example.com", &config);
+        adapter.create(stored.clone()).await.unwrap();
+
+        // A record updating its own unchanged email finds ITSELF: no :taken.
+        // `uniqueness_scope_id: None` models the models that never override the
+        // accessor - the trait default that used to flag every self-update.
+        let self_update = TestUser {
+            uniqueness_scope_id: None,
+            ..stored.clone()
+        };
+        let mut errors = ValidationErrors::new();
+        Validatable::validate_email_uniqueness(&self_update, &adapter, &mut errors).await;
+        assert!(
+            errors.is_empty(),
+            "an unchanged-email update must not be :taken: {errors:?}"
+        );
+
+        // A DIFFERENT record holding the same email is still :taken.
+        let other = TestUser {
+            id: 2,
+            uniqueness_scope_id: None,
+            ..stored.clone()
+        };
+        let mut errors = ValidationErrors::new();
+        Validatable::validate_email_uniqueness(&other, &adapter, &mut errors).await;
+        assert_eq!(
+            errors.get("email").map(Vec::as_slice),
+            Some(&[":taken".to_string()][..]),
+            "a second record with the same address is :taken"
+        );
+
+        // A new record with the taken email is :taken.
+        let fresh = TestUser {
+            id: 0,
+            email: "test@example.com".to_string(),
+            password: Some("secret123".to_string()),
+            ..TestUser::default()
+        };
+        let mut errors = ValidationErrors::new();
+        Validatable::validate_email_uniqueness(&fresh, &adapter, &mut errors).await;
+        assert_eq!(
+            errors.get("email").map(Vec::as_slice),
+            Some(&[":taken".to_string()][..]),
+            "a new record with a taken address is :taken"
+        );
+    }
+
+    /// M3: Devise's `find_or_initialize_with_errors`
+    /// (`authenticatable.rb:277-292`) slices the submitted conditions to the
+    /// required attributes, drops blank values, and runs the lookup ONLY when
+    /// every required key survived. A partial key set must never reach the
+    /// adapter (a permissive "partial conditions match" backend would revive
+    /// an arbitrary record), and the missing keys report Devise's `:blank`,
+    /// not the caller's error.
+    #[tokio::test]
+    async fn find_or_initialize_with_errors_partial_keys_skip_the_lookup() {
+        let config = test_config();
+        let inner = MemoryAdapter::<TestUser>::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = CountingAdapter {
+            inner: &inner,
+            calls: Arc::clone(&calls),
+            fail_reads: false,
+        };
+        adapter
+            .create(TestUser::testing("secret123", &config))
+            .await
+            .unwrap();
+        let calls_after_seed = calls.load(Ordering::SeqCst);
+
+        let required = ["email", "username"];
+        let mut conditions = Conditions::new();
+        conditions.insert("email", AdapterValue::String("test@example.com".to_string()));
+
+        let resource = TestUser::find_or_initialize_with_errors(
+            &required,
+            &conditions,
+            ":not_found",
+            &adapter,
+            &config,
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            calls_after_seed,
+            "a partial key set must not reach the adapter"
+        );
+        assert_eq!(
+            resource.errors.get("username").map(Vec::as_slice),
+            Some(&[":blank".to_string()][..]),
+            "the missing key is :blank, not the caller error: {:?}",
+            resource.errors
+        );
+        assert_eq!(
+            resource.errors.get("email").map(Vec::as_slice),
+            Some(&[":not_found".to_string()][..]),
+            "a present-but-unmatched key keeps the caller error"
+        );
+        assert!(!resource.record.persisted());
+    }
+
+    /// M3: every required key blank (or absent) still performs no lookup and
+    /// reports `:blank` per key.
+    #[tokio::test]
+    async fn find_or_initialize_with_errors_all_blank_keys_skip_the_lookup() {
+        let config = test_config();
+        let inner = MemoryAdapter::<TestUser>::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = CountingAdapter {
+            inner: &inner,
+            calls: Arc::clone(&calls),
+            fail_reads: false,
+        };
+        adapter
+            .create(TestUser::testing("secret123", &config))
+            .await
+            .unwrap();
+        let calls_after_seed = calls.load(Ordering::SeqCst);
+
+        let required = ["email", "username"];
+        let mut conditions = Conditions::new();
+        conditions.insert("email", AdapterValue::String("   ".to_string()));
+        conditions.insert("username", AdapterValue::String(String::new()));
+        conditions.insert(
+            "admin",
+            AdapterValue::String("ignored@example.com".to_string()),
+        );
+
+        let resource = TestUser::find_or_initialize_with_errors(
+            &required,
+            &conditions,
+            ":not_found",
+            &adapter,
+            &config,
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            calls_after_seed,
+            "blank keys must not reach the adapter"
+        );
+        assert_eq!(
+            resource.errors.get("email").map(Vec::as_slice),
+            Some(&[":blank".to_string()][..])
+        );
+        assert_eq!(
+            resource.errors.get("username").map(Vec::as_slice),
+            Some(&[":blank".to_string()][..])
+        );
+        assert!(
+            resource.errors.get("admin").is_none(),
+            "conditions are sliced to the required attributes"
+        );
+    }
+
+    /// M3: the full key set reaches the adapter, and a miss initializes a
+    /// record carrying the caller's error on every required key.
+    #[tokio::test]
+    async fn find_or_initialize_with_errors_full_keys_lookup_reports_error() {
+        let config = test_config();
+        let inner = MemoryAdapter::<TestUser>::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = CountingAdapter {
+            inner: &inner,
+            calls: Arc::clone(&calls),
+            fail_reads: false,
+        };
+        let stored = TestUser::testing("secret123", &config);
+        adapter.create(stored).await.unwrap();
+        let calls_after_seed = calls.load(Ordering::SeqCst);
+
+        let required = ["email", "username"];
+        let mut conditions = Conditions::new();
+        conditions.insert("email", AdapterValue::String("test@example.com".to_string()));
+        conditions.insert("username", AdapterValue::String(" tester ".to_string()));
+
+        let miss = TestUser::find_or_initialize_with_errors(
+            &required,
+            &conditions,
+            ":not_found",
+            &adapter,
+            &config,
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            calls_after_seed + 1,
+            "the full key set performs exactly one lookup"
+        );
+        assert_eq!(
+            miss.errors.get("email").map(Vec::as_slice),
+            Some(&[":not_found".to_string()][..])
+        );
+        assert_eq!(
+            miss.errors.get("username").map(Vec::as_slice),
+            Some(&[":not_found".to_string()][..])
+        );
+
+        // A key outside the required list never widens the lookup: the
+        // stored record matches on `email` alone only when `username` is
+        // absent from the required set.
+        let hit = TestUser::find_or_initialize_with_errors(
+            &["email"],
+            &conditions,
+            ":not_found",
+            &adapter,
+            &config,
+        )
+        .await;
+        assert!(hit.is_valid(), "one required key that matches finds the record");
+        assert_eq!(hit.record.id, 1);
+    }
+
+    /// M3: the single-attribute helper delegates to the group form, so a blank
+    /// value reports `:blank` without touching the adapter (Devise's
+    /// `find_or_initialize_with_error_by` is a thin wrapper).
+    #[tokio::test]
+    async fn find_or_initialize_with_error_by_blank_reports_blank() {
+        let config = test_config();
+        let inner = MemoryAdapter::<TestUser>::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = CountingAdapter {
+            inner: &inner,
+            calls: Arc::clone(&calls),
+            fail_reads: false,
+        };
+        let calls_after_seed = calls.load(Ordering::SeqCst);
+
+        for blank in ["", "   "] {
+            let resource = TestUser::find_or_initialize_with_error_by(
+                "email",
+                blank,
+                ":not_found",
+                &adapter,
+                &config,
+            )
+            .await;
+            assert_eq!(
+                resource.errors.get("email").map(Vec::as_slice),
+                Some(&[":blank".to_string()][..]),
+                "a blank attribute reports :blank"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            calls_after_seed,
+            "blank attributes never reach the adapter"
+        );
+    }
+
+    /// S10: the email-change gate. Devise skips the uniqueness lookup entirely
+    /// when the email is not changing, so a model that tracks its original
+    /// address (overriding [`Validatable::email_changed`]) performs ZERO
+    /// adapter lookups on a non-email update.
+    #[tokio::test]
+    async fn validatable_uniqueness_is_gated_on_the_email_change() {
+        let config = test_config();
+        let inner = MemoryAdapter::<TestUser>::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = CountingAdapter {
+            inner: &inner,
+            calls: Arc::clone(&calls),
+            fail_reads: false,
+        };
+        let stored = TestUser::testing("gate@example.com", &config);
+        adapter.create(stored.clone()).await.unwrap();
+        let calls_after_seed = calls.load(Ordering::SeqCst);
+
+        let gate = TestUser {
+            id: 3,
+            email: "gate@example.com".to_string(),
+            email_changed_override: Some(false),
+            ..TestUser::default()
+        };
+        let mut errors = ValidationErrors::new();
+        Validatable::validate_email_uniqueness(&gate, &adapter, &mut errors).await;
+        assert!(errors.is_empty());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            calls_after_seed,
+            "an unchanged email must not run the uniqueness lookup"
         );
     }
 
@@ -3062,10 +3801,10 @@ mod tests {
     fn test_gate_chain_confirmable_before_lockable() {
         use crate::scope::Module;
 
-        // Canonical super-chain order pins the evaluation order: Confirmable
-        // sorts below Lockable, so the confirmable gate runs first. Inverting
-        // the chain would surface "locked" for an unconfirmed-plus-locked
-        // record; this test fails exactly then.
+        // Module order pins the registration order (modules.rb): Confirmable
+        // sorts below Lockable - and because Ruby's `include` makes the LAST
+        // module the outermost super-chain link, Lockable's `inactive_message`
+        // wins for an unconfirmed-plus-locked record (`lockable.rb:95-97`).
         assert!(Module::Confirmable < Module::Lockable);
         assert!(Module::Lockable < Module::Timeoutable);
         assert!(Module::Timeoutable < Module::Trackable);
@@ -3079,10 +3818,11 @@ mod tests {
         assert!(!chain_active_for_authentication(true, false));
         assert!(!chain_active_for_authentication(false, false));
 
-        // First-failing message wins: unconfirmed before locked.
+        // Outermost-link message wins: locked before unconfirmed (lockable
+        // is included after confirmable, so `access_locked?` answers first).
         assert_eq!(
             chain_inactive_message(Some("unconfirmed"), Some("locked")),
-            "unconfirmed"
+            "locked"
         );
         assert_eq!(
             chain_inactive_message(Some("unconfirmed"), None),

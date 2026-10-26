@@ -151,50 +151,6 @@ pub mod serializer {
 
         Some(key)
     }
-
-    /// Serialize remember-me cookie payload - `[key, value, timestamp]`
-    ///
-    /// Mirrors Devise's `serialize_into_cookie` → `[to_key, rememberable_value, Time.now.utc.to_f.to_s]`
-    #[must_use]
-    pub fn serialize_into_cookie(
-        record: &dyn AnyDeviseModel,
-        rememberable_value: &str,
-    ) -> (DeviseKey, String, String) {
-        let key = record.to_key();
-        let timestamp = chrono::Utc::now().timestamp().to_string();
-        (key, rememberable_value.to_string(), timestamp)
-    }
-
-    /// Deserialize remember-me cookie payload
-    ///
-    /// Mirrors Devise's `serialize_from_cookie(*args)` - validates 5 conditions (RMB-03)
-    pub async fn serialize_from_cookie<A, M>(
-        _store: &dyn SessionStore,
-        _scope: &str,
-        adapter: &A,
-        cookie_parts: (&str, &str, &str), // (key, value, timestamp)
-    ) -> Option<DeviseKey>
-    where
-        A: OrmAdapter<M> + Send + Sync,
-        M: AnyDeviseModel + crate::session::Rememberable + Send + Sync + 'static,
-    {
-        let (key_str, cookie_value, _timestamp_str) = cookie_parts;
-
-        let key = DeviseKey::from_str(key_str).ok()?;
-
-        // Fetch record
-        let record = adapter.get(&key).await.ok()??;
-
-        // Validate rememberable_value (remember_token column OR authenticatable_salt)
-        let rememberable_value = record.rememberable_value()?;
-
-        // Constant-time comparison
-        if !crate::crypto::secure_compare(&rememberable_value, cookie_value) {
-            return None;
-        }
-
-        Some(key)
-    }
 }
 
 /// Expire all Devise session keys for a scope (sign_in_out.rb:99-101)
@@ -206,24 +162,6 @@ pub async fn expire_devise_keys(store: &dyn SessionStore, scope: &str) {
     for key in keys {
         store.remove(&key).await;
     }
-}
-
-/// Generate a unique remember token (Devise's `remember_token` loop)
-///
-/// Loops until the token digest is unused in the database.
-///
-/// Mirrors the `remember_token` column minting loop: `Devise.friendly_token` until unused in the store.
-pub fn generate_remember_token<A>(_adapter: &A, _scope: &str, secret_key: &str) -> (String, String)
-where
-    A: Send + Sync,
-{
-    use crate::crypto::token_generator::generate_with;
-
-    generate_with(secret_key, "remember_token", |_enc| {
-        // Note: In a real implementation, we'd check the database here.
-        // For now, we assume uniqueness since the token has high entropy.
-        true
-    })
 }
 
 /// Trait for models that support rememberable - provides `rememberable_value`
@@ -415,16 +353,30 @@ mod tests {
         assert!(session_value.is_none());
     }
 
+    /// The `[key, value, timestamp]` remember-cookie triple lives in exactly
+    /// one place: `rememberable.rs`'s `Rememberable::serialize_into_cookie` /
+    /// `serialize_from_cookie`, which enforce Devise's five conditions. The
+    /// session module owns the key NAMES (this module's `keys::remember_token_key`)
+    /// and the session payload only; the second, weaker cookie serializer that
+    /// used to live here was deleted rather than left to drift from the real
+    /// one. This test pins the surviving seam: the value the production
+    /// serializer carries resolves through [`Rememberable`].
     #[tokio::test]
-    async fn test_cookie_serializer() {
-        let mut user = TestUser::new(1, "test@example.com", "$2a$12$salt123456789012345678901234");
-        user.remember_token = Some("remember-token-value".to_string());
+    async fn session_remember_facet_feeds_the_production_cookie_serializer() {
+        let mut tokenized = TestUser::new(1, "user@example.com", "$2a$12$salt123456789012345678901234");
+        tokenized.remember_token = Some("remember-token-value".to_string());
+        assert_eq!(
+            tokenized.rememberable_value(),
+            Some("remember-token-value".to_string()),
+            "the remember_token column wins for the cookie value"
+        );
 
-        let (key, value, timestamp) =
-            serializer::serialize_into_cookie(&user, "remember-token-value");
-        assert_eq!(key, DeviseKey::from_i64(1));
-        assert_eq!(value, "remember-token-value");
-        assert_ne!(timestamp.len(), 0);
+        let hashed = TestUser::new(1, "user@example.com", "$2a$12$salt123456789012345678901234");
+        assert_eq!(
+            hashed.rememberable_value(),
+            Some("$2a$12$salt123456789012345678".to_string()),
+            "without the column the authenticatable salt carries the cookie value"
+        );
     }
 
     #[test]

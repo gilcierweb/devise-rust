@@ -3,6 +3,7 @@
 //! Mirrors `Devise::ParameterFilter` and `Devise::ParameterSanitizer` (`devise/lib/devise/parameter_filter.rb`, `parameter_sanitizer.rb`).
 
 use crate::config::DeviseConfig;
+use crate::error::DeviseError;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -120,29 +121,57 @@ impl ParameterSanitizer {
         }
     }
 
-    /// Sanitize parameters for an action, keeping only permitted keys
+    /// Sanitize parameters for an action, keeping only permitted keys.
     ///
-    /// # Panics
+    /// An action that was never registered (a missing `permit` call, or a typo
+    /// in the caller's action name) is REPORTED as
+    /// [`DeviseError::Config`], mirroring Devise's
+    /// `unknown_action!` (`parameter_sanitizer.rb:162`), which raises
+    /// `NotImplementedError` with actionable guidance:
     ///
-    /// Panics if `action` has not been registered via [`Self::new`] or [`Self::permit`].
-    /// Unknown actions are a programmer error, not a runtime condition - call sites
-    /// must use the known action names (`sign_in`, `sign_up`, `account_update`).
+    /// ```text
+    /// Devise doesn't know how to sanitize parameters for 'sign_in'
+    /// ```
+    ///
+    /// Devise raises into Rails' exception handler (a 500 for the request);
+    /// a Rust `panic!` in a request-facing API does far more damage than a
+    /// 500 - it unwinds the handler task, and on a `panic = "abort"` build it
+    /// takes the whole process down - so the failure travels in the return
+    /// value for the caller to render as an error response.
+    ///
+    /// # Errors
+    ///
+    /// `DeviseError::Config` when `action` has not been registered through
+    /// [`Self::new`] or [`Self::permit`].
     ///
     /// Mirrors `ParameterSanitizer#sanitize(action)`: the permitted params for `sign_in`, `sign_up`, and `account_update`.
-    #[must_use]
-    pub fn sanitize(&self, action: &str, params: &Map<String, Value>) -> Map<String, Value> {
+    pub fn sanitize(
+        &self,
+        action: &str,
+        params: &Map<String, Value>,
+    ) -> Result<Map<String, Value>, DeviseError> {
         let Some(permitted) = self.permitted.get(action) else {
-            panic!("unknown action '{action}' for parameter sanitization");
+            return Err(DeviseError::Config(format!(
+                "Devise doesn't know how to sanitize parameters for '{action}'.\n\
+                 If you want to define a new set of parameters to be sanitized use the \
+                 `permit` method first:\n\
+                 \u{20} ParameterSanitizer::permit(\"{action}\", &[\"param1\", \"param2\", \"param3\"])"
+            )));
         };
 
-        params
+        Ok(params
             .iter()
             .filter(|(k, _)| permitted.contains(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .collect())
     }
 
-    /// Sanitize with a custom block for complex logic
+    /// Sanitize with a custom block for complex logic.
+    ///
+    /// # Errors
+    ///
+    /// `DeviseError::Config` when `action` has not been registered through
+    /// [`Self::new`] or [`Self::permit`] (the block never runs).
     ///
     /// Mirrors the sanitizer's block form, `sanitize(action) { |attrs| ... }`.
     pub fn sanitize_with<F>(
@@ -150,13 +179,13 @@ impl ParameterSanitizer {
         action: &str,
         params: &Map<String, Value>,
         f: F,
-    ) -> Map<String, Value>
+    ) -> Result<Map<String, Value>, DeviseError>
     where
         F: FnOnce(&mut Map<String, Value>),
     {
-        let mut sanitized = self.sanitize(action, params);
+        let mut sanitized = self.sanitize(action, params)?;
         f(&mut sanitized);
-        sanitized
+        Ok(sanitized)
     }
 }
 
@@ -271,7 +300,9 @@ mod tests {
             "unpermitted": "value"
         });
 
-        let result = sanitizer.sanitize("sign_up", raw_params.as_object().unwrap());
+        let result = sanitizer
+            .sanitize("sign_up", raw_params.as_object().unwrap())
+            .expect("sign_up is a registered action");
 
         assert_eq!(result.get("email").unwrap(), "user@example.com");
         assert_eq!(result.get("password").unwrap(), "secret");
@@ -297,12 +328,35 @@ mod tests {
         );
     }
 
+    /// S7-core: `sanitize` is a request-facing API. An unregistered action is
+    /// a configuration problem to REPORT, not a panic in the request path -
+    /// Devise raises `NotImplementedError` ("Devise doesn't know how to
+    /// sanitize parameters for '<action>'"), which the port maps to
+    /// `DeviseError::Config`.
     #[test]
-    #[should_panic(expected = "unknown action")]
-    fn test_parameter_sanitizer_unknown_action() {
+    fn test_parameter_sanitizer_unknown_action_reports_config_error() {
         let config = DeviseConfig::default();
         let sanitizer = ParameterSanitizer::new(&config);
         let params = json!({}).as_object().unwrap().clone();
-        let _unused = sanitizer.sanitize("unknown_action", &params);
+
+        let error = sanitizer
+            .sanitize("unknown_action", &params)
+            .expect_err("an unregistered action is a config error, not a panic");
+        assert!(
+            matches!(error, DeviseError::Config(ref message) if message.contains("unknown_action")),
+            "the error must name the action: {error:?}"
+        );
+        assert!(
+            matches!(error, DeviseError::Config(ref message) if message.contains("permit")),
+            "the error must carry Devise's actionable guidance: {error:?}"
+        );
+
+        // The block form propagates the same error instead of panicking.
+        let block_error = sanitizer
+            .sanitize_with("unknown_action", &params, |attrs| {
+                attrs.clear();
+            })
+            .expect_err("the block form reports the same error");
+        assert!(matches!(block_error, DeviseError::Config(_)));
     }
 }
