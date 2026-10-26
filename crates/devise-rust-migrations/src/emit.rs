@@ -16,9 +16,12 @@ use crate::{EmitError, EmitOptions, Flow, MigrationFiles, check_identifier};
 ///   when `timestamps` is set) plus `CREATE UNIQUE INDEX` statements;
 ///   `down.sql` drops the table.
 /// * [`Flow::AddToExisting`] — `up.sql` is one `ALTER TABLE … ADD COLUMN` per
-///   column plus the same indexes; `down.sql` drops the added columns in
-///   reverse order (devise's `migration_existing.rb` raises
-///   `IrreversibleMigration` here — we emit `DROP COLUMN`s instead, per D-10).
+///   column plus the same indexes; `down.sql` drops the indexes in reverse
+///   order, then the added columns in reverse order (devise's
+///   `migration_existing.rb` raises `IrreversibleMigration` here — we emit
+///   `DROP INDEX` + `DROP COLUMN`s instead, per D-10). Dropping the indexes
+///   first keeps a re-run's `CREATE UNIQUE INDEX` working and satisfies
+///   engines (SQLite) that refuse to drop an indexed column (M2).
 ///
 /// # Errors
 ///
@@ -67,7 +70,9 @@ pub fn emit(opts: &EmitOptions) -> Result<MigrationFiles, EmitError> {
                 up.push_str(index);
             }
             up.push('\n');
-            let mut down = ddl::alter_drop_columns(opts, &columns).join("\n");
+            let mut down = ddl::drop_index_statements(opts).join("\n");
+            down.push('\n');
+            down.push_str(&ddl::alter_drop_columns(opts, &columns).join("\n"));
             down.push('\n');
             (up, down)
         }

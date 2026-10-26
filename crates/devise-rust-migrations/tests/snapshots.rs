@@ -297,6 +297,40 @@ fn matrix_existing_flow(#[case] dialect: Dialect) {
     }
     assert!(!files.down_sql.contains("DROP TABLE"));
 
+    // down.sql must DROP every index up.sql created, in reverse order, BEFORE
+    // the DROP COLUMNs (M2): otherwise rollback leaves stale indexes, a
+    // re-run's CREATE UNIQUE INDEX fails, and SQLite refuses to drop an
+    // indexed column.
+    for column in [
+        "email",
+        "reset_password_token",
+        "confirmation_token",
+        "unlock_token",
+    ] {
+        let drop_index = format!("DROP INDEX index_users_on_{column}");
+        assert!(
+            files.down_sql.contains(&drop_index),
+            "existing down.sql missing {drop_index}"
+        );
+    }
+    let first_drop_col = files.down_sql.find("DROP COLUMN").unwrap();
+    let last_drop_index = files.down_sql.rfind("DROP INDEX").unwrap();
+    assert!(
+        last_drop_index < first_drop_col,
+        "every DROP INDEX must precede the first DROP COLUMN"
+    );
+    assert!(
+        files
+            .down_sql
+            .find("DROP INDEX index_users_on_unlock_token")
+            .expect("unlock_token index dropped")
+            < files
+                .down_sql
+                .find("DROP INDEX index_users_on_email")
+                .expect("email index dropped"),
+        "indexes drop in reverse creation order (unlock_token before email)"
+    );
+
     insta::assert_snapshot!(
         format!("full_{}_existing", dialect_tag(dialect)),
         format!("{}\n---\n{}", files.up_sql, files.down_sql)

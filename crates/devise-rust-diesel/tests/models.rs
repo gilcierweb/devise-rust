@@ -919,6 +919,14 @@ impl ContractModel for FixtureUser {
         i64::from(self.sign_in_count)
     }
 
+    fn contract_current_sign_in_ip(&self) -> Option<&str> {
+        self.current_sign_in_ip.as_deref()
+    }
+
+    fn contract_last_sign_in_ip(&self) -> Option<&str> {
+        self.last_sign_in_ip.as_deref()
+    }
+
     fn contract_unlock_token(&self) -> Option<&str> {
         self.unlock_token.as_deref()
     }
@@ -979,6 +987,14 @@ impl ContractModel for UuidUser {
 
     fn contract_sign_in_count(&self) -> i64 {
         i64::from(self.sign_in_count)
+    }
+
+    fn contract_current_sign_in_ip(&self) -> Option<&str> {
+        self.current_sign_in_ip.as_deref()
+    }
+
+    fn contract_last_sign_in_ip(&self) -> Option<&str> {
+        self.last_sign_in_ip.as_deref()
     }
 
     fn contract_unlock_token(&self) -> Option<&str> {

@@ -29,6 +29,10 @@ CREATE UNIQUE INDEX index_users_on_confirmation_token ON users (confirmation_tok
 CREATE UNIQUE INDEX index_users_on_unlock_token ON users (unlock_token);
 
 ---
+DROP INDEX index_users_on_unlock_token;
+DROP INDEX index_users_on_confirmation_token;
+DROP INDEX index_users_on_reset_password_token;
+DROP INDEX index_users_on_email;
 ALTER TABLE users DROP COLUMN updated_at;
 ALTER TABLE users DROP COLUMN created_at;
 ALTER TABLE users DROP COLUMN uid;

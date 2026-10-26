@@ -70,6 +70,17 @@ pub trait Dialect: sqlx::Database + Send + Sync + 'static {
             " AND column_name = ",
         )
     }
+
+    /// The SQL cast suffix appended after an INET-placeholder bind so a
+    /// text-encoded IP parameter fits the dtype of the IP column (M3). The
+    /// migration emitter types IPs `INET` on Postgres, so binds carry
+    /// `"::inet"` there; SQLite/MySQL store IPs as `TEXT` and need no cast
+    /// (default `""`). The value itself stays a bind — only the placeholder
+    /// gains the cast.
+    #[must_use]
+    fn inet_cast() -> &'static str {
+        ""
+    }
 }
 
 /// Adds one bind: the driver encodes the value and renders its placeholder
@@ -83,6 +94,9 @@ where
     DB: Dialect,
 {
     use sqlx::Arguments as _;
+    // Detect an INET bind before the value moves into the argument buffer:
+    // the Postgres arm appends its `::inet` cast after the placeholder (M3).
+    let inet = matches!(bind, Bind::Inet(_) | Bind::NullableInet(_));
     DB::add_bind(args, bind)?;
     let mut placeholder = String::new();
     args.format_placeholder(&mut placeholder)
@@ -91,6 +105,11 @@ where
             source: None,
         })?;
     qb.push(placeholder);
+    if inet {
+        // Raw SQL pushed AFTER the placeholder: `$1::inet` (Postgres) or the
+        // dialect's `""` (text-storing SQLite/MySQL) — the value stays a bind.
+        qb.push(DB::inet_cast());
+    }
     Ok(())
 }
 
@@ -420,7 +439,9 @@ impl Dialect for sqlx::Postgres {
             Bind::Timestamp(t) => args.add(t).map_err(encoding_failed),
             Bind::NullableTimestamp(t) => args.add(t).map_err(encoding_failed),
             Bind::Uuid(id) => args.add(id).map_err(encoding_failed),
-            // INET columns use TEXT in test rig (sqlx 0.8.6 INET binding not supported).
+            // INET columns bind as text and `push_bind` appends `::inet`, so the
+            // parameter satisfies the emitted `INET` column (M3) — the same
+            // single-chokepoint encoding as every other bind.
             Bind::Inet(ip) => args.add(ip.to_string()).map_err(encoding_failed),
             Bind::NullableInet(ip) => args.add(ip.map(|i| i.to_string())).map_err(encoding_failed),
         }
@@ -428,6 +449,12 @@ impl Dialect for sqlx::Postgres {
 
     fn uuid_key(id: uuid::Uuid) -> Bind {
         Bind::Uuid(id)
+    }
+
+    // The emitted `current_sign_in_ip`/`last_sign_in_ip` columns are `INET`;
+    // a text-encoded IP bind needs the explicit cast to satisfy them (M3).
+    fn inet_cast() -> &'static str {
+        "::inet"
     }
 }
 
@@ -462,5 +489,47 @@ impl Dialect for sqlx::MySql {
 
     fn uuid_key(id: uuid::Uuid) -> Bind {
         Bind::Text(id.hyphenated().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Bind, push_bind};
+
+    /// The Postgres INET bind must carry an explicit `::inet` cast riding the
+    /// placeholder (M3): the emitted `INET` column rejects a bare text
+    /// parameter, so the write path casts `$1::inet` while the value stays a
+    /// bind (never inlined text).
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_inet_bind_appends_inet_cast() {
+        let mut args = <sqlx::Postgres as sqlx::Database>::Arguments::<'_>::default();
+        let mut qb =
+            sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE users SET current_sign_in_ip = ");
+        let ip = "192.0.2.10".parse::<std::net::IpAddr>().unwrap();
+        push_bind::<sqlx::Postgres>(&mut qb, &mut args, Bind::Inet(ip)).expect("inet bind pushes");
+        let sql = qb.into_sql();
+        assert!(
+            sql.contains("$1::inet"),
+            "postgres INET bind must cast the placeholder $1::inet: {sql}"
+        );
+    }
+
+    /// The SQLite arm stores IPs as `TEXT`, so the same bind carries no cast
+    /// (the value stays a plain placeholder).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_inet_bind_has_no_cast() {
+        let mut args = <sqlx::Sqlite as sqlx::Database>::Arguments::<'_>::default();
+        let mut qb =
+            sqlx::QueryBuilder::<sqlx::Sqlite>::new("UPDATE users SET current_sign_in_ip = ");
+        let ip = "192.0.2.10".parse::<std::net::IpAddr>().unwrap();
+        push_bind::<sqlx::Sqlite>(&mut qb, &mut args, Bind::Inet(ip)).expect("inet bind pushes");
+        let sql = qb.into_sql();
+        assert!(
+            !sql.contains("::inet"),
+            "sqlite IP is TEXT and must not cast: {sql}"
+        );
+        assert!(sql.contains('?'), "sqlite placeholder present: {sql}");
     }
 }

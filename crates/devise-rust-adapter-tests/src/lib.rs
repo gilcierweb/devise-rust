@@ -83,6 +83,12 @@ pub trait ContractModel: Sized + Send + Sync + Debug + PartialEq + 'static {
     /// The row's trackable visit counter.
     fn contract_sign_in_count(&self) -> i64;
 
+    /// The row's trackable current-sign-in IP, `None` when unset.
+    fn contract_current_sign_in_ip(&self) -> Option<&str>;
+
+    /// The row's trackable last-sign-in IP, `None` when unset.
+    fn contract_last_sign_in_ip(&self) -> Option<&str>;
+
     /// The row's lockable token digest, `None` when cleared.
     fn contract_unlock_token(&self) -> Option<&str>;
 
@@ -748,6 +754,85 @@ pub async fn salt_invalidation_case<F: ContractFactory>(factory: &F) {
     );
 }
 
+/// Trackable IP round-trip (D-28): the two trackable IP columns
+/// (`current_sign_in_ip`/`last_sign_in_ip`) start unset on a fresh sample,
+/// write an IP through `update_columns`, read the exact value back from a
+/// fresh read, and clear to `None` through an explicit `Value::Null`
+/// (the devise token-clearing tristate). This is the contract case that
+/// closes the IP-column coverage gap flagged in M3 (the fixture contract's
+/// full-row pin does not assert IPs, so every leg must exercise them here).
+///
+/// The IP is a fixed IPv4 literal so the value survives each backend's
+/// IP→string encode/decode without IPv6 canonicalization surprises (e.g.
+/// sqlx's `nullable_inet` parse→`IpAddr`→`to_string()`).
+///
+/// # Panics
+///
+/// Panics when any contract assertion fails; case fns are the assertion
+/// mechanism (see the crate docs).
+pub async fn trackable_ip_case<F: ContractFactory>(factory: &F) {
+    let adapter = factory.adapter().await;
+    let now = sample_time();
+    let email = "ip-tracer@example.test";
+    let created = adapter
+        .create(<F::Model as ContractModel>::sample_new(email, now))
+        .await
+        .expect("create stores the row");
+    let key = factory.key_of_created(&created);
+    assert_eq!(
+        created.contract_current_sign_in_ip(),
+        None,
+        "a fresh sample leaves current_sign_in_ip unset"
+    );
+    assert_eq!(
+        created.contract_last_sign_in_ip(),
+        None,
+        "a fresh sample leaves last_sign_in_ip unset"
+    );
+
+    let current_ip = "192.0.2.10";
+    let last_ip = "192.0.2.11";
+    let stamped = adapter
+        .update_columns(
+            &key,
+            &HashMap::from([
+                ("current_sign_in_ip".to_owned(), Value::from(current_ip)),
+                ("last_sign_in_ip".to_owned(), Value::from(last_ip)),
+            ]),
+        )
+        .await
+        .expect("trackable IP columns write");
+    assert_eq!(stamped.contract_current_sign_in_ip(), Some(current_ip));
+    assert_eq!(stamped.contract_last_sign_in_ip(), Some(last_ip));
+
+    let reread = adapter.get_strict(&key).await.expect("row exists");
+    assert_eq!(
+        reread.contract_current_sign_in_ip(),
+        Some(current_ip),
+        "a fresh read observes the written current_sign_in_ip"
+    );
+    assert_eq!(
+        reread.contract_last_sign_in_ip(),
+        Some(last_ip),
+        "a fresh read observes the written last_sign_in_ip"
+    );
+
+    let cleared = adapter
+        .update_columns(
+            &key,
+            &HashMap::from([("current_sign_in_ip".to_owned(), Value::Null)]),
+        )
+        .await
+        .expect("current_sign_in_ip clears to NULL");
+    assert_eq!(cleared.contract_current_sign_in_ip(), None);
+    let reread = adapter.get_strict(&key).await.expect("row exists");
+    assert_eq!(
+        reread.contract_current_sign_in_ip(),
+        None,
+        "Value::Null writes NULL into the IP column (devise clearing)"
+    );
+}
+
 /// Change-notification hook point (D-28): the model-layer notifications
 /// (`send_email_changed_notification`, `send_password_change_notification`)
 /// observe exactly the `email` and `encrypted_password` columns, so the
@@ -818,4 +903,5 @@ pub async fn run_contract_suite<F: ContractFactory>(factory: &F) {
     counter_case(factory).await;
     salt_invalidation_case(factory).await;
     change_notification_case(factory).await;
+    trackable_ip_case(factory).await;
 }

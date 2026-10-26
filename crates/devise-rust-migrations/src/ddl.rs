@@ -291,6 +291,27 @@ pub(crate) fn has_unlock_token(opts: &EmitOptions) -> bool {
         )
 }
 
+/// The columns that get a unique index, in creation order — the ONE source
+/// both the CREATE ([`index_statements`]) and DROP ([`drop_index_statements`])
+/// sides derive from, so the add-to-existing rollback drops exactly the
+/// indexes the up migration creates (M2, DRY).
+fn index_columns(opts: &EmitOptions) -> Vec<&'static str> {
+    let mut columns = Vec::new();
+    if opts.modules.contains(&Module::DatabaseAuthenticatable) {
+        columns.push("email");
+    }
+    if opts.modules.contains(&Module::Recoverable) {
+        columns.push("reset_password_token");
+    }
+    if opts.modules.contains(&Module::Confirmable) {
+        columns.push("confirmation_token");
+    }
+    if has_unlock_token(opts) {
+        columns.push("unlock_token");
+    }
+    columns
+}
+
 /// Full `CREATE UNIQUE INDEX …;` statements for the selected modules.
 ///
 /// Mirrors `migration.rb:15-18`: email + `reset_password_token` always when
@@ -298,28 +319,31 @@ pub(crate) fn has_unlock_token(opts: &EmitOptions) -> bool {
 /// commented) when reconfirmable / email-unlock apply (D-10).
 pub(crate) fn index_statements(opts: &EmitOptions) -> Vec<String> {
     let table = opts.table.as_str();
-    let mut indexes = Vec::new();
-    if opts.modules.contains(&Module::DatabaseAuthenticatable) {
-        indexes.push(format!(
-            "CREATE UNIQUE INDEX index_{table}_on_email ON {table} (email);"
-        ));
-    }
-    if opts.modules.contains(&Module::Recoverable) {
-        indexes.push(format!(
-            "CREATE UNIQUE INDEX index_{table}_on_reset_password_token ON {table} (reset_password_token);"
-        ));
-    }
-    if opts.modules.contains(&Module::Confirmable) {
-        indexes.push(format!(
-            "CREATE UNIQUE INDEX index_{table}_on_confirmation_token ON {table} (confirmation_token);"
-        ));
-    }
-    if has_unlock_token(opts) {
-        indexes.push(format!(
-            "CREATE UNIQUE INDEX index_{table}_on_unlock_token ON {table} (unlock_token);"
-        ));
-    }
-    indexes
+    index_columns(opts)
+        .into_iter()
+        .map(|column| {
+            format!("CREATE UNIQUE INDEX index_{table}_on_{column} ON {table} ({column});")
+        })
+        .collect()
+}
+
+/// `DROP INDEX …;` statements for the add-to-existing flow's `down.sql`: the
+/// exact inverse of [`index_statements`], in reverse creation order and in the
+/// dialect's spelling (MySQL requires the trailing `ON <table>` clause;
+/// Postgres/SQLite name the index alone). Emitting these before the
+/// `DROP COLUMN`s (see [`alter_drop_columns`]) keeps a later re-run's
+/// `CREATE UNIQUE INDEX` working and satisfies engines (SQLite) that refuse
+/// to drop an indexed column.
+pub(crate) fn drop_index_statements(opts: &EmitOptions) -> Vec<String> {
+    let table = opts.table.as_str();
+    index_columns(opts)
+        .into_iter()
+        .rev()
+        .map(|column| match opts.dialect {
+            Dialect::Mysql => format!("DROP INDEX index_{table}_on_{column} ON {table};"),
+            Dialect::Postgres | Dialect::Sqlite => format!("DROP INDEX index_{table}_on_{column};"),
+        })
+        .collect()
 }
 
 /// `CREATE TABLE` statement for the create flow.

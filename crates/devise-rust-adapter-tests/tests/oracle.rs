@@ -28,6 +28,8 @@ macro_rules! oracle_fixture {
             unconfirmed_email: Option<String>,
             failed_attempts: i64,
             sign_in_count: i64,
+            current_sign_in_ip: Option<String>,
+            last_sign_in_ip: Option<String>,
             unlock_token: Option<String>,
             locked_at: Option<NaiveDateTime>,
             created_at: NaiveDateTime,
@@ -47,6 +49,8 @@ macro_rules! oracle_fixture {
                     unconfirmed_email: None,
                     failed_attempts: 0,
                     sign_in_count: 0,
+                    current_sign_in_ip: None,
+                    last_sign_in_ip: None,
                     unlock_token: Some(format!("enc-unlock-{email}")),
                     locked_at: None,
                     created_at: now,
@@ -96,6 +100,14 @@ macro_rules! oracle_fixture {
 
             fn contract_sign_in_count(&self) -> i64 {
                 self.sign_in_count
+            }
+
+            fn contract_current_sign_in_ip(&self) -> Option<&str> {
+                self.current_sign_in_ip.as_deref()
+            }
+
+            fn contract_last_sign_in_ip(&self) -> Option<&str> {
+                self.last_sign_in_ip.as_deref()
             }
 
             fn contract_unlock_token(&self) -> Option<&str> {
