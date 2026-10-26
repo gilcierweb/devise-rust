@@ -157,7 +157,8 @@ async fn sessions_controller_happy_path_and_flash_split() {
         .confirmed_now(&common::SystemClock);
     let created = state.adapter.create(user).await.expect("seed");
 
-    // HTML: 302 + flash cookie toward "/" (default after_sign_in target).
+    // HTML: 302 + flash cookie toward "/users" (Devise's after_sign_in
+    // precedence: no stored location → the scope root).
     let req = test::TestRequest::post()
         .uri("/users/sign_in")
         .insert_header(("content-type", "application/x-www-form-urlencoded"))
@@ -170,20 +171,23 @@ async fn sessions_controller_happy_path_and_flash_split() {
         resp.headers()
             .get(actix_web::http::header::LOCATION)
             .and_then(|v| v.to_str().ok()),
-        Some("/")
+        Some("/users")
     );
     let cookies = devise_rust_actix::test_helpers::set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=signed_in")),
-        "flash cookie carries signed_in: {cookies:?}"
-    );
     assert!(
         cookies.iter().any(|c| c.starts_with("id=")),
         "session cookie rotated"
     );
     let _ = created;
+    let session_cookie = cookies
+        .iter()
+        .find(|c| c.starts_with("id="))
+        .expect("session cookie").clone();
+    assert_eq!(
+        common::flash_of(&app, session_cookie.as_str()).await.as_deref(),
+        Some("signed_in"),
+        "flash session carries signed_in"
+    );
 
     // JSON failure: wrong password → 401 with symbolic key.
     let req = test::TestRequest::post()
@@ -285,17 +289,21 @@ async fn passwords_controller_basics() {
         "reset instructions mailed"
     );
 
-    // assert_reset_token_passed: missing token → redirect with no_token flash.
+    // assert_reset_token_passed: missing token → redirect with no_token flash
+    // (session-staged, S11).
     let req = test::TestRequest::get()
         .uri("/users/password/edit")
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::FOUND);
     let cookies = devise_rust_actix::test_helpers::set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=no_token")),
-        "{cookies:?}"
+    let session_cookie = cookies
+        .iter()
+        .find(|c| c.starts_with("id="))
+        .expect("session cookie").clone();
+    assert_eq!(
+        common::flash_of(&app, session_cookie.as_str()).await.as_deref(),
+        Some("no_token"),
+        "no_token flash staged in the session"
     );
 }

@@ -4,10 +4,34 @@
 //! failure renderer, route registration, and test helpers that map devise-rust
 //! core's framework-neutral auth surface onto actix-web's request pipeline.
 //!
+//! ## CSRF — the port's contract (read this before shipping)
+//!
+//! **This crate does not verify request origins.** Devise runs inside
+//! Rails, where `protect_from_forgery` guards every POST/PATCH/PUT/DELETE
+//! before any controller action runs; the port leaves that layer to the
+//! framework, because actix-web ships no built-in CSRF middleware.
+//!
+//! You MUST:
+//!
+//! 1. mount your framework's CSRF protection (an origin/token-check
+//!    middleware) AROUND every mutating devise route — `sign_in`, `sign_up`,
+//!    account `update`/`destroy`, and the passwords/confirmations/unlocks
+//!    forms — and
+//! 2. call [`bridge::handle_unverified_request`] from that middleware's
+//!    failure path. Devise's override (`controllers/helpers.rb:254-260`)
+//!    signs out EVERY scope, clears the devise session data, and renews the
+//!    session id, so nothing signed-in survives a forged request; the
+//!    bridge helper performs exactly that sweep against the live
+//!    `actix_session::Session`.
+//!
+//! Without both pieces, a cross-site form post can drive any signed-in
+//! session through the sign-in/sign-out/registration actions.
+//!
 //! ## Modules
 //!
-//! - [`bridge`] — `ActixSessionStore` implementing the core `SessionStore`
-//!   trait over `actix_session::Session` (D-04 owned-extract).
+//! - [`bridge`] — the synchronous session I/O helpers over
+//!   `actix_session::Session` (D-04 owned-extract), plus the S11
+//!   session-backed flash (`set_flash` / `take_flash`).
 //! - [`middleware`] — `DeviseMiddleware` Transform/Service pair: scope
 //!   resolution, owned snapshot of session values, remember-cookie drain.
 //! - [`failure`] — actix `FailureRenderer` mapping core `Failure` decisions
@@ -35,7 +59,6 @@ pub mod routes;
 pub mod schema;
 pub mod test_helpers;
 
-pub use bridge::ActixSessionStore;
 pub use callbacks::{derive_actix_key, rotate_csrf_token};
 pub use extractors::{
     Auth, AuthGroup, RequireAuth, admin_session, admin_signed_in, authenticate_admin,

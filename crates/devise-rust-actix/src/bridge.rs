@@ -1,19 +1,21 @@
-//! Actix session bridge — `ActixSessionStore` implementing the core
-//! [`SessionStore`] trait over
-//! `actix_session::Session` using the **owned-extract** pattern (D-04).
+//! Actix session bridge — the synchronous session I/O helpers the
+//! middleware and controllers run over `actix_session::Session` using the
+//! **owned-extract** pattern (D-04).
 //!
-//! `actix_session::Session` is `!Send + !Sync`, so the bridge cannot hold a
-//! `Session` handle itself and stay `Send + Sync`. The middleware owns the
-//! session handle; each operation extracts values synchronously, drops the
-//! handle, then `await`s on NO further session I/O.
+//! `actix_session::Session` is `!Send + !Sync`, so nothing `Send + Sync`
+//! (a core `SessionStore` impl, an `AuthProxy`) can hold the live handle.
+//! The middleware and handlers own the handle per request; each helper
+//! extracts values synchronously, drops the handle, then `await`s on NO
+//! further session I/O. There is deliberately NO `SessionStore`
+//! implementation here: a bridge type that satisfied the async trait
+//! without the live handle would be a silently-inert store (M-fix); all
+//! real I/O flows through the helpers in this module.
 //!
 //! ## Renewal (SESS-05 / D-03)
 //!
 //! `Session::renew()` is called **before** every privilege transition:
 //! `insert_session`, `sign_out`, `sign_out_all_scopes`, `bypass_sign_in`,
-//! and the account-update path. The bridge's renew-before-insert order
-//! closes the core gap where `AuthProxy::bypass_sign_in` / `sign_out`
-//! otherwise skip renewal.
+//! and the account-update path.
 //!
 //! ## Session payload
 //!
@@ -26,137 +28,60 @@
 #![allow(clippy::missing_errors_doc)] // session/serializer codes already documented upstream
 
 use actix_session::Session;
-use actix_web::cookie::Key;
 use devise_rust::{
     adapter::{DeviseKey, OrmAdapter},
+    config::DeviseConfig,
     error::DeviseError,
     failure::AnyDeviseModel,
-    session::{SessionStore, keys},
+    session::keys,
 };
 use serde_json::Value;
-use std::fmt;
 use std::str::FromStr;
 
-/// Actix-backed session store implementing the core `SessionStore` trait.
+/// Call `Session::renew()` **before** any session payload write.
 ///
-/// The struct holds **only** the derived `actix_web::cookie::Key`; the
-/// actual `Session` handle is passed to each operation by the caller (the
-/// middleware/extractor layer) because `Session` is `!Send + !Sync` and
-/// cannot live across `await` points (D-04 owned-extract).
+/// This is the D-03 renewal point for `sign_in` / `sign_out` /
+/// `bypass_sign_in` / account-update paths — the bridge's job is to
+/// ensure session fixation protection fires on every transition.
 ///
-/// Construct via [`ActixSessionStore::new`] when the caller already has a
-/// derived `Key`, or [`ActixSessionStore::with_derived_key`] to derive one
-/// from the Devise `secret_key_base` via [`Key::derive_from`] (D-02).
+/// Synchronous: `Session::renew()` is a pure re-key of the cookie jar,
+/// no I/O. Holding the handle around never blocks an executor (D-04).
 ///
-/// ## Examples
+/// # Errors
 ///
-/// ```rust,ignore
-/// let config = DeviseConfig::default();
-/// let key = derive_actix_key(&config.secret_key)?;
-/// let store = ActixSessionStore::new(key);
-/// // ... inside middleware: Session extracted per-request, dropped before await.
-/// ```
-#[derive(Clone)]
-pub struct ActixSessionStore {
-    /// The actix-web cookie `Key` derived from the Devise `secret_key_base`.
-    ///
-    /// Debug-redacted: keys never surface in logs (D-02 secrecy contract).
-    key: Key,
+/// Infallible in practice: actix-session renew only fails on internal
+/// state errors, which would surface earlier. Returns `DeviseError::Internal`
+/// defensively if the underlying call ever reports failure.
+pub fn renew_sync(session: &Session) -> Result<(), DeviseError> {
+    session.renew();
+    Ok(())
 }
 
-impl fmt::Debug for ActixSessionStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ActixSessionStore")
-            .field("key", &"<actix_web::cookie::Key>")
-            .finish()
-    }
+/// Session key carrying the one-shot devise flash (S11).
+///
+/// Devise's flash IS session state (Rails' flash hash): it rides the signed
+/// session cookie (signature + `Secure` come from the app's
+/// `SessionMiddleware` configuration), is read once, and is cleared on the
+/// read — never a standalone unsigned cookie the client could forge and
+/// the app might render.
+pub const FLASH_SESSION_KEY: &str = "devise.flash";
+
+/// Stage a flash I18n KEY for the next request to read (S11).
+///
+/// The value is always the bare catalog key (`signed_in`,
+/// `devise.omniauth_callbacks.failure`, …) — one format across every
+/// controller; the app renders it through the I18n catalog.
+pub fn set_flash(session: &Session, flash_key: &str) {
+    let _ = session.insert(FLASH_SESSION_KEY, flash_key);
 }
 
-impl ActixSessionStore {
-    /// Create from an already-derived `Key`.
-    #[must_use]
-    pub fn new(key: Key) -> Self {
-        Self { key }
-    }
-
-    /// Create from the Devise `secret_key_base`, deriving the `Key` via
-    /// [`Key::derive_from`] (D-02). This is the single secret surface shared
-    /// by HMAC token digests, session cookies, and remember cookies.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DeviseError::Config`] when `secret_key_base` is empty.
-    pub fn with_derived_key(secret_key_base: &str) -> Result<Self, DeviseError> {
-        let key = crate::callbacks::derive_actix_key(secret_key_base)?;
-        Ok(Self::new(key))
-    }
-
-    /// Accessor for the derived `Key` (debug-redacted on the struct itself).
-    #[must_use]
-    pub fn key(&self) -> &Key {
-        &self.key
-    }
-
-    /// Call `Session::renew()` **before** any session payload write.
-    ///
-    /// This is the D-03 renewal point for `sign_in` / `sign_out` /
-    /// `bypass_sign_in` / account-update paths — the bridge's job is to
-    /// ensure session fixation protection fires on every transition.
-    ///
-    /// Synchronous: `Session::renew()` is a pure re-key of the cookie jar,
-    /// no I/O. Holding the handle around never blocks an executor (D-04).
-    ///
-    /// # Errors
-    ///
-    /// Infallible in practice: actix-session renew only fails on internal
-    /// state errors, which would surface earlier. Returns `DeviseError::Internal`
-    /// defensively if the underlying call ever reports failure.
-    pub fn renew_sync(session: &Session) -> Result<(), DeviseError> {
-        session.renew();
-        Ok(())
-    }
-}
-
-/// The bridge's `SessionStore` impl is a **placeholder-targeted struct impl**.
-/// All real I/O flows through the synchronous helpers in this module
-/// (see [`insert_session_and_renew_sync`], [`fetch_session_with_salt`], etc.) which
-/// take an explicit `&Session` parameter. The trait exists so that the
-/// bridge can satisfy the core `AuthProxy` constructor's `SessionStore`
-/// boundary without holding `Session` directly.
-#[async_trait::async_trait]
-impl SessionStore for ActixSessionStore {
-    async fn get_value(&self, _key: &str) -> Option<Value> {
-        // Placeholder: real read flows through `fetch_session_with_salt`,
-        // which sees the live `&Session` handle from the middleware.
-        None
-    }
-
-    async fn insert_value(&self, _key: &str, _value: Value) {
-        // Placeholder: real write flows through `insert_session_and_renew`.
-    }
-
-    async fn remove(&self, _key: &str) {
-        // Placeholder: real remove flows through `sign_out_and_renew`.
-    }
-
-    async fn remove_prefix(&self, _prefix: &str) {
-        // Placeholder: real prefix remove flows through `sign_out_all_scopes_and_renew`.
-    }
-
-    async fn keys_with_prefix(&self, _prefix: &str) -> Vec<String> {
-        // Placeholder: real enumeration flows through a synchronous helper.
-        Vec::new()
-    }
-
-    async fn renew(&self) -> Result<(), DeviseError> {
-        // Placeholder: real renew flows through `renew_sync` via the helpers.
-        Ok(())
-    }
-
-    async fn reset(&self) -> Result<(), DeviseError> {
-        // Placeholder: real reset flows through a synchronous helper.
-        Ok(())
-    }
+/// Read-and-clear the staged flash (Rails' flash is read-once; the sweep
+/// mirrors `flash.discard`).
+#[must_use]
+pub fn take_flash(session: &Session) -> Option<String> {
+    let value = session.get::<String>(FLASH_SESSION_KEY).ok().flatten();
+    session.remove(FLASH_SESSION_KEY);
+    value
 }
 
 /// Insert the session payload `[key, salt]` for a scope, renewing first
@@ -173,7 +98,7 @@ pub fn insert_session_and_renew_sync(
     key: &DeviseKey,
     salt: &str,
 ) -> Result<(), DeviseError> {
-    ActixSessionStore::renew_sync(session)?;
+    renew_sync(session)?;
     let session_key = keys::scope_session_key(scope);
     let session_value = serde_json::json!([key.to_string(), salt]);
     session
@@ -188,39 +113,53 @@ pub fn insert_session_and_renew_sync(
 ///
 /// Infallible: session remove cannot fail independently.
 pub fn sign_out_and_renew(session: &Session, scope: &str) -> Result<(), DeviseError> {
-    ActixSessionStore::renew_sync(session)?;
+    renew_sync(session)?;
     let session_key = keys::scope_session_key(scope);
     session.remove(&session_key);
     Ok(())
+}
+
+/// Remove every devise-owned session entry for one scope: the session
+/// payload, the remember-token slot, the stored location, the timeoutable
+/// tick, and the omniauth stash for every configured provider.
+///
+/// This is the port of Devise's `session.keys.grep(/^devise\./)` sweep over
+/// the scope's keys plus the warden logout payload (S2): a signed-out
+/// request must leave NO devise state behind in the session.
+fn clear_scope_devise_data(session: &Session, scope: &str, config: &DeviseConfig) {
+    session.remove(&keys::scope_session_key(scope));
+    session.remove(&keys::remember_token_key(scope));
+    session.remove(&devise_rust::failure::stored_location_key(scope));
+    session.remove(&devise_rust::timeoutable::last_request_at_key(scope));
+    for provider in &config.omniauth_providers {
+        session.remove(&crate::omniauth::omniauth_state_key(scope, provider));
+        session.remove(&crate::omniauth::omniauth_verifier_key(scope, provider));
+    }
 }
 
 /// Devise `handle_unverified_request` (`controllers/helpers.rb:254-260`):
 /// the CSRF-failure hook. Rails' base clears the session; Devise's override
 /// additionally signs out EVERY scope without locking and marks the request
 /// to skip session storage, so no user survives the aborted request
-/// (session-fixation / cross-site form-abuse protection).
-///
-/// The port clears each scope's devise session payload and then renews the
+/// (session-fixation / cross-site form-abuse protection). The port runs
+/// the full per-scope devise-data sweep (session payload, remember slot,
+/// stored location, timeout tick, omniauth stash) and then renews the
 /// session id, so any session-cookie value captured before the failure is
-/// dead afterwards. Applications wire this from their own CSRF failure path
-/// (`protect_from_forgery` with a handler that calls it, or a custom
-/// `DeviseController::handle_unverified_request`-equivalent).
+/// dead afterwards. Applications wire this from their CSRF failure path
+/// (see the crate-level CSRF contract note).
 ///
 /// # Errors
 ///
 /// Infallible: see [`sign_out_and_renew`].
-pub fn handle_unverified_request(session: &Session, scopes: &[String]) -> Result<(), DeviseError> {
+pub fn handle_unverified_request(
+    session: &Session,
+    scopes: &[String],
+    config: &DeviseConfig,
+) -> Result<(), DeviseError> {
     for scope in scopes {
-        let session_key = keys::scope_session_key(scope);
-        session.remove(&session_key);
+        clear_scope_devise_data(session, scope, config);
     }
-    // Sessions also carry the timeoutable tick; a forged request must not
-    // keep a live tick either.
-    for scope in scopes {
-        let tick_key = devise_rust::timeoutable::last_request_at_key(scope);
-        session.remove(&tick_key);
-    }
-    let _ = ActixSessionStore::renew_sync(session);
+    let _ = renew_sync(session);
     Ok(())
 }
 
@@ -230,24 +169,28 @@ pub fn handle_unverified_request(session: &Session, scopes: &[String]) -> Result
 /// branch and on `cancel`, where a request must leave no signed-in state
 /// behind.
 ///
-/// The port clears each scope's devise session payload and timeoutable tick
-/// (no session id change — the data dies, the session lives).
+/// The sweep covers the session payload, the remember-token slot, the
+/// stored location, the timeoutable tick, and the omniauth stash for every
+/// configured provider (no session id change — the data dies, the session
+/// lives).
 ///
 /// # Errors
 ///
 /// Infallible: see [`sign_out_and_renew`].
-pub fn expire_devise_data_sync(session: &Session, scopes: &[String]) -> Result<(), DeviseError> {
+pub fn expire_devise_data_sync(
+    session: &Session,
+    scopes: &[String],
+    config: &DeviseConfig,
+) -> Result<(), DeviseError> {
     for scope in scopes {
-        let session_key = keys::scope_session_key(scope);
-        session.remove(&session_key);
-        let tick_key = devise_rust::timeoutable::last_request_at_key(scope);
-        session.remove(&tick_key);
+        clear_scope_devise_data(session, scope, config);
     }
     Ok(())
 }
 
-/// Sign out all scopes: remove each scope's session key, renewing first
-/// (D-03).
+/// Sign out all scopes: Devise's `sign_out_all_scopes` — renew first
+/// (D-03), then sweep every mapping's devise data out of the session
+/// (`Devise.mappings` iteration, S2).
 ///
 /// # Errors
 ///
@@ -255,11 +198,11 @@ pub fn expire_devise_data_sync(session: &Session, scopes: &[String]) -> Result<(
 pub fn sign_out_all_scopes_and_renew_sync(
     session: &Session,
     scopes: &[String],
+    config: &DeviseConfig,
 ) -> Result<(), DeviseError> {
-    ActixSessionStore::renew_sync(session)?;
+    renew_sync(session)?;
     for scope in scopes {
-        let session_key = keys::scope_session_key(scope);
-        session.remove(&session_key);
+        clear_scope_devise_data(session, scope, config);
     }
     Ok(())
 }
@@ -279,7 +222,7 @@ pub fn bypass_sign_in_and_renew_sync(
     key: &DeviseKey,
     salt: &str,
 ) -> Result<(), DeviseError> {
-    ActixSessionStore::renew_sync(session)?;
+    renew_sync(session)?;
     let session_key = keys::scope_session_key(scope);
     let session_value = serde_json::json!([key.to_string(), salt]);
     session
@@ -318,7 +261,10 @@ where
     let key = DeviseKey::from_str(key_str).ok()?;
 
     let record = adapter.get(&key).await.ok()??;
-    let current_salt = record.authenticatable_salt()?;
+    // S6: the writer (`session_pair`) serializes a missing salt as "" —
+    // omniauth-only rows carry no password digest, and their sessions must
+    // resolve. Reading the salt as `None` logged them out on every request.
+    let current_salt = record.authenticatable_salt().unwrap_or_default();
 
     if !devise_rust::crypto::secure_compare(&current_salt, stored_salt) {
         session.remove(&session_key);

@@ -62,6 +62,16 @@ async fn seed_user_unconfirmed(state: &TestState, email: &str, password: &str) -
     state.adapter.create(user).await.expect("seed")
 }
 
+
+/// The session (`id=`) cookie pair of a response, for flash probe replay
+/// (the flash rides the signed session now, S11).
+fn session_cookie(resp: &actix_web::dev::ServiceResponse) -> String {
+    set_cookie_pairs(resp)
+        .into_iter()
+        .find(|c| c.starts_with("id="))
+        .expect("session cookie on the response")
+}
+
 fn urlencode(email: &str) -> String {
     email.replace('@', "%40")
 }
@@ -139,7 +149,10 @@ async fn flow_sign_in_and_sign_out_with_flashes() {
     let resp = form_sign_in(&app, "flow@example.com", "secret123").await;
     assert_eq!(resp.status(), 302);
     jar.merge(&resp);
-    assert_eq!(jar.value("devise.flash").as_deref(), Some("signed_in"));
+    assert_eq!(
+        common::flash_of(&app, &jar.header()).await.as_deref(),
+        Some("signed_in")
+    );
     let signed_in_session = jar.value("id").expect("session cookie");
     assert_ne!(
         anon_session.as_deref(),
@@ -170,7 +183,10 @@ async fn flow_sign_in_and_sign_out_with_flashes() {
     .await;
     assert_eq!(resp.status(), 302);
     jar.merge(&resp);
-    assert_eq!(jar.value("devise.flash").as_deref(), Some("signed_out"));
+    assert_eq!(
+        common::flash_of(&app, &jar.header()).await.as_deref(),
+        Some("signed_out")
+    );
     let signed_out_session = jar.value("id").expect("session cookie");
     assert_ne!(
         signed_in_session, signed_out_session,
@@ -200,18 +216,10 @@ async fn flow_sign_in_unknown_email_reports_not_found() {
 
     let resp = form_sign_in(&app, "ghost@example.com", "secret123").await;
     assert_eq!(resp.status(), 302);
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=not_found_in_database")),
-        "not_found_in_database flash on unknown email: {cookies:?}"
-    );
-    assert!(
-        !cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=invalid")),
-        "unknown email must not report plain invalid: {cookies:?}"
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("not_found_in_database"),
+        "not_found_in_database flash on unknown email"
     );
 }
 
@@ -230,18 +238,10 @@ async fn flow_sign_in_unknown_email_paranoid_reports_invalid() {
 
     let resp = form_sign_in(&app, "ghost@example.com", "secret123").await;
     assert_eq!(resp.status(), 302);
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=invalid")),
-        "unified invalid flash under paranoid: {cookies:?}"
-    );
-    assert!(
-        !cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=not_found_in_database")),
-        "paranoid must not leak account absence: {cookies:?}"
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("invalid"),
+        "unified invalid flash under paranoid"
     );
 }
 
@@ -254,12 +254,10 @@ async fn flow_sign_in_failure_formats() {
 
     let resp = form_sign_in(&app, "flow2@example.com", "wrongpass").await;
     assert_eq!(resp.status(), 302);
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=invalid")),
-        "invalid flash on HTML miss: {cookies:?}"
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("invalid"),
+        "invalid flash on HTML miss"
     );
 
     let resp = test::call_service(
@@ -323,7 +321,7 @@ async fn flow_account_update_requires_current_password() {
         &app,
         test::TestRequest::default()
             .method(actix_web::http::Method::PATCH)
-            .uri("/users/")
+            .uri("/users")
             .insert_header(("cookie", jar.header()))
             .insert_header(("content-type", "application/x-www-form-urlencoded"))
             .set_payload(
@@ -365,7 +363,7 @@ async fn flow_account_update_email_postpones_until_confirmation() {
         &app,
         test::TestRequest::default()
             .method(actix_web::http::Method::PATCH)
-            .uri("/users/")
+            .uri("/users")
             .insert_header(("cookie", jar.header()))
             .insert_header(("content-type", "application/x-www-form-urlencoded"))
             .set_payload("user[current_password]=secret123&user[email]=attacker@example.com")
@@ -373,12 +371,10 @@ async fn flow_account_update_email_postpones_until_confirmation() {
     )
     .await;
     assert_eq!(resp.status(), 302);
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=update_needs_confirmation")),
-        "update_needs_confirmation flash expected: {cookies:?}"
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("update_needs_confirmation"),
+        "update_needs_confirmation flash expected"
     );
 
     // The DB row still carries the ORIGINAL address; the new one waits in
@@ -435,7 +431,7 @@ async fn flow_account_update_clears_reset_token_on_password_change() {
         &app,
         test::TestRequest::default()
             .method(actix_web::http::Method::PATCH)
-            .uri("/users/")
+            .uri("/users")
             .insert_header(("cookie", jar.header()))
             .insert_header(("content-type", "application/x-www-form-urlencoded"))
             .set_payload(
@@ -476,7 +472,7 @@ async fn flow_account_update_plain_flash() {
         &app,
         test::TestRequest::default()
             .method(actix_web::http::Method::PATCH)
-            .uri("/users/")
+            .uri("/users")
             .insert_header(("cookie", jar.header()))
             .insert_header(("content-type", "application/x-www-form-urlencoded"))
             .set_payload("user[current_password]=secret123")
@@ -484,12 +480,10 @@ async fn flow_account_update_plain_flash() {
     )
     .await;
     assert_eq!(resp.status(), 302);
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=updated")),
-        "plain update flash expected: {cookies:?}"
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("updated"),
+        "plain update flash expected"
     );
 }
 
@@ -509,12 +503,9 @@ async fn flow_reset_token_errors() {
     )
     .await;
     assert_eq!(resp.status(), 302);
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=no_token")),
-        "{cookies:?}"
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("no_token")
     );
 
     // Unknown token on update → 422 with `invalid` key.
@@ -592,11 +583,9 @@ async fn flow_confirm_by_token_blank_and_legacy_paths() {
     )
     .await;
     assert_eq!(resp.status(), 302);
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=confirmed"))
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("confirmed")
     );
 }
 
@@ -645,22 +634,17 @@ async fn flow_unlock_by_token() {
     )
     .await;
     assert_eq!(resp.status(), 302);
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=unlocked")),
-        "{cookies:?}"
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("unlocked")
     );
 
     // Sign-in now works again.
     let resp = form_sign_in(&app, "flow7@example.com", "secret123").await;
     assert_eq!(resp.status(), 302);
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=signed_in"))
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("signed_in")
     );
 }
 
@@ -703,7 +687,7 @@ async fn flow_two_cookie_jar_password_change_kills_session_and_remember() {
         &app,
         test::TestRequest::default()
             .method(actix_web::http::Method::PATCH)
-            .uri("/users/")
+            .uri("/users")
             .insert_header(("cookie", old_jar.header()))
             .insert_header(("content-type", "application/x-www-form-urlencoded"))
             .set_payload(
@@ -779,7 +763,7 @@ async fn flow_renewal_rotation_on_privilege_paths() {
         &app,
         test::TestRequest::default()
             .method(actix_web::http::Method::PATCH)
-            .uri("/users/")
+            .uri("/users")
             .insert_header(("cookie", jar.header()))
             .insert_header(("content-type", "application/x-www-form-urlencoded"))
             .set_payload(
@@ -846,7 +830,8 @@ async fn flow_stored_location_get_only() {
         "stored location wins"
     );
 
-    // POST to a protected route: never stored — sign-in lands on `/`.
+    // POST to a protected route: never stored — sign-in lands on the scope
+    // root (Devise `after_sign_in_path_for` → `signed_in_root_path`).
     let mut jar2 = Jar::new();
     let resp = test::call_service(
         &app,
@@ -864,7 +849,7 @@ async fn flow_stored_location_get_only() {
         .get(actix_web::http::header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    assert_eq!(location.as_deref(), Some("/"), "POST is never stored");
+    assert_eq!(location.as_deref(), Some("/users"), "POST is never stored");
 }
 
 /// Devise `verify_signed_out_user` (`sessions_controller.rb:6`): a second
@@ -884,12 +869,10 @@ async fn flow_sign_out_again_reports_already_signed_out() {
 
     let resp = sign_out_request(&app, &jar.header()).await;
     assert_eq!(resp.status(), 302);
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=already_signed_out")),
-        "already_signed_out flash expected: {cookies:?}"
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("already_signed_out"),
+        "already_signed_out flash expected"
     );
 }
 
@@ -908,12 +891,10 @@ async fn flow_sign_in_while_signed_in_reports_already_authenticated() {
     let resp =
         form_sign_in_with(&app, "flow10@example.com", "secret123", Some(&jar.header())).await;
     assert_eq!(resp.status(), 302);
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=already_authenticated")),
-        "already_authenticated flash expected: {cookies:?}"
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("already_authenticated"),
+        "already_authenticated flash expected"
     );
 }
 
@@ -941,7 +922,7 @@ async fn flow_account_update_email_change_notifies_both_addresses() {
         &app,
         test::TestRequest::default()
             .method(actix_web::http::Method::PATCH)
-            .uri("/users/")
+            .uri("/users")
             .insert_header(("cookie", jar.header()))
             .insert_header(("content-type", "application/x-www-form-urlencoded"))
             .set_payload("user[current_password]=secret123&user[email]=new-addr@example.com")
@@ -995,26 +976,18 @@ async fn flow_sign_in_lock_under_paranoid_reports_invalid() {
     assert_eq!(first.status(), 302);
 
     let resp = form_sign_in(&app, "flow12@example.com", "wrongpass").await;
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=invalid")),
-        "threshold lock under paranoid reports invalid: {cookies:?}"
-    );
-    assert!(
-        !cookies.iter().any(|c| c.starts_with("devise.flash=locked")),
-        "paranoid must not leak the lock: {cookies:?}"
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("invalid"),
+        "threshold lock under paranoid reports invalid"
     );
 
     // The account is now locked; even the correct password stays unified.
     let resp = form_sign_in(&app, "flow12@example.com", "secret123").await;
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies
-            .iter()
-            .any(|c| c.starts_with("devise.flash=invalid")),
-        "locked + correct password stays unified: {cookies:?}"
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("invalid"),
+        "locked + correct password stays unified"
     );
 }
 
@@ -1034,9 +1007,9 @@ async fn flow_sign_in_lock_without_paranoid_reports_locked() {
 
     let _ = form_sign_in(&app, "flow13@example.com", "wrongpass").await;
     let resp = form_sign_in(&app, "flow13@example.com", "wrongpass").await;
-    let cookies = set_cookie_pairs(&resp);
-    assert!(
-        cookies.iter().any(|c| c.starts_with("devise.flash=locked")),
-        "threshold lock without paranoid reports locked: {cookies:?}"
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp)).await.as_deref(),
+        Some("locked"),
+        "threshold lock without paranoid reports locked"
     );
 }

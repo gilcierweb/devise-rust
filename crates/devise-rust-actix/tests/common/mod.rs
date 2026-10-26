@@ -25,7 +25,7 @@ use devise_rust::{
     scope::{Mapping, Module, PathNames, ScopeRegistry, SignOutVia},
     time::Clock,
 };
-use devise_rust_actix::{ActixSessionStore, DeviseMiddleware, routes::DeviseWebState};
+use devise_rust_actix::{DeviseMiddleware, routes::DeviseWebState};
 
 pub use devise_rust::adapter::OrmAdapter as OrmAdapterTrait;
 pub use devise_rust::time::SystemClock;
@@ -125,7 +125,7 @@ use serde_json::Value as JsonValue;
 
 /// Full-module fixture user: every Devise module trait implemented so the
 /// route matrix can exercise all five controllers against one model.
-#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct FixtureUser {
     pub id: i64,
     pub email: String,
@@ -150,6 +150,9 @@ pub struct FixtureUser {
     pub failed_attempts: u32,
     pub unlock_token: Option<String>,
     pub locked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Login handle used by the `authentication_keys` override suite (the
+    /// column a real app would query instead of email when configured).
+    pub username: Option<String>,
     /// Omniauthable identity pair (D-11): the provider name + uid the
     /// default linking policy reads and writes.
     pub provider: Option<String>,
@@ -164,6 +167,10 @@ pub struct FixtureUser {
     pub raw_unlock_token: Option<String>,
     #[serde(skip)]
     pub remember_me_flag: Option<bool>,
+    /// Shared flag the `after_database_authentication` hook override sets —
+    /// lets the controller suites observe that the hook fired (DBAU-07).
+    #[serde(skip)]
+    pub after_db_auth_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FixtureUser {
@@ -214,6 +221,13 @@ impl AnyDeviseModel for FixtureUser {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// DBAU-07 observable: flip the shared flag when the controller fires
+    /// the hook after a successful password check.
+    fn after_database_authentication(&self) {
+        self.after_db_auth_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn rememberable_value_opt(&self) -> Option<String> {
@@ -315,6 +329,20 @@ impl DatabaseAuthenticatable for FixtureUser {
     fn assign_attributes(&mut self, attrs: &serde_json::Map<String, JsonValue>) {
         if let Some(JsonValue::String(email)) = attrs.get("email") {
             email.clone_into(&mut self.email);
+        }
+        // Real-ORM parity: a model assigns every submitted column it
+        // carries — the fixture mirrors that so the S7 sanitizer tests can
+        // observe what the controller let through (Devise's strong params
+        // are the controller's job, not the model's).
+        if let Some(JsonValue::String(username)) = attrs.get("username") {
+            self.username = Some(username.clone());
+        }
+        if let Some(JsonValue::String(unconfirmed_email)) = attrs.get("unconfirmed_email") {
+            self.unconfirmed_email = Some(unconfirmed_email.clone());
+        }
+        if let Some(JsonValue::Number(count)) = attrs.get("failed_attempts") {
+            self.failed_attempts =
+                u32::try_from(count.as_u64().unwrap_or(0)).unwrap_or(0);
         }
     }
 }
@@ -537,7 +565,8 @@ impl devise_rust::omniauthable::Omniauthable for FixtureUser {
         A: devise_rust::adapter::OrmAdapter<Self, New = Self::New> + Send + Sync,
     {
         let mut outcome =
-            devise_rust::omniauthable::default_from_omniauth(adapter, &profile, &devise_rust::config::DeviseConfig::default(), clock).await;
+            devise_rust::omniauthable::default_from_omniauth(adapter, &profile, &test_config(), clock)
+                .await;
         // Devise's canonical from_omniauth pattern: a provider-verified
         // identity is confirmed on creation (one home: core helper).
         if outcome.is_valid() {
@@ -630,6 +659,7 @@ pub fn test_state(mapping: Mapping) -> TestState {
 pub fn test_state_with_config(mapping: Mapping, config: DeviseConfig) -> TestState {
     let all_scopes = vec![mapping.name.clone()];
     TestState {
+        scope_registry: registry_with(mapping.clone()),
         mapping,
         config: Arc::new(config),
         adapter: Arc::new(IdAssigningAdapter::new()),
@@ -646,6 +676,40 @@ pub fn test_state_with_config(mapping: Mapping, config: DeviseConfig) -> TestSta
 async fn private_probe(user: devise_rust_actix::RequireAuth<FixtureUser>) -> HttpResponse {
     let email = user.user().map(|u| u.email.clone()).unwrap_or_default();
     HttpResponse::Ok().json(serde_json::json!({ "email": email }))
+}
+
+/// Flash probe: takes the session-backed devise flash (read-once) and
+/// echoes it as JSON — the observable surface for the S11 flash contract.
+async fn flash_probe(session: actix_session::Session) -> HttpResponse {
+    let flash = devise_rust_actix::bridge::take_flash(&session);
+    HttpResponse::Ok().json(serde_json::json!({ "flash": flash }))
+}
+
+/// Read the devise flash over a probe request, replaying `cookie_header`
+/// (any `name=value` pairs of the caller's jar). Returns the flash value
+/// staged by the PREVIOUS response, consuming it (read-once).
+pub async fn flash_of(
+    app: &impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse,
+        Error = actix_web::Error,
+    >,
+    cookie_header: &str,
+) -> Option<String> {
+    let resp = actix_web::test::call_service(
+        app,
+        actix_web::test::TestRequest::get()
+            .uri("/devise-test/flash")
+            .insert_header(("cookie", cookie_header))
+            .to_request(),
+    )
+    .await;
+    assert!(
+        resp.status().is_success(),
+        "flash probe reachable (register it in the builder)"
+    );
+    let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+    body["flash"].as_str().map(str::to_string)
 }
 
 /// Wired actix test service: `SessionMiddleware` outermost, then
@@ -665,35 +729,56 @@ pub async fn build_app(
         Error = actix_web::Error,
     >,
 ) {
+    build_app_with(state, Vec::new()).await
+}
+
+/// [`build_app`] plus extra probe `Resource`s registered next to the devise
+/// scope (outside it — actix scopes claim their prefix).
+pub async fn build_app_with(
+    state: TestState,
+    extra: Vec<(&'static str, actix_web::Route)>,
+) -> (
+    TestState,
+    impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse,
+        Error = actix_web::Error,
+    >,
+) {
     let key =
         devise_rust_actix::derive_actix_key(&state.config.secret_key).expect("derive actix key");
-    let store = ActixSessionStore::new(key.clone());
     let scope_name = state.mapping.name.clone();
     let finder: Arc<dyn devise_rust::model::ModelFinder> =
         Arc::new(AdapterBridge::new(state.adapter.as_ref().clone()));
     let middleware = DeviseMiddleware::new(
-        Arc::new(store),
         registry_with(state.mapping.clone()),
         state.config.clone(),
     )
     .with_finder(&scope_name, finder);
 
     let data_state = state.clone();
+    let mut app = App::new()
+        .wrap(middleware)
+        .wrap(
+            SessionMiddleware::builder(CookieSessionStore::default(), key)
+                .cookie_secure(false)
+                .build(),
+        )
+        // App-level data so probe routes OUTSIDE the devise scope can
+        // extract the same state the scope's own handlers see.
+        .app_data(web::Data::new(data_state.clone()))
+        .service(devise_rust_actix::routes::devise_for_users(web::Data::new(
+            data_state.clone(),
+        )));
+    for (path, route) in extra {
+        app = app.route(path, route);
+    }
     let service = actix_web::test::init_service(
-        App::new()
-            .wrap(middleware)
-            .wrap(
-                SessionMiddleware::builder(CookieSessionStore::default(), key)
-                    .cookie_secure(false)
-                    .build(),
-            )
-            .service(devise_rust_actix::routes::devise_for_users(web::Data::new(
-                data_state.clone(),
-            )))
-            // Probe route OUTSIDE the devise scope (actix scopes claim their
+        app // Probe route OUTSIDE the devise scope (actix scopes claim their
             // prefix) but still prefix-matching the registry's find_by_path.
             .route("/users_dashboard", web::get().to(private_probe))
-            .route("/users_dashboard", web::post().to(private_probe)),
+            .route("/users_dashboard", web::post().to(private_probe))
+            .route("/devise-test/flash", web::get().to(flash_probe)),
     )
     .await;
     (state, service)
@@ -740,6 +825,7 @@ pub async fn build_omniauth_service(
 ) {
     let all_scopes = vec![mapping.name.clone()];
     let state = TestState {
+        scope_registry: registry_with(mapping.clone()),
         mapping,
         config: Arc::new(config),
         adapter: Arc::new(IdAssigningAdapter::new()),
@@ -751,12 +837,10 @@ pub async fn build_omniauth_service(
 
     let key =
         devise_rust_actix::derive_actix_key(&state.config.secret_key).expect("derive actix key");
-    let store = ActixSessionStore::new(key.clone());
     let scope_name = state.mapping.name.clone();
     let finder: Arc<dyn devise_rust::model::ModelFinder> =
         Arc::new(AdapterBridge::new(state.adapter.as_ref().clone()));
     let middleware = DeviseMiddleware::new(
-        Arc::new(store),
         registry_with(state.mapping.clone()),
         state.config.clone(),
     )
@@ -782,7 +866,8 @@ pub async fn build_omniauth_service(
                 data_state.clone(),
             )))
             .route("/users_dashboard", web::get().to(private_probe))
-            .route("/users_dashboard", web::post().to(private_probe)),
+            .route("/users_dashboard", web::post().to(private_probe))
+            .route("/devise-test/flash", web::get().to(flash_probe)),
     )
     .await;
     (state, service)

@@ -84,12 +84,29 @@ impl Default for Jar {
 /// exercised here).
 const APP_HOST: &str = "app.test";
 
-fn flash_cookie(resp: &actix_web::dev::ServiceResponse) -> String {
-    resp.response()
-        .cookies()
-        .find(|cookie| cookie.name() == "devise.flash")
-        .map(|cookie| cookie.value().to_string())
-        .unwrap_or_default()
+/// Read the session-staged devise flash (S11) over the probe, replaying the
+/// jar's session cookie. Consumes the flash (read-once).
+async fn flash_of(
+    app: &impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse,
+        Error = actix_web::Error,
+    >,
+    jar: &mut Jar,
+) -> Option<String> {
+    let resp = test::call_service(
+        app,
+        TestRequest::get()
+            .uri("/devise-test/flash")
+            .insert_header(("host", APP_HOST))
+            .insert_header(("cookie", jar.header()))
+            .to_request(),
+    )
+    .await;
+    assert!(resp.status().is_success(), "flash probe reachable");
+    jar.merge(&resp);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    body["flash"].as_str().map(str::to_string)
 }
 
 fn location(resp: &actix_web::dev::ServiceResponse) -> String {
@@ -329,16 +346,14 @@ async fn callback_round_trip_signs_in_with_success_flash() {
     let mut jar = Jar::new();
     let resp = round_trip(&app, &mut jar).await;
 
-    // Success: redirect to the after-sign-in path (the actix
-    // `after_sign_in_target` parity: stored location or root) with the
-    // success flash.
+    // Success: redirect to the after-sign-in path (Devise precedence: no
+    // stored location → the scope root) with the success flash.
     assert_eq!(resp.status(), StatusCode::FOUND);
-    assert_eq!(location(&resp), "/");
-    let flash = flash_cookie(&resp);
-    assert!(
-        flash.contains("Successfully%20authenticated%20from%20Stub%20account")
-            || flash.contains("Successfully authenticated from Stub account"),
-        "success flash rides the devise.flash cookie: {flash}"
+    assert_eq!(location(&resp), "/users");
+    assert_eq!(
+        flash_of(&app, &mut jar).await.as_deref(),
+        Some("devise.omniauth_callbacks.success"),
+        "success flash carries the bare I18n key (M)"
     );
 
     // The identity row exists (provider + uid persisted, D-11).
@@ -446,15 +461,10 @@ async fn callback_without_state_fails_closed() {
         "/users/sign_in",
         "failure redirects to after_omniauth_failure_path_for"
     );
-    let flash = flash_cookie(&resp);
-    assert!(
-        flash.contains("Could%20not%20authenticate%20you%20from%20Stub%20because")
-            || flash.contains("Could not authenticate you from Stub because"),
-        "failure flash renders the en.yml template: {flash}"
-    );
-    assert!(
-        flash.contains("Invalid%20state") || flash.contains("Invalid state"),
-        "missing state reason is symbolic: {flash}"
+    assert_eq!(
+        flash_of(&app, &mut jar).await.as_deref(),
+        Some("devise.omniauth_callbacks.failure"),
+        "failure flash carries the bare I18n key (missing state branch)"
     );
 }
 
@@ -473,10 +483,10 @@ async fn callback_with_mismatched_state_fails_closed() {
     .await;
     assert_eq!(resp.status(), StatusCode::FOUND);
     assert_eq!(location(&resp), "/users/sign_in");
-    let flash = flash_cookie(&resp);
-    assert!(
-        flash.contains("Invalid%20state") || flash.contains("Invalid state"),
-        "mismatched state reason: {flash}"
+    assert_eq!(
+        flash_of(&app, &mut jar).await.as_deref(),
+        Some("devise.omniauth_callbacks.failure"),
+        "failure flash carries the bare I18n key (mismatched state branch)"
     );
 }
 
@@ -527,10 +537,10 @@ async fn pkce_verifier_mismatch_fails_closed() {
     let resp = get_callback(&app, &mut jar, &relative_uri(&callback)).await;
     assert_eq!(resp.status(), StatusCode::FOUND);
     assert_eq!(location(&resp), "/users/sign_in");
-    let flash = flash_cookie(&resp);
-    assert!(
-        flash.contains("Token%20exchange%20failed") || flash.contains("Token exchange failed"),
-        "PKCE mismatch surfaces as the symbolic exchange failure: {flash}"
+    assert_eq!(
+        flash_of(&app, &mut jar).await.as_deref(),
+        Some("devise.omniauth_callbacks.failure"),
+        "PKCE mismatch surfaces through the bare failure key"
     );
 }
 
@@ -579,11 +589,10 @@ async fn post_callback_variant_completes_the_exchange() {
     jar.merge(&resp);
 
     assert_eq!(resp.status(), StatusCode::FOUND);
-    let flash = flash_cookie(&resp);
-    assert!(
-        flash.contains("Successfully%20authenticated%20from%20Stub%20account")
-            || flash.contains("Successfully authenticated from Stub account"),
-        "POST callback signs in with the success flash: {flash}"
+    assert_eq!(
+        flash_of(&app, &mut jar).await.as_deref(),
+        Some("devise.omniauth_callbacks.success"),
+        "POST callback signs in with the bare success key"
     );
     assert!(
         find_by_identity(&state, "stub-uid-1").await.is_some(),

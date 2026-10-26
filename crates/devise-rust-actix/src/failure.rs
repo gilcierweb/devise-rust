@@ -45,22 +45,20 @@ impl FailureRenderer for ActixFailureRenderer {
             } => {
                 // Navigational → 302 toward the mapping's sign-in path (the
                 // `location` field, which the core already computed from
-                // `mapping.sign_in_path()`), plus a flash cookie carrying
-                // `flash_key`.
+                // `mapping.sign_in_path()`). The flash does NOT ride this
+                // response: the core renderer contract has no session
+                // access, and Devise's flash is session state — the actix
+                // callers (extractors) stage `flash_key` into the signed
+                // session before rendering through here (S11).
                 let target = if location.is_empty() {
                     mapping.sign_in_path()
                 } else {
                     location.clone()
                 };
-                let mut response = HttpResponse::Found()
+                let _ = flash_key;
+                HttpResponse::Found()
                     .insert_header((header::LOCATION, target))
-                    .finish();
-                if let Some(flash_cookie) = render_flash_cookie(flash_key) {
-                    response.add_cookie(&flash_cookie).ok();
-                }
-                // `stored_location` is written to the session jar by the
-                // controller layer in Task 2; it does not alter the redirect.
-                response
+                    .finish()
             }
             Failure::ApiUnauthorized {
                 status,
@@ -99,19 +97,6 @@ impl FailureRenderer for ActixFailureRenderer {
     }
 }
 
-/// Render a flash cookie carrying the failure's `flash_key`.
-///
-/// Cookie contents are HMAC-less at this stage: the `SessionMiddleware`'s
-/// `CookieSessionStore` rounds them through the derived `Key`, so the flash
-/// value travels client-side in the session jar.
-fn render_flash_cookie(flash_key: &str) -> Option<actix_web::cookie::Cookie<'static>> {
-    if flash_key.is_empty() {
-        return None;
-    }
-    let mut cookie =
-        actix_web::cookie::Cookie::new("devise.flash".to_string(), flash_key.to_string());
-    cookie.set_path("/");
-    cookie.set_http_only(true);
-    cookie.set_same_site(actix_web::cookie::SameSite::Lax);
-    Some(cookie)
-}
+// (S11 removed the standalone flash cookie: Devise's flash is session
+// state, staged by the callers through `bridge::set_flash` and read once
+// via `bridge::take_flash` — never an unsigned client-forgeable cookie.)

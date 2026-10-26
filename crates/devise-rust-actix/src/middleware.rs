@@ -46,7 +46,7 @@ use devise_rust::{
     model::ModelFinder,
     request::{AuthRequest, HttpMethod, RequestFlags},
     scope::{Mapping, ScopeRegistry},
-    session::{SessionStore, keys},
+    session::keys,
 };
 use serde_json::Value;
 use std::str::FromStr;
@@ -56,8 +56,6 @@ use actix_session::SessionExt;
 /// Shared configuration for the middleware.
 #[derive(Clone)]
 pub struct DeviseMiddlewareConfig {
-    /// Session store implementation (`ActixSessionStore`).
-    pub session_store: Arc<dyn SessionStore>,
     /// Scope registry for mapping paths to scopes.
     pub scope_registry: Arc<ScopeRegistry>,
     /// Devise configuration.
@@ -108,15 +106,21 @@ pub struct DeviseMiddleware {
 
 impl DeviseMiddleware {
     /// Construct the middleware from its shared configuration pieces.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `config.validate()` fails — Devise's
+    /// `raise_no_secret_key` boot contract (`routes.rb:228`): an empty
+    /// `secret_key` makes every HMAC token digest forgeable, so the
+    /// middleware refuses to construct (a Rust panic at boot time is the
+    /// port's `raise`).
     #[must_use]
-    pub fn new(
-        session_store: Arc<dyn SessionStore>,
-        scope_registry: Arc<ScopeRegistry>,
-        config: Arc<DeviseConfig>,
-    ) -> Self {
+    pub fn new(scope_registry: Arc<ScopeRegistry>, config: Arc<DeviseConfig>) -> Self {
+        if let Err(error) = config.validate() {
+            panic!("{error}");
+        }
         Self {
             config: DeviseMiddlewareConfig {
-                session_store,
                 scope_registry,
                 config,
                 finders: HashMap::new(),
@@ -187,7 +191,7 @@ where
 
         // D-04 owned snapshot: the raw cookie/header/params data is cloned
         // synchronously; the remainder of the pipeline owns plain Rust values.
-        let auth_request = build_auth_request(&req, &config.config, scope.as_deref());
+        let auth_request = build_auth_request(&req, scope.as_deref());
         let auth_request_for_resolution = auth_request.clone();
 
         // Session payload snapshot (synchronous, D-04): the `Session` handle
@@ -287,9 +291,12 @@ where
             }
             let response = fut.await;
             match response {
-                Ok(service_response) => {
-                    Ok(drain_remember_clears(service_response, &remember_clears))
-                }
+                Ok(service_response) => Ok(drain_remember_clears(
+                    service_response,
+                    &remember_clears,
+                    &config.config,
+                    &devise_rust::time::SystemClock,
+                )),
                 Err(err) => Err(err),
             }
         })
@@ -298,23 +305,32 @@ where
 
 /// Staged remember-cookie tombstones for the response phase (the strategy
 /// chain's `ClearCookieAndPass` outcomes in actix).
-pub type RememberClearHandle = Arc<std::sync::Mutex<Vec<String>>>;
+///
+/// Each entry is `(scope, cookie name)`: the scope is required to derive the
+/// tombstone's `path`/`domain`/`secure` attributes, because a browser only
+/// drops a cookie whose name **and** path **and** domain all match (S9).
+pub type RememberClearHandle = Arc<std::sync::Mutex<Vec<(String, String)>>>;
 
 /// Apply the staged remember-cookie tombstones to the response
 /// (`ClearCookieAndPass` → `cookies.delete`, Devise jar semantics).
 fn drain_remember_clears<B>(
     mut response: actix_web::dev::ServiceResponse<B>,
     clears: &RememberClearHandle,
+    config: &DeviseConfig,
+    clock: &dyn devise_rust::time::Clock,
 ) -> actix_web::dev::ServiceResponse<B> {
     let Ok(guard) = clears.lock() else {
         return response;
     };
-    let names: Vec<String> = guard.clone();
+    let staged: Vec<(String, String)> = guard.clone();
     drop(guard);
-    for name in names {
+    for (scope, name) in staged {
+        let attrs = devise_rust::rememberable::RememberableCookieAttrs::for_scope(
+            &scope, config, clock,
+        );
         let _ = response
             .response_mut()
-            .add_removal_cookie(&crate::remember::removal_cookie(&name));
+            .add_removal_cookie(&crate::remember::removal_cookie(&name, &attrs));
     }
     response
 }
@@ -338,8 +354,11 @@ async fn resolve_remember_users(
     scope: Option<&str>,
     mut users: HashMap<String, Arc<dyn AnyDeviseModel>>,
     request: &AuthRequest,
-) -> (HashMap<String, Arc<dyn AnyDeviseModel>>, Vec<String>) {
-    let mut clears: Vec<String> = Vec::new();
+) -> (
+    HashMap<String, Arc<dyn AnyDeviseModel>>,
+    Vec<(String, String)>,
+) {
+    let mut clears: Vec<(String, String)> = Vec::new();
     let Ok(jar_key) = crate::remember::derive_remember_key(&config.config) else {
         return (users, clears);
     };
@@ -362,6 +381,7 @@ async fn resolve_remember_users(
     let Some(staged) = request.cookies.get(&cookie_name).cloned() else {
         return (users, clears);
     };
+    let staged_scope = scope.to_string();
     // Signature-verified plaintext; a failed verify keeps the raw value,
     // which the core strategy classifies as stale (delete + pass through).
     let plaintext =
@@ -382,7 +402,7 @@ async fn resolve_remember_users(
                     users.insert(scope.to_string(), Arc::from(record));
                 }
                 Ok(devise_rust::failure::AuthOutcome::ClearCookieAndPass { cookie_key }) => {
-                    clears.push(cookie_key);
+                    clears.push((staged_scope.clone(), cookie_key));
                 }
                 _ => {}
             }
@@ -421,9 +441,11 @@ async fn resolve_users(
         let Ok(Some(record)) = finder.get_boxed(&key).await else {
             continue;
         };
-        let Some(current_salt) = record.authenticatable_salt() else {
-            continue;
-        };
+        // S6: models without an `encrypted_password` (omniauth-only rows)
+        // have NO salt — the serializer writes "" and the fetch must compare
+        // "" against "" the same way, or every such session dies on every
+        // request. The writer (`session_pair`) already defaults to "".
+        let current_salt = record.authenticatable_salt().unwrap_or_default();
         if !devise_rust::crypto::secure_compare(&current_salt, stored_salt) {
             continue;
         }
@@ -433,11 +455,7 @@ async fn resolve_users(
 }
 
 /// Build an owned [`AuthRequest`] snapshot of an actix request.
-fn build_auth_request(
-    req: &ServiceRequest,
-    config: &DeviseConfig,
-    scope: Option<&str>,
-) -> AuthRequest {
+fn build_auth_request(req: &ServiceRequest, scope: Option<&str>) -> AuthRequest {
     let mut cookies = HashMap::new();
     if let Some(scope_name) = scope {
         let session_key = devise_rust::session::keys::scope_session_key(scope_name);
@@ -474,7 +492,14 @@ fn build_auth_request(
         skip_timeout: false,
         skip_timeoutable: false,
         skip_trackable: false,
-        allow_params_authentication: config.params_authenticatable,
+        // Devise `allow_params_authentication!` (sessions_controller.rb:5)
+        // enables the params strategy ONLY inside sessions#create — the
+        // warden env flag starts false on every request (S4). Enabling it
+        // from `config.params_authenticatable` here would let ANY guarded
+        // route authenticate `?user_email=…&user_password=…` query
+        // credentials (credentials in URLs/logs). The controller sets the
+        // flag on this staged snapshot when it runs its sign-in pass.
+        allow_params_authentication: false,
     };
 
     // D-11: read peer_addr from the socket connection only, never

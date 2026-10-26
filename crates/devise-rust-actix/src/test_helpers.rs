@@ -126,8 +126,9 @@ pub fn cookie_header(pairs: &[String]) -> String {
 pub async fn sign_out_all_scopes(
     session: &actix_session::Session,
     scopes: &[String],
+    config: &DeviseConfig,
 ) -> Result<(), devise_rust::error::DeviseError> {
-    crate::bridge::sign_out_all_scopes_and_renew_sync(session, scopes)?;
+    crate::bridge::sign_out_all_scopes_and_renew_sync(session, scopes, config)?;
     Ok(())
 }
 

@@ -19,7 +19,7 @@ use devise_rust::failure::AnyDeviseModel;
 use devise_rust::model::AdapterBridge;
 use devise_rust::scope::{Mapping, Module, PathNames, ScopeRegistry, SignOutVia};
 use devise_rust_actix::{
-    ActixSessionStore, DeviseMiddleware,
+    DeviseMiddleware,
     extractors::{
         Auth, AuthGroup, RequireAuth, admin_signed_in, authenticate_group, current_admin,
         current_user, group_signed_in, user_session, user_signed_in,
@@ -152,6 +152,13 @@ impl TestAppState {
     }
 }
 
+/// Take the session-backed devise flash (S11) — the probe surface for the
+/// failure-path tests.
+async fn flash_probe(session: Session) -> HttpResponse {
+    let flash = devise_rust_actix::bridge::take_flash(&session);
+    HttpResponse::Ok().json(serde_json::json!({ "flash": flash }))
+}
+
 /// Protected route guarded by `RequireAuth` over the `user` scope.
 async fn protected_user(auth: RequireAuth<AuthUser>) -> HttpResponse {
     let user = auth.user().cloned().expect("typed user present");
@@ -233,10 +240,7 @@ macro_rules! test_app {
         let state: Arc<TestAppState> = $state;
         let key = devise_rust_actix::callbacks::derive_actix_key(&state.config.secret_key)
             .expect("derive key");
-        let store: Arc<dyn devise_rust::session::SessionStore> =
-            Arc::new(ActixSessionStore::new(key.clone()));
         let middleware = DeviseMiddleware::new(
-            store,
             state.scope_registry.clone(),
             Arc::new(state.config.clone()),
         )
@@ -261,6 +265,7 @@ macro_rules! test_app {
                 .route("/users/soft", web::get().to(soft_user))
                 .route("/users/peer", web::get().to(peer_probe))
                 .route("/users/status", web::get().to(multi_scope_status))
+                .route("/devise-test/flash-probe", web::get().to(flash_probe))
                 .route("/devise-test/sign-in", web::get().to(bridge_sign_in))
                 .route(
                     "/devise-test/admin-sign-in",
@@ -304,14 +309,24 @@ async fn anonymous_html_redirects_with_flash() {
         .unwrap_or_default()
         .to_string();
     assert_eq!(location, "/users/sign_in");
-    let flash = resp
-        .headers()
-        .get_all(header::SET_COOKIE)
-        .filter_map(|v| v.to_str().ok())
-        .map(str::to_string)
-        .find(|c| c.starts_with("devise.flash="))
-        .expect("flash cookie present");
-    assert!(flash.contains("unauthenticated"), "flash key: {flash}");
+    // The flash is session state (S11): read it through the probe with the
+    // session cookie this response set.
+    let cookies = set_cookie_pairs(&resp);
+    let session_cookie = cookies
+        .into_iter()
+        .find(|c| c.starts_with("actix-session=") || c.starts_with("id="))
+        .expect("session cookie");
+    let probe = test::TestRequest::get()
+        .uri("/devise-test/flash-probe")
+        .insert_header((header::COOKIE, session_cookie))
+        .to_request();
+    let resp = test::call_service(&app, probe).await;
+    assert!(resp.status().is_success(), "flash probe reachable");
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(
+        body["flash"], "unauthenticated",
+        "flash key staged in the session: {body}"
+    );
 
     // Soft extractor on the same stack stays anonymous.
     let req = test::TestRequest::get().uri("/users/soft").to_request();
@@ -468,7 +483,7 @@ async fn remember_set_cookie_carries_hardened_attrs_and_codec() {
     let mut jar = actix_web::cookie::CookieJar::new();
     {
         let mut signed = jar.signed_mut(&key);
-        actix_remember::apply_op(&mut signed, &op);
+        actix_remember::apply_op(&mut signed, &op, &config, &SystemClock);
     }
     let rendered: Vec<String> = jar.delta().map(ToString::to_string).collect();
     assert_eq!(rendered.len(), 1, "one cookie delta");
@@ -506,7 +521,7 @@ async fn remember_set_cookie_carries_hardened_attrs_and_codec() {
     let mut jar = actix_web::cookie::CookieJar::new();
     let signed_value = {
         let mut signed = jar.signed_mut(&key);
-        actix_remember::apply_op(&mut signed, &op);
+        actix_remember::apply_op(&mut signed, &op, &config, &SystemClock);
         let Some(cookie) = jar.delta().next() else {
             panic!("delta cookie");
         };
@@ -576,7 +591,7 @@ async fn stale_signed_cookie_yields_clear_and_pass_through() {
     let mut out_jar = actix_web::cookie::CookieJar::new();
     {
         let mut signed = out_jar.signed_mut(&key);
-        actix_remember::apply_op(&mut signed, clear.as_ref());
+        actix_remember::apply_op(&mut signed, clear.as_ref(), &config, &SystemClock);
     }
     let tombstone = out_jar.delta().next().expect("tombstone").to_string();
     assert!(tombstone.starts_with("remember_user_token="), "{tombstone}");

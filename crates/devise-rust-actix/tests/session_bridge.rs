@@ -23,9 +23,8 @@ use devise_rust::{
     failure::AnyDeviseModel,
     session::keys,
 };
-use devise_rust_actix::{
-    ActixSessionStore,
-    bridge::{fetch_session_with_salt, handle_unverified_request, insert_session_and_renew_sync},
+use devise_rust_actix::bridge::{
+    fetch_session_with_salt, handle_unverified_request, insert_session_and_renew_sync, renew_sync,
 };
 use serde_json::json;
 
@@ -95,7 +94,7 @@ async fn sign_in_handler(
 
     // Renew before insert (D-03): explicit renew call site so grep of
     // bridge.rs finds it.
-    drop(ActixSessionStore::renew_sync(&session));
+    drop(renew_sync(&session));
     insert_session_and_renew_sync(&session, scope, &user_key, &salt).expect("insert");
 
     // Re-read via the bridge so salt validation is proven.
@@ -129,8 +128,7 @@ async fn tracer_session_roundtrip_via_middleware() -> Result<(), actix_web::Erro
     let config = tracer_config();
     let key =
         devise_rust_actix::callbacks::derive_actix_key(&config.secret_key).expect("derive key");
-    let store = ActixSessionStore::new(key.clone());
-    let _dbg = std::hint::black_box(store);
+
 
     // A user-model adapter shared across the request pipeline.
     let adapter = Arc::new(MemoryAdapter::<TracerUser>::new());
@@ -253,7 +251,6 @@ async fn tracer_handle_unverified_request_clears_all_scopes() {
     let config = tracer_config();
     let key =
         devise_rust_actix::callbacks::derive_actix_key(&config.secret_key).expect("derive key");
-    let _store = ActixSessionStore::new(key.clone());
 
     let app = test::init_service(
         App::new()
@@ -266,7 +263,8 @@ async fn tracer_handle_unverified_request_clears_all_scopes() {
                 "/tracer/multi-scope",
                 web::get().to(|session: Session| async move {
                     let scopes: Vec<String> = vec!["user".to_string(), "admin".to_string()];
-                    handle_unverified_request(&session, &scopes).expect("unverified request");
+                    handle_unverified_request(&session, &scopes, &tracer_config())
+                        .expect("unverified request");
                     let user_payload: Option<serde_json::Value> =
                         session.get(&keys::scope_session_key("user")).ok().flatten();
                     let admin_payload: Option<serde_json::Value> = session

@@ -68,32 +68,69 @@ pub fn cookie_for_set(value: &str, attrs: &RememberableCookieAttrs) -> Cookie<'s
 }
 
 /// Build the tombstone cookie for a `Clear` op (Devise `cookies.delete`).
+///
+/// A browser only drops a cookie when **name + path + domain** all match the
+/// cookie it holds, so the tombstone must carry the same attributes the
+/// `Set` op used ([`cookie_for_set`]). Rendering the hardcoded `Path=/`
+/// leaves the live cookie untouched for every app that mounts Devise under a
+/// custom `path` or on a custom `domain` (`rememberable_options`) — the user
+/// would stay signed in after sign-out (S9).
 #[must_use]
-pub fn removal_cookie(name: &str) -> Cookie<'static> {
-    let mut cookie = Cookie::build(name.to_string(), String::new())
-        .path("/".to_string())
-        .finish();
+pub fn removal_cookie(name: &str, attrs: &RememberableCookieAttrs) -> Cookie<'static> {
+    let mut builder = Cookie::build(name.to_string(), String::new())
+        .path(attrs.path.clone().unwrap_or_else(|| "/".to_string()))
+        .same_site(match attrs.same_site {
+            SameSite::Strict => ActixSameSite::Strict,
+            SameSite::Lax => ActixSameSite::Lax,
+            SameSite::None => ActixSameSite::None,
+        })
+        .http_only(attrs.httponly);
+    if attrs.secure {
+        builder = builder.secure(true);
+    }
+    if let Some(domain) = &attrs.domain {
+        builder = builder.domain(domain.clone());
+    }
+    let mut cookie = builder.finish();
     cookie.make_removal();
     cookie
 }
 
 /// Execute one core [`RememberCookieOp`] against the signed jar: `Set`
 /// signs the hardened cookie, `Clear` signs the tombstone.
-pub fn apply_op<J: BorrowMut<CookieJar>>(jar: &mut SignedJar<J>, op: &RememberCookieOp) {
+///
+/// The core `Clear` variant carries no attribute payload (only `scope` and
+/// `key`), so the tombstone attributes are derived here from the op's own
+/// scope against `config` (S9) — one home for the attribute resolution.
+pub fn apply_op<J: BorrowMut<CookieJar>>(
+    jar: &mut SignedJar<J>,
+    op: &RememberCookieOp,
+    config: &DeviseConfig,
+    clock: &dyn Clock,
+) {
     match op {
         RememberCookieOp::Set { value, attrs, .. } => {
             jar.add(cookie_for_set(value, attrs));
         }
-        RememberCookieOp::Clear { key, .. } => {
-            jar.add(removal_cookie(key));
+        RememberCookieOp::Clear { scope, key } => {
+            let attrs = RememberableCookieAttrs::for_scope(scope, config, clock);
+            // The op's key is authoritative (key-override aware); the derived
+            // attrs only supply path/domain/secure.
+            let _ = key;
+            jar.add(removal_cookie(key, &attrs));
         }
     }
 }
 
 /// Execute every op in order against the signed jar.
-pub fn apply_ops<J: BorrowMut<CookieJar>>(jar: &mut SignedJar<J>, ops: &[RememberCookieOp]) {
+pub fn apply_ops<J: BorrowMut<CookieJar>>(
+    jar: &mut SignedJar<J>,
+    ops: &[RememberCookieOp],
+    config: &DeviseConfig,
+    clock: &dyn Clock,
+) {
     for op in ops {
-        apply_op(jar, op);
+        apply_op(jar, op, config, clock);
     }
 }
 

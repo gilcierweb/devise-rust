@@ -59,7 +59,7 @@ use devise_rust::adapter::{OrmAdapter, Value as AdapterValue};
 use devise_rust::error::DeviseError;
 use devise_rust::omniauthable::{
     OAuthProviderConfig, Omniauthable, ProviderProfile, authorize_start, basic_client,
-    failure_message, http_client, success_message, verify_state,
+    http_client, verify_state,
 };
 use devise_rust::scope::RouteSpec;
 use oauth2::{AuthorizationCode, PkceCodeVerifier, TokenResponse};
@@ -73,29 +73,20 @@ use crate::routes::{DeviseWebState, FullDeviseModel};
 /// authorize attempt (twin of the axum module's key shape; actix and
 /// axum sessions never interoperate, but the key grammar stays
 /// identical for auditability).
-fn omniauth_state_key(scope: &str, provider: &str) -> String {
+pub(crate) fn omniauth_state_key(scope: &str, provider: &str) -> String {
     format!("devise.{scope}.omniauth.{provider}.state")
 }
 
 /// Session key carrying the stashed PKCE verifier for one (scope,
 /// provider) authorize attempt (single-use; removed on callback read).
-fn omniauth_verifier_key(scope: &str, provider: &str) -> String {
+pub(crate) fn omniauth_verifier_key(scope: &str, provider: &str) -> String {
     format!("devise.{scope}.omniauth.{provider}.pkce_verifier")
 }
 
-/// `OmniAuth::Utils.camelize` for the flash `kind`: "stub" -> "Stub",
-/// `google_oauth2` -> `GoogleOauth2`.
-fn omniauth_kind(provider: &str) -> String {
-    let mut out = String::new();
-    for word in provider.split('_') {
-        let mut chars = word.chars();
-        if let Some(first) = chars.next() {
-            out.extend(first.to_uppercase());
-            out.push_str(chars.as_str());
-        }
-    }
-    out
-}
+// `OmniAuth::Utils.camelize` was used to interpolate the provider kind into
+// the RENDERED flash sentences; the flash now carries the bare I18n key
+// (M: one format everywhere), so the interpolation belongs to the app's
+// rendering of `devise.omniauth_callbacks.*` through the catalog.
 
 /// Shared application state for one omniauth mount: the mapping's devise
 /// state plus the app's `OAuth2` provider endpoint configs (D-05 —
@@ -199,48 +190,40 @@ fn internal_error() -> HttpResponse {
     HttpResponse::InternalServerError().finish()
 }
 
-/// 302 + the `devise.flash` cookie carrying the RENDERED omniauth flash
-/// message (kind + reason interpolation per T-09-14 — the value derives
-/// from the provider name and symbolic reasons, never user input or
-/// tokens).
-fn omniauth_flash_redirect(location: &str, message: &str) -> HttpResponse {
-    let mut response = HttpResponse::Found()
-        .insert_header((actix_web::http::header::LOCATION, location))
-        .finish();
-    let mut cookie = actix_web::cookie::Cookie::new("devise.flash", message.to_string());
-    cookie.set_path("/");
-    cookie.set_http_only(true);
-    cookie.set_same_site(actix_web::cookie::SameSite::Lax);
-    response.add_cookie(&cookie).ok();
-    response
-}
-
-/// The omniauth failure path: `devise.omniauth_callbacks.failure` flash
-/// with the camelize'd kind and symbolic reason, redirecting to
-/// `after_omniauth_failure_path_for` (Devise: the scope's new-session
-/// path).
-fn omniauth_failure<M, A, L>(
-    st: &OmniauthWebState<M, A, L>,
-    provider: &str,
-    reason: &str,
+/// 302 + the session-staged omniauth flash (S11 + M: the SAME
+/// `routes::flash_redirect` helper every controller uses, carrying the BARE
+/// I18n key — `devise.omniauth_callbacks.success` / `.failure` — so the
+/// app renders every flash through the one catalog; the omniauth module
+/// no longer writes pre-rendered sentences into a slot the controllers
+/// fill with keys).
+fn omniauth_flash_redirect(
+    session: &Session,
+    location: &str,
+    flash_key: &str,
 ) -> HttpResponse {
-    let kind = omniauth_kind(provider);
-    let message = failure_message(&kind, reason);
-    omniauth_flash_redirect(&st.devise.mapping.sign_in_path(), &message)
+    crate::routes::flash_redirect(session, location, flash_key)
 }
 
-/// Success redirect target after sign-in: stored location (same-host
-/// parsed via core validator) or the app root — the actix
-/// `after_sign_in_target` parity.
-fn after_sign_in_target(session: &Session, scope: &str) -> String {
-    let key = devise_rust::failure::stored_location_key(scope);
-    if let Some(raw) = session.get::<String>(&key).ok().flatten() {
-        session.remove(&key);
-        if let Some(target) = devise_rust::request::AuthRequest::parse_stored_uri(&raw) {
-            return target;
-        }
-    }
-    "/".to_string()
+/// The omniauth failure path: the bare `devise.omniauth_callbacks.failure`
+/// flash key, redirecting to `after_omniauth_failure_path_for` (Devise: the
+/// scope's new-session path).
+fn omniauth_failure<M, A, L>(
+    session: &Session,
+    st: &OmniauthWebState<M, A, L>,
+) -> HttpResponse {
+    omniauth_flash_redirect(
+        session,
+        &st.devise.mapping.sign_in_path(),
+        "devise.omniauth_callbacks.failure",
+    )
+}
+
+/// Success redirect target after sign-in — the crate-wide Devise
+/// precedence (stored location → scope root → `/`) lives in
+/// [`crate::routes::after_sign_in_target`]; the omniauth callback redirects
+/// through the same home instead of a private reduced copy.
+fn after_sign_in_target(session: &Session, mapping: &devise_rust::scope::Mapping) -> String {
+    crate::routes::after_sign_in_target(session, mapping)
 }
 
 /// Durable sign-in bookkeeping on the omniauth callback path (twin of
@@ -505,11 +488,11 @@ where
     // CSRF state: `secure_compare` only; absence on either side fails
     // closed (T-09-09).
     if !verify_state(stashed_state.as_deref(), returned_state.as_deref()) {
-        return omniauth_failure(&state, &provider, "Invalid state");
+        return omniauth_failure(&session, &state) /* Invalid state */;
     }
     let (Some(code), Some(verifier)) = (code.filter(|code| !code.is_empty()), stashed_verifier)
     else {
-        return omniauth_failure(&state, &provider, "Invalid credentials");
+        return omniauth_failure(&session, &state) /* Invalid credentials */;
     };
 
     // Token exchange over the redirects-disabled transport (SSRF rule,
@@ -517,10 +500,10 @@ where
     // be forgotten handler-side.
     let redirect_url = redirect_uri(&state, &req, &provider);
     let Ok(client) = basic_client(provider_config, &redirect_url) else {
-        return omniauth_failure(&state, &provider, "Token exchange failed");
+        return omniauth_failure(&session, &state) /* Token exchange failed */;
     };
     let Ok(http) = http_client() else {
-        return omniauth_failure(&state, &provider, "Token exchange failed");
+        return omniauth_failure(&session, &state) /* Token exchange failed */;
     };
     let Ok(token) = client
         .exchange_code(AuthorizationCode::new(code))
@@ -528,7 +511,7 @@ where
         .request_async(&http)
         .await
     else {
-        return omniauth_failure(&state, &provider, "Token exchange failed");
+        return omniauth_failure(&session, &state) /* Token exchange failed */;
     };
 
     // Userinfo fetch with the access token (session-only, D-12 — the
@@ -544,12 +527,12 @@ where
     {
         Ok(response) if response.status().is_success() => match response.text().await {
             Ok(text) => text,
-            Err(_) => return omniauth_failure(&state, &provider, "Userinfo fetch failed"),
+            Err(_) => return omniauth_failure(&session, &state) /* Userinfo fetch failed */,
         },
-        _ => return omniauth_failure(&state, &provider, "Userinfo fetch failed"),
+        _ => return omniauth_failure(&session, &state) /* Userinfo fetch failed */,
     };
     let Ok(claims) = serde_json::from_str::<JsonValue>(&raw_claims) else {
-        return omniauth_failure(&state, &provider, "Userinfo fetch failed");
+        return omniauth_failure(&session, &state) /* Userinfo fetch failed */;
     };
 
     // Auth-hash build (the OmniAuth middleware role): uid from `sub` or
@@ -560,7 +543,7 @@ where
         .and_then(JsonValue::as_str)
         .or_else(|| claims.get("uid").and_then(JsonValue::as_str))
     else {
-        return omniauth_failure(&state, &provider, "Userinfo fetch failed");
+        return omniauth_failure(&session, &state) /* Userinfo fetch failed */;
     };
     let profile = ProviderProfile {
         provider: provider.clone(),
@@ -587,7 +570,7 @@ where
         outcome.record
     } else {
         // Model rejection: symbolic failure, never model values.
-        return omniauth_failure(&state, &provider, "Invalid credentials");
+        return omniauth_failure(&session, &state) /* Invalid credentials */;
     };
 
     // Warden after_set_user parity on the authentication event: lockable
@@ -607,9 +590,9 @@ where
     }
     rotate_csrf_token(&session, &scope, &devise.config);
 
-    // Success: the devise.omniauth_callbacks.success flash with the
-    // camelize'd kind, redirecting to the stored location or root.
-    let target = after_sign_in_target(&session, &scope);
-    let message = success_message(&omniauth_kind(&provider));
-    omniauth_flash_redirect(&target, &message)
+    // Success: the BARE `devise.omniauth_callbacks.success` flash key
+    // (M: one key format everywhere; the app renders it through the I18n
+    // catalog), redirecting to the stored location or the scope root.
+    let target = after_sign_in_target(&session, &devise.mapping);
+    omniauth_flash_redirect(&session, &target, "devise.omniauth_callbacks.success")
 }

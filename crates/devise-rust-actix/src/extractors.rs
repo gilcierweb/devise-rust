@@ -221,14 +221,46 @@ impl<M: AnyDeviseModel + Send + Sync + 'static> FromRequest for RequireAuth<M> {
                 && matches!(request.method, HttpMethod::Get)
                 && !request.is_xhr();
             if navigational {
-                if let Some(target) =
-                    devise_rust::request::AuthRequest::parse_stored_uri(&request.path)
+                // Devise `store_location!` stores the request's FULL path
+                // (`request.fullpath`) — path AND query string; rebuilding
+                // the raw pairs from the staged snapshot keeps `?tab=…`
+                // alive across the sign-in round trip (T-08-08 validates
+                // the stored target through the same-host parser either
+                // way).
+                let mut target = request.path.clone();
+                if !request.query.is_empty() {
+                    let pairs: Vec<String> = request
+                        .query
+                        .iter()
+                        .map(|(name, value)| format!("{name}={value}"))
+                        .collect();
+                    target.push('?');
+                    target.push_str(&pairs.join("&"));
+                }
+                if let Some(stored) =
+                    devise_rust::request::AuthRequest::parse_stored_uri(&target)
                 {
                     use actix_session::SessionExt as _;
                     let session = req.get_session();
                     let key = devise_rust::failure::stored_location_key(&mapping.name);
-                    drop(session.insert(&key, target));
+                    drop(session.insert(&key, stored));
                 }
+            }
+        }
+        // Stage the failure's flash key into the signed session (S11: the
+        // flash is session state, not a renderer cookie) BEFORE the async
+        // block — the `Session` handle never crosses an `await` (D-04).
+        if let (Some(mapping), Some(config)) = (&mapping, &config) {
+            let reason = if timed_out.is_some() {
+                FailureReason::Timeout
+            } else {
+                FailureReason::Unauthenticated
+            };
+            let failure = build_failure(&request, mapping, config, reason);
+            if let Some(flash_key) = failure.flash_key() {
+                use actix_session::SessionExt as _;
+                let session = req.get_session();
+                crate::bridge::set_flash(&session, flash_key);
             }
         }
         Box::pin(async move {
@@ -345,7 +377,8 @@ pub fn admin_session(req: &HttpRequest) -> Option<Value> {
 }
 
 /// `authenticate_<scope>!` helper: returns the typed record or the rendered
-/// core `Failure` (302 navigational / 401 API, D-09).
+/// core `Failure` (302 navigational / 401 API, D-09). The failure's flash
+/// key is staged into the session (S11) before rendering.
 ///
 /// # Errors
 ///
@@ -359,6 +392,17 @@ where
     }
     let request = staged_request(req);
     let resolved = resolved_auth(req);
+    if let (Some(mapping), Some(config)) = (
+        resolved.as_ref().and_then(|r| r.mapping.clone()),
+        resolved.as_ref().and_then(|r| r.config.clone()),
+    ) {
+        let failure = build_failure(&request, &mapping, &config, FailureReason::Unauthenticated);
+        if let Some(flash_key) = failure.flash_key() {
+            use actix_session::SessionExt as _;
+            let session = req.get_session();
+            crate::bridge::set_flash(&session, flash_key);
+        }
+    }
     Err(unauthenticated_response(
         &request,
         resolved.as_ref().and_then(|r| r.mapping.as_ref()),
@@ -439,6 +483,17 @@ pub fn authenticate_group(
     }
     let request = staged_request(req);
     let resolved = resolved_auth(req);
+    if let (Some(mapping), Some(config)) = (
+        resolved.as_ref().and_then(|r| r.mapping.clone()),
+        resolved.as_ref().and_then(|r| r.config.clone()),
+    ) {
+        let failure = build_failure(&request, &mapping, &config, FailureReason::Unauthenticated);
+        if let Some(flash_key) = failure.flash_key() {
+            use actix_session::SessionExt as _;
+            let session = req.get_session();
+            crate::bridge::set_flash(&session, flash_key);
+        }
+    }
     Err(unauthenticated_response(
         &request,
         resolved.as_ref().and_then(|r| r.mapping.as_ref()),
@@ -448,7 +503,8 @@ pub fn authenticate_group(
 
 /// Reject already-signed-in visitors from sign-in pages (SESS-08 /
 /// core `require_no_authentication`): navigational requests redirect to the
-/// scope root with the `already_authenticated` flash; API requests 401.
+/// scope root with the `already_authenticated` flash (session-staged,
+/// S11); API requests 401.
 ///
 /// # Errors
 ///
@@ -467,16 +523,17 @@ pub fn require_no_authentication(req: &HttpRequest) -> Result<(), HttpResponse> 
         .mapping
         .as_ref()
         .map_or_else(|| "/".to_string(), Mapping::full_path);
-    let mut response = HttpResponse::Found()
+    // S11: the flash is session state — stage the key into the signed
+    // session (same lifetime the controllers' flashes have).
+    {
+        use actix_session::SessionExt as _;
+        let session = req.get_session();
+        crate::bridge::set_flash(
+            &session,
+            FailureReason::AlreadyAuthenticated.flash_key(),
+        );
+    }
+    Err(HttpResponse::Found()
         .insert_header((header::LOCATION, target))
-        .finish();
-    let mut flash = actix_web::cookie::Cookie::new(
-        "devise.flash".to_string(),
-        FailureReason::AlreadyAuthenticated.flash_key().to_string(),
-    );
-    flash.set_path("/");
-    flash.set_http_only(true);
-    flash.set_same_site(actix_web::cookie::SameSite::Lax);
-    response.add_cookie(&flash).ok();
-    Err(response)
+        .finish())
 }

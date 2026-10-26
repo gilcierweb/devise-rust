@@ -44,7 +44,7 @@ use devise_rust::rememberable::Rememberable;
 use devise_rust::scope::{Mapping, Module, ScopeRegistry, SignOutVia};
 use devise_rust::time::{Clock, SystemClock};
 use devise_rust_actix::routes::DeviseWebState;
-use devise_rust_actix::{ActixSessionStore, DeviseMiddleware, derive_actix_key, devise_for_users};
+use devise_rust_actix::{DeviseMiddleware, derive_actix_key, devise_for_users};
 use devise_rust_diesel::changeset::{
     nullable_datetime, nullable_string, required_datetime, required_i32, required_string,
 };
@@ -807,11 +807,13 @@ fn example_state(
     mapping: Mapping,
     config: Arc<DeviseConfig>,
     adapter: ExampleAdapter,
+    scope_registry: Arc<ScopeRegistry>,
 ) -> ExampleState {
     DeviseWebState {
         all_scopes: vec!["user".to_string(), "admin".to_string()],
         mapping,
         config,
+        scope_registry,
         adapter: Arc::new(adapter),
         mailer: Arc::new(TestMailer::default()),
         clock: Arc::new(SystemClock),
@@ -867,6 +869,14 @@ fn app_factory(
     let user_mapping = mapping("user", "users");
     let admin_mapping = mapping("admin", "admins");
 
+    // The one shared registry: the middleware AND both web states carry it
+    // (`sign_out_all_scopes` walks the registry, S2 parity with Devise's
+    // `Devise.mappings` iteration).
+    let mut registry = ScopeRegistry::new();
+    registry.register(user_mapping.clone());
+    registry.register(admin_mapping.clone());
+    let registry = Arc::new(registry);
+
     let adapter = ExampleAdapter::new(pool.clone());
     // Devise `check_fields!` parity: fail loudly at startup when a model's
     // required columns are missing from the database. `app_factory` is sync,
@@ -887,24 +897,25 @@ fn app_factory(
             );
         }
     }
-    let mut user_state = example_state(user_mapping.clone(), config.clone(), adapter.clone());
+    let mut user_state = example_state(
+        user_mapping.clone(),
+        config.clone(),
+        adapter.clone(),
+        registry.clone(),
+    );
     user_state.mailer = mailer.clone();
-    let mut admin_state = example_state(admin_mapping.clone(), config.clone(), adapter.clone());
+    let mut admin_state = example_state(
+        admin_mapping.clone(),
+        config.clone(),
+        adapter.clone(),
+        registry.clone(),
+    );
     admin_state.mailer = mailer;
-
-    let mut registry = ScopeRegistry::new();
-    registry.register(user_mapping);
-    registry.register(admin_mapping);
-    let registry = Arc::new(registry);
 
     let user_finder: Arc<dyn ModelFinder> = Arc::new(AdapterBridge::new(adapter.clone()));
     let admin_finder: Arc<dyn ModelFinder> = Arc::new(AdapterBridge::new(adapter));
 
-    let middleware = DeviseMiddleware::new(
-        Arc::new(ActixSessionStore::new(key.clone())),
-        registry,
-        config,
-    )
+    let middleware = DeviseMiddleware::new(registry, config)
     .with_finder("user", user_finder)
     .with_finder("admin", admin_finder);
 
