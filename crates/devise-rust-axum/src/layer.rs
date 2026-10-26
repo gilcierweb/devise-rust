@@ -31,10 +31,12 @@
 //!    only — proxy forwarding headers are never consulted (D-20).
 //! 4. Non-strict `AuthProxy` fetch for the resolved scope: the warden
 //!    payload through the bridge store, salt validation via the scope's
-//!    finder (mismatch deletes the key), then `Event::Request` hook
-//!    dispatch with the live record — the core hook bodies own the
-//!    timeout check, the live remember-me exemption, and the
-//!    integer-epoch `last_request_at` tick, honoring the
+//!    finder (mismatch deletes the key), then the activatable fetch gate
+//!    (a locked or unconfirmed record deletes the scope session key,
+//!    stages its failure, and leaves the request anonymous), then
+//!    `Event::Request` hook dispatch with the live record: the core hook
+//!    bodies own the timeout check, the live remember-me exemption, and
+//!    the integer-epoch `last_request_at` tick, honoring the
 //!    `skip_timeoutable` / `skip_timeout` / `skip_trackable` flags carried
 //!    on the `AuthRequest`.
 //! 5. `TowerSessionStore` over the cloned session plus the per-request
@@ -290,14 +292,23 @@ where
     }
 }
 
-/// Non-strict warden fetch plus `Event::Request` hook dispatch for the
-/// resolved scope.
+/// Non-strict warden fetch, the activatable fetch gate, and `Event::Request`
+/// hook dispatch for the resolved scope.
 ///
 /// The fetch mirrors core `AuthProxy::fetch_from_session` semantics over
 /// the erased finder (the proxy's own fetch stays strategy-coupled for the
 /// strict path): read the `[key, salt]` payload, fetch the record, compare
 /// salts constant-time, and on mismatch DELETE the session key and yield
 /// nothing (T-09-02).
+///
+/// The activatable gate runs on the fetch here, because Devise's
+/// `hooks/activatable.rb` registers a bare `after_set_user` that validates
+/// the user activity on each request, the fetch included: a record failing
+/// `active_for_authentication?` is logged out (the scope session key is
+/// deleted) and the request fails with its `inactive_message`. The failure
+/// is staged on the proxy so the later strict call in the same request
+/// renders the locked or unconfirmed key, and the request itself stays
+/// anonymous (no `Event::Request` hooks, no memoization).
 ///
 /// Request hooks run with the local record BEFORE memoization — the same
 /// borrow shape core uses — so the core `timeoutable_tick_hook` body can
@@ -318,6 +329,30 @@ async fn fetch_and_dispatch_request_hooks(
     let Some(record) = fetch_session_record(proxy, finder.as_ref(), scope).await else {
         return;
     };
+
+    // Activatable gate on the fetch (T-261026-ghb-01): the Event::Fetch
+    // hook context mirrors the shape core `fetch_from_session` builds. A
+    // rejection performs the reference's `warden.logout(scope)` plus
+    // `throw :warden`: delete the scope session key, stage the failure for
+    // the request's strict call, and leave the request anonymous.
+    let gate_result = {
+        let mut gate_ctx = HookContext {
+            proxy: proxy as &mut dyn HookProxy,
+            scope,
+            event: Event::Fetch,
+            request: None,
+            record: Some(record.as_ref()),
+        };
+        hooks.run_hooks(&mut gate_ctx).await
+    };
+    if let Err(failure) = gate_result {
+        proxy
+            .session_store()
+            .remove(&keys::scope_session_key(scope))
+            .await;
+        proxy.stage_session_fetch_failure(scope, failure);
+        return;
+    }
 
     // Event::Request hooks with the live record: core bodies own the
     // timeout check (skip flags honored through `request.flags`), the

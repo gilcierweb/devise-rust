@@ -17,12 +17,17 @@ mod common;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
+use axum::response::IntoResponse;
 use common::{FixtureUser, SystemClock, default_mapping};
 use devise_rust::adapter::{Conditions, OrmAdapter, Value};
 use devise_rust::failure::AnyDeviseModel;
+use devise_rust::hooks::HookRegistry;
+use devise_rust::model::{AdapterBridge, ModelFinder};
 use devise_rust::time::Clock as _;
 use devise_rust_axum::test_helpers::{cookie_header, set_cookie_pairs};
+use devise_rust_axum::{DeviseLayer, devise_for_router, session_manager_layer};
 use http_body_util::BodyExt;
+use std::sync::Arc;
 use tower::ServiceExt;
 
 type Response = axum::http::Response<axum::body::Body>;
@@ -1506,5 +1511,197 @@ async fn flow_sign_in_lock_without_paranoid_reports_locked() {
     assert!(
         common::flash_keys_from_cookies(&cookies, &state.config).contains(&"locked".to_string()),
         "threshold lock without paranoid reports locked: {cookies:?}"
+    );
+}
+
+// ============================================================================
+// Activatable session-fetch gate (Devise `hooks/activatable.rb`): a locked
+// record held in the session authenticates nothing on the next request, the
+// scope session key dies on the request that rejected it, and unlocking the
+// account does not resurrect the dead session (T-261026-ghb-01/02).
+// ============================================================================
+
+/// Guarded route under the scope prefix: 200 plus the email for an
+/// authenticated record, otherwise the `RequireAuth` failure path (302 to
+/// the sign-in path plus the inactive flash key).
+async fn flow_fetch_gate_private(
+    user: devise_rust_axum::RequireAuth<common::FixtureUser>,
+) -> impl IntoResponse {
+    let email = user
+        .user()
+        .map(|user| user.email.clone())
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({ "email": email })),
+    )
+}
+
+/// Non-strict probe: whether the layer resolved a record for this request.
+async fn flow_fetch_gate_probe(
+    auth: devise_rust_axum::Auth<common::FixtureUser>,
+) -> axum::Json<bool> {
+    axum::Json(auth.is_authenticated())
+}
+
+/// Build the fetch-gate app: the devise routes plus the guarded and
+/// non-strict probes mounted under the scope prefix, sharing the devise
+/// layer's session store.
+fn flow_fetch_gate_app(state: common::TestState) -> (common::TestState, Router) {
+    let mut hooks = HookRegistry::new();
+    devise_rust::hooks::register_devise_hooks(&mut hooks, &state.mapping);
+
+    let mapping = state.mapping.clone();
+    let scope_name = mapping.name.clone();
+    let finder: Arc<dyn ModelFinder> = Arc::new(AdapterBridge::new(state.adapter.as_ref().clone()));
+    let devise_layer = DeviseLayer::new(
+        common::registry_with(std::slice::from_ref(&mapping)),
+        state.config.clone(),
+    )
+    .with_hooks(Arc::new(hooks))
+    .with_finder(&scope_name, finder);
+    let session_layer = session_manager_layer(&state.config).expect("session layer builds");
+
+    let app = Router::new()
+        .merge(devise_for_router(state.clone()))
+        .route(
+            "/users/private",
+            axum::routing::get(flow_fetch_gate_private),
+        )
+        .route(
+            "/users/anonymous-probe",
+            axum::routing::get(flow_fetch_gate_probe),
+        )
+        .layer(devise_layer)
+        .layer(session_layer);
+    (state, app)
+}
+
+/// Write the lock state of the seeded account straight through the test
+/// adapter (the fixture manipulation the lockable flow tests use).
+async fn flow_fetch_gate_write_lock(
+    state: &common::TestState,
+    key: &devise_rust::adapter::DeviseKey,
+    locked: bool,
+) {
+    let mut fields = std::collections::HashMap::new();
+    if locked {
+        fields.insert(
+            "locked_at".to_string(),
+            Value::String(common::now_rfc3339()),
+        );
+        fields.insert("failed_attempts".to_string(), Value::Integer(20));
+    } else {
+        fields.insert("locked_at".to_string(), Value::Null);
+        fields.insert("failed_attempts".to_string(), Value::Integer(0));
+    }
+    state
+        .adapter
+        .update_columns(key, &fields)
+        .await
+        .expect("lock write");
+}
+
+/// GET the guarded route with the jar's cookies replayed.
+async fn flow_fetch_gate_guarded(app: &Router, cookie: String) -> Response {
+    call(
+        app,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/users/private")
+            .header(header::ACCEPT, "text/html")
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await
+}
+
+/// GET the non-strict probe with the jar's cookies replayed.
+async fn flow_fetch_gate_probe_call(app: &Router, cookie: String) -> bool {
+    let resp = call(
+        app,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/users/anonymous-probe")
+            .header(header::ACCEPT, "text/html")
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "the soft probe never fails");
+    body_json(resp).await.as_bool().expect("boolean body")
+}
+
+/// Devise `hooks/activatable.rb` fetch arm: sign in, lock the account, then
+/// hit the guarded route with the session cookie replayed. The request is
+/// rejected (302 to the sign-in path, never 200), the flash carries the
+/// `locked` key, and the non-strict surface resolves anonymous. Unlocking
+/// the account afterwards still rejects, because the gate deleted the scope
+/// session key on the request that rejected it.
+#[tokio::test]
+async fn flow_fetch_gate_locked_session_rejects_and_survives_unlock() {
+    let (state, app) = flow_fetch_gate_app(common::test_state(default_mapping()));
+    let user = seed_user(&state, "flowgate@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    jar.merge(&form_sign_in(&app, "flowgate@example.com", "secret123").await);
+    // The signed-in session really reaches the guarded route.
+    let ok = flow_fetch_gate_guarded(&app, jar.header()).await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "a live session passes the gate"
+    );
+
+    // Lock the account: the session payload stays valid, but the record no
+    // longer passes `active_for_authentication?`.
+    flow_fetch_gate_write_lock(&state, &user.to_key(), true).await;
+
+    let rejected = flow_fetch_gate_guarded(&app, jar.header()).await;
+    assert_eq!(
+        rejected.status(),
+        StatusCode::FOUND,
+        "the locked session must not render the guarded route"
+    );
+    assert_eq!(
+        rejected
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/users/sign_in"),
+        "the rejection redirects to the scope sign-in path"
+    );
+    let cookies = set_cookie_pairs(&rejected);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"locked".to_string()),
+        "the inactive message rides the flash: {cookies:?}"
+    );
+    // The non-strict surface stays anonymous on the same locked session.
+    assert!(
+        !flow_fetch_gate_probe_call(&app, jar.header()).await,
+        "the locked session resolves anonymous on the soft extractor"
+    );
+
+    // The browser keeps whatever cookies the rejected response carried.
+    jar.merge(&rejected);
+
+    // Unlock the account: the dead session must stay dead (T-261026-ghb-02).
+    flow_fetch_gate_write_lock(&state, &user.to_key(), false).await;
+    let after_unlock = flow_fetch_gate_guarded(&app, jar.header()).await;
+    assert_eq!(
+        after_unlock.status(),
+        StatusCode::FOUND,
+        "the deleted session key must not resurrect after the unlock"
+    );
+    let after_body = body_text(after_unlock).await;
+    assert!(
+        !after_body.contains("flowgate@example.com"),
+        "the guarded handler never ran: {after_body}"
+    );
+    assert!(
+        !flow_fetch_gate_probe_call(&app, jar.header()).await,
+        "the unlocked replay still resolves anonymous"
     );
 }
