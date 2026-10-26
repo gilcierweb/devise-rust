@@ -83,6 +83,15 @@ pub struct AuthProxy {
     /// reproduce Devise's rememberable exemption
     /// (`strategies/rememberable.rb:36-43`).
     winning_strategy: Option<&'static str>,
+    /// Failures staged by the activatable session-fetch gate, per scope.
+    ///
+    /// Devise's activatable hook (`hooks/activatable.rb`) runs on every
+    /// `after_set_user` action, the fetch included: when the gate rejects a
+    /// session record the request fails, so presented credentials and the
+    /// remember arm must not resurrect the locked session. The proxy is
+    /// per-request in both frameworks, so the slot lives exactly as long
+    /// as the request it poisoned.
+    fetch_gate_failures: HashMap<String, Failure>,
 }
 
 impl AuthProxy {
@@ -113,6 +122,7 @@ impl AuthProxy {
             config,
             remember_cookie_ops: Vec::new(),
             winning_strategy: None,
+            fetch_gate_failures: HashMap::new(),
         }
     }
 
@@ -428,6 +438,21 @@ impl AuthProxy {
         any_user
     }
 
+    /// Stage a session-fetch gate failure for the request.
+    ///
+    /// The axum layer runs its fetch non-strictly (the request stays
+    /// anonymous on a gate rejection), so the failure is staged here for
+    /// the later strict call in the same request, which then renders the
+    /// gate's inactive message instead of a generic unauthenticated one.
+    /// Core's own fetch path stages the failure inline.
+    ///
+    /// The slot is per-request: the proxy is per-request in both
+    /// frameworks, so a staged failure never outlives the request whose
+    /// session it rejected.
+    pub fn stage_session_fetch_failure(&mut self, scope: &str, failure: Failure) {
+        self.fetch_gate_failures.insert(scope.to_string(), failure);
+    }
+
     /// Shared authentication flow returning the real failure on error.
     async fn try_authenticate(
         &mut self,
@@ -445,17 +470,31 @@ impl AuthProxy {
         {
             return Ok(());
         }
-        if let Some(user) = self.fetch_from_session(scope).await {
-            let opts = SetUserOpts {
-                event: SetUserEvent::Fetch,
-                store: false,
-                run_callbacks: false,
-                force: false,
-            };
-            self.set_user(scope, Some(user), opts)
-                .await
-                .map_err(Failure::from)?;
-            return Ok(());
+        // Devise's activatable hook throws on the fetch, which aborts the
+        // warden cycle: a session the gate rejected poisons the whole
+        // request, so neither presented credentials nor the remember arm
+        // may authenticate past it (`hooks/activatable.rb`).
+        if let Some(failure) = self.fetch_gate_failures.get(scope).cloned() {
+            return Err(failure);
+        }
+        match self.fetch_from_session(scope).await {
+            Ok(Some(user)) => {
+                let opts = SetUserOpts {
+                    event: SetUserEvent::Fetch,
+                    store: false,
+                    run_callbacks: false,
+                    force: false,
+                };
+                self.set_user(scope, Some(user), opts)
+                    .await
+                    .map_err(Failure::from)?;
+                return Ok(());
+            }
+            // No session record: the chain continues with strategies exactly
+            // as before (missing finder, missing or malformed payload, key
+            // parse failure, record not found, salt mismatch).
+            Ok(None) => {}
+            Err(failure) => return Err(failure),
         }
         let (user, store) = self.authenticate_via_strategies(scope, request).await?;
         let opts = SetUserOpts {
@@ -472,22 +511,57 @@ impl AuthProxy {
 
     /// Fetch the session user with salt validation (warden fetch semantics).
     ///
-    /// A salt mismatch deletes the session key and yields `None`.
-    async fn fetch_from_session(&mut self, scope: &str) -> Option<Box<dyn AnyDeviseModel>> {
-        let finder = self.finders.get(scope).cloned()?;
+    /// Every no-session outcome (missing finder, missing payload, malformed
+    /// payload, key parse failure, record not found) is `Ok(None)`, so
+    /// [`try_authenticate`](Self::try_authenticate) still falls through to
+    /// the strategy chain. A salt mismatch deletes the session key and
+    /// yields `Ok(None)`.
+    ///
+    /// The `Event::Fetch` hook dispatch is the activatable gate
+    /// (`hooks/activatable.rb`, which validates the user activity on each
+    /// request): a rejected record deletes the scope session key (the
+    /// reference's `warden.logout(scope)`), stages its failure for the
+    /// request, and returns `Err`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate's [`Failure`] when the `Event::Fetch` hooks reject
+    /// the record.
+    async fn fetch_from_session(
+        &mut self,
+        scope: &str,
+    ) -> Result<Option<Box<dyn AnyDeviseModel>>, Failure> {
+        let Some(finder) = self.finders.get(scope).cloned() else {
+            return Ok(None);
+        };
         let session_key = session::keys::scope_session_key(scope);
-        let session_value = self.session_store.get_value(&session_key).await?;
-        let payload = session_value.as_array()?;
+        let Some(session_value) = self.session_store.get_value(&session_key).await else {
+            return Ok(None);
+        };
+        let Some(payload) = session_value.as_array() else {
+            return Ok(None);
+        };
         if payload.len() < 2 {
-            return None;
+            return Ok(None);
         }
-        let key = DeviseKey::from_str(payload[0].as_str()?).ok()?;
-        let stored_salt = payload[1].as_str()?;
-        let record = finder.get_boxed(&key).await.ok()??;
-        let current_salt = record.as_ref().authenticatable_salt()?;
+        let Some(key) = payload[0]
+            .as_str()
+            .and_then(|raw| DeviseKey::from_str(raw).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(stored_salt) = payload[1].as_str() else {
+            return Ok(None);
+        };
+        let Ok(Some(record)) = finder.get_boxed(&key).await else {
+            return Ok(None);
+        };
+        let Some(current_salt) = record.as_ref().authenticatable_salt() else {
+            return Ok(None);
+        };
         if !crate::crypto::secure_compare(&current_salt, stored_salt) {
             self.session_store.remove(&session_key).await;
-            return None;
+            return Ok(None);
         }
         let hooks = self.hooks.clone();
         let mut ctx = HookContext {
@@ -497,8 +571,18 @@ impl AuthProxy {
             request: None,
             record: Some(record.as_ref()),
         };
-        let _ = hooks.run_hooks(&mut ctx).await;
-        Some(record)
+        match hooks.run_hooks(&mut ctx).await {
+            Ok(()) => Ok(Some(record)),
+            Err(failure) => {
+                // Warden logout: the reference deletes the scope session key
+                // before throwing, so an unlocked account cannot resurrect
+                // the dead session on a later request.
+                self.session_store.remove(&session_key).await;
+                self.fetch_gate_failures
+                    .insert(scope.to_string(), failure.clone());
+                Err(failure)
+            }
+        }
     }
 
     /// Queue the extend re-issue cookie (D-14) for a rememberable
@@ -1290,5 +1374,296 @@ mod tests {
             .await
             .unwrap();
         assert!(store.get_value("remember_cookie_set:user").await.is_some());
+    }
+
+    /// Bcrypt-shaped hash whose first 29 characters are the warden salt the
+    /// session payload stores and `fetch_from_session` compares.
+    const FETCH_GATE_HASH: &str = "$2a$04$abcdefghijklmnopqrstuu01234";
+
+    /// Session-fetch gate model: `active_for_authentication?` reads the
+    /// `active` flag, the gate view is exposed only when `gated` holds
+    /// (Devise's `respond_to?` guard), and `encrypted_password` carries a
+    /// real bcrypt-shaped prefix so the warden salt compare passes.
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct FetchGateUser {
+        id: i64,
+        email: String,
+        encrypted_password: String,
+        /// Plaintext twin so the params strategy can really authenticate
+        /// this record (the replay test must prove credentials alone do not
+        /// resurrect a gated session).
+        #[serde(skip)]
+        password: Option<String>,
+        /// Whether the record exposes the activatable gate view.
+        gated: bool,
+        /// Result of `active_for_authentication?`.
+        active: bool,
+    }
+
+    impl FetchGateUser {
+        fn new(email: &str, password: &str, gated: bool, active: bool) -> Self {
+            Self {
+                id: 1,
+                email: email.to_string(),
+                encrypted_password: FETCH_GATE_HASH.to_string(),
+                password: Some(password.to_string()),
+                gated,
+                active,
+            }
+        }
+    }
+
+    impl AnyDeviseModel for FetchGateUser {
+        fn to_key(&self) -> DeviseKey {
+            DeviseKey::from_i64(self.id)
+        }
+
+        fn authenticatable_salt(&self) -> Option<String> {
+            self.encrypted_password.get(..29).map(str::to_string)
+        }
+
+        fn as_password_verifiable(&self) -> Option<&dyn PasswordVerifiable> {
+            Some(self)
+        }
+
+        fn as_activatable(&self) -> Option<&dyn crate::model::Activatable> {
+            if self.gated { Some(self) } else { None }
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl PasswordVerifiable for FetchGateUser {
+        fn valid_password(&self, password: &str, _config: &DeviseConfig) -> bool {
+            self.password.as_deref() == Some(password)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model::Authenticatable for FetchGateUser {
+        fn active_for_authentication(&self) -> bool {
+            self.active
+        }
+
+        fn inactive_message(&self) -> &'static str {
+            if self.active { "inactive" } else { "locked" }
+        }
+    }
+
+    /// Core fetch-gate harness: the gate mapping (Lockable + Confirmable so
+    /// the gate composers apply), the hook registry over it, a finder over a
+    /// memory adapter seeded with `record`, and the scope session key
+    /// pre-populated with that record's `[key, salt]` payload.
+    async fn fetch_gate_proxy(
+        record: FetchGateUser,
+    ) -> (
+        AuthProxy,
+        Arc<ProxySessionStore>,
+        MemoryAdapter<FetchGateUser>,
+    ) {
+        let renewed = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(ProxySessionStore {
+            data: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            renewed,
+        });
+        let adapter = MemoryAdapter::<FetchGateUser>::new();
+        adapter.create(record.clone()).await.expect("seed");
+        // The oracle keys storage by its own counter (first create is 1),
+        // so the payload rides the assigned key.
+        let key = record.to_key();
+        let salt = record.authenticatable_salt().unwrap_or_default();
+        store
+            .insert_value(
+                &session::keys::scope_session_key("user"),
+                serde_json::json!([key.to_string(), salt]),
+            )
+            .await;
+
+        let mut mapping = Mapping {
+            name: "user".to_string(),
+            class_name: "FetchGateUser".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![
+                crate::scope::Module::DatabaseAuthenticatable,
+                crate::scope::Module::Confirmable,
+                crate::scope::Module::Lockable,
+            ],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: SignOutVia::Delete,
+            failure_app: None,
+        };
+        mapping.modules.sort();
+        let mut registry = ScopeRegistry::new();
+        registry.register(mapping.clone());
+        let mut hooks = HookRegistry::new();
+        crate::hooks::register_devise_hooks(&mut hooks, &mapping);
+        let store_trait: Arc<dyn SessionStore> = store.clone();
+        let mut proxy = AuthProxy::new(
+            store_trait,
+            Arc::new(registry),
+            Arc::new(hooks),
+            Arc::new(test_config()),
+        );
+        proxy.register_finder("user", Arc::new(AdapterBridge::new(adapter.clone())));
+        (proxy, store, adapter)
+    }
+
+    fn fetch_gate_request() -> AuthRequest {
+        AuthRequest::new(HttpMethod::Get, "/users/dashboard".to_string())
+    }
+
+    /// Params sign-in whose credentials DO match the seeded record: the
+    /// replay test uses it to prove that a gated session cannot be
+    /// strategy-authenticated past, remember arm included.
+    fn fetch_gate_sign_in_request(email: &str, password: &str) -> AuthRequest {
+        let mut request = AuthRequest::new(HttpMethod::Post, "/users/sign_in".to_string());
+        request
+            .params
+            .insert("user_email".to_string(), email.to_string());
+        request
+            .params
+            .insert("user_password".to_string(), password.to_string());
+        request.flags.allow_params_authentication = true;
+        request
+    }
+
+    /// Devise `hooks/activatable.rb` fetch arm: a locked record held in the
+    /// session authenticates nothing, the scope session key is deleted (the
+    /// reference's `warden.logout(scope)`), and the record itself stays in
+    /// the adapter (T-261026-ghb-01 / T-261026-ghb-02).
+    #[tokio::test]
+    async fn fetch_gate_locked_session_fetches_none_and_deletes_key() {
+        let record = FetchGateUser::new("locked@example.com", "secret123", true, false);
+        let (mut proxy, store, adapter) = fetch_gate_proxy(record).await;
+
+        let request = fetch_gate_request();
+        assert!(
+            proxy.authenticate("user", &request).await.is_none(),
+            "a locked record must not authenticate the session fetch"
+        );
+        assert!(!proxy.authenticated("user"), "no memo is staged");
+        let session_key = session::keys::scope_session_key("user");
+        assert!(
+            store.get_value(&session_key).await.is_none(),
+            "the gate deletes the scope session key"
+        );
+        assert!(
+            adapter
+                .get(&DeviseKey::from_i64(1))
+                .await
+                .expect("adapter read")
+                .is_some(),
+            "only the session dies, the record stays in the adapter"
+        );
+        assert!(
+            proxy.fetch_gate_failures.contains_key("user"),
+            "the failure is staged for the request"
+        );
+    }
+
+    /// The strict path propagates the classified inactive failure: the
+    /// "locked" stem reaches the caller as `Failure::Locked`, never the
+    /// generic unauthenticated variant.
+    #[tokio::test]
+    async fn fetch_gate_strict_failure_carries_inactive_message() {
+        let record = FetchGateUser::new("locked@example.com", "secret123", true, false);
+        let (mut proxy, _store, _adapter) = fetch_gate_proxy(record).await;
+
+        let request = fetch_gate_request();
+        let failure = proxy
+            .authenticate_strict("user", &request)
+            .await
+            .expect_err("a locked session fails strict authentication");
+        assert!(
+            matches!(failure, Failure::Locked { message } if message == "locked"),
+            "the inactive message classifies the failure: {failure:?}"
+        );
+    }
+
+    /// An active record fetches normally: the session key survives and no
+    /// failure is staged.
+    #[tokio::test]
+    async fn fetch_gate_active_record_fetches_normally() {
+        let record = FetchGateUser::new("active@example.com", "secret123", true, true);
+        let (mut proxy, store, _adapter) = fetch_gate_proxy(record).await;
+
+        let request = fetch_gate_request();
+        let user = proxy
+            .authenticate("user", &request)
+            .await
+            .expect("an active record fetches");
+        assert_eq!(user.to_key(), DeviseKey::from_i64(1));
+        assert!(proxy.authenticated("user"));
+        let session_key = session::keys::scope_session_key("user");
+        assert!(
+            store.get_value(&session_key).await.is_some(),
+            "an active fetch keeps the session key"
+        );
+        assert!(
+            proxy.fetch_gate_failures.is_empty(),
+            "no failure is staged for an active record"
+        );
+    }
+
+    /// The staged failure replays: once the gate rejects the session, a
+    /// second authentication attempt in the same request fails again even
+    /// with credentials that would otherwise authenticate the record (the
+    /// request cannot strategy-authenticate past a locked session).
+    #[tokio::test]
+    async fn fetch_gate_replays_staged_failure_on_second_call() {
+        let record = FetchGateUser::new("locked@example.com", "secret123", true, false);
+        let (mut proxy, _store, _adapter) = fetch_gate_proxy(record).await;
+
+        let request = fetch_gate_request();
+        assert!(
+            proxy.authenticate_strict("user", &request).await.is_err(),
+            "first call rejects"
+        );
+
+        // Matching credentials: without the staged gate the params strategy
+        // would authenticate this very record.
+        let credentials = fetch_gate_sign_in_request("locked@example.com", "secret123");
+        let second = proxy
+            .authenticate_strict("user", &credentials)
+            .await
+            .expect_err("the staged failure replays instead of running strategies");
+        assert!(
+            matches!(second, Failure::Locked { message } if message == "locked"),
+            "the replay carries the classified inactive failure: {second:?}"
+        );
+        assert!(!proxy.authenticated("user"), "no memo is staged either");
+    }
+
+    /// A record without the gate view (Devise's `respond_to?` guard) is
+    /// exempt: it fetches unchanged, even while `active_for_authentication?`
+    /// would report false.
+    #[tokio::test]
+    async fn fetch_gate_exempt_record_without_gate_view() {
+        let record = FetchGateUser::new("exempt@example.com", "secret123", false, false);
+        let (mut proxy, store, _adapter) = fetch_gate_proxy(record).await;
+
+        let request = fetch_gate_request();
+        let user = proxy
+            .authenticate("user", &request)
+            .await
+            .expect("a record without the gate view fetches unchanged");
+        assert_eq!(user.to_key(), DeviseKey::from_i64(1));
+        let session_key = session::keys::scope_session_key("user");
+        assert!(
+            store.get_value(&session_key).await.is_some(),
+            "the session key survives for an exempt record"
+        );
+        assert!(proxy.fetch_gate_failures.is_empty(), "no failure staged");
     }
 }

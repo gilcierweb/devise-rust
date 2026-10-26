@@ -333,24 +333,30 @@ impl Debug for HookRegistry {
 pub fn register_devise_hooks(registry: &mut HookRegistry, mapping: &crate::scope::Mapping) {
     use crate::scope::Module;
 
-    // 1. Activatable - runs on SetUser + Authentication for all scopes
+    // 1. Activatable - runs on SetUser + Authentication + Fetch for all scopes
     registry.add_hook(
-        HookFilter::new().only(vec![Event::SetUser, Event::Authentication]),
+        HookFilter::new().only(vec![Event::SetUser, Event::Authentication, Event::Fetch]),
         Box::new(|ctx| {
             Box::pin(async move {
-                // Devise `hooks/activatable.rb` (after_set_user except: :fetch):
-                // a record that fails `active_for_authentication?` fails the
-                // transition with its `inactive_message` (`unconfirmed` /
-                // `locked` / `inactive`). The gate pair is read through the
-                // object-safe Activatable view, so the hook enforces the very
-                // same composition the typed controllers check - no app-side
-                // wiring required (divergence closed 2026-10-25).
+                // Devise `hooks/activatable.rb` registers a bare
+                // `after_set_user` with no event exclusion: the reference
+                // comment says the gate exists to validate the user activity
+                // on each request, so the hook runs on every `after_set_user`
+                // action, the session fetch included. A record that fails
+                // `active_for_authentication?` fails the transition with its
+                // `inactive_message` (`unconfirmed` / `locked` / `inactive`).
+                // On the fetch path `proxy.rs` deletes the scope session key
+                // and fails the request, which is the reference's
+                // `warden.logout(scope)` followed by `throw :warden`.
+                //
+                // The gate pair is read through the object-safe Activatable
+                // view, so the hook enforces the very same composition the
+                // typed controllers check - no app-side wiring required
+                // (divergence closed 2026-10-25, fetch arm 2026-10-26).
                 if let Some(record) = ctx.record {
                     if let Some(gate) = record.as_activatable() {
                         if !gate.active_for_authentication() {
-                            return Err(Failure::Unauthenticated {
-                                message: gate.inactive_message(),
-                            });
+                            return Err(crate::failure::inactive_failure(gate.inactive_message()));
                         }
                     }
                 }

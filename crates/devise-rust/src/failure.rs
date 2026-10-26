@@ -400,6 +400,45 @@ impl FailureReason {
     }
 }
 
+/// Classify an `inactive_message` stem into the matching [`Failure`].
+///
+/// Devise's activatable hook (`devise/lib/devise/hooks/activatable.rb`)
+/// throws `record.inactive_message`, and the failure app renders the
+/// matching `devise.failure.*` I18n key. This maps that stem onto the
+/// port's classified failure variant so a renderer picks the locked or
+/// unconfirmed flash key instead of the generic unauthenticated one.
+///
+/// Deviation from the reference: an application-defined custom stem falls
+/// back to [`Failure::Unauthenticated`] because the port's failure
+/// vocabulary is a closed enum, so a custom `inactive_message` cannot mint
+/// a new variant at runtime the way the I18n key can.
+#[must_use]
+pub fn inactive_failure(message: &'static str) -> Failure {
+    match message {
+        "locked" => Failure::Locked { message },
+        "unconfirmed" => Failure::Unconfirmed { message },
+        _ => Failure::Unauthenticated { message },
+    }
+}
+
+/// Classify an `inactive_message` stem into the matching [`FailureReason`].
+///
+/// The renderer-side twin of [`inactive_failure`]: the actix extractor
+/// builds its failure-app reason from the stem staged by the gate, which
+/// is how the locked or unconfirmed flash key reaches the response
+/// (Devise throws `record.inactive_message`, `activatable.rb`).
+///
+/// Same closed-enum deviation as [`inactive_failure`]: an app-defined
+/// custom stem reports the generic unauthenticated reason.
+#[must_use]
+pub fn failure_reason_from_message(message: &str) -> FailureReason {
+    match message {
+        "locked" => FailureReason::Locked,
+        "unconfirmed" => FailureReason::Unconfirmed,
+        _ => FailureReason::Unauthenticated,
+    }
+}
+
 /// Check the request format against configured navigational formats.
 ///
 /// Delegates to [`AuthRequest::is_navigational_format`](crate::request::AuthRequest::is_navigational_format).
@@ -611,6 +650,43 @@ mod tests {
             action: "new".to_string(),
         };
         assert!(recall.is_recall());
+    }
+
+    /// Devise `hooks/activatable.rb` classification: the inactive message
+    /// stem must reach the renderer as the classified failure, so the
+    /// locked and unconfirmed flash keys survive the round trip.
+    #[test]
+    fn test_inactive_message_classifies_to_the_locked_and_unconfirmed_failures() {
+        assert!(matches!(
+            inactive_failure("locked"),
+            Failure::Locked { message } if message == "locked"
+        ));
+        assert!(matches!(
+            inactive_failure("unconfirmed"),
+            Failure::Unconfirmed { message } if message == "unconfirmed"
+        ));
+        // An unknown (app-defined) stem fails closed to the generic key.
+        assert!(matches!(
+            inactive_failure("deactivated"),
+            Failure::Unauthenticated { message } if message == "deactivated"
+        ));
+
+        assert_eq!(failure_reason_from_message("locked"), FailureReason::Locked);
+        assert_eq!(
+            failure_reason_from_message("unconfirmed"),
+            FailureReason::Unconfirmed
+        );
+        assert_eq!(
+            failure_reason_from_message("deactivated"),
+            FailureReason::Unauthenticated
+        );
+        // The reason round-trips into the same flash key the reference
+        // renders through `devise.failure.*`.
+        assert_eq!(failure_reason_from_message("locked").flash_key(), "locked");
+        assert_eq!(
+            failure_reason_from_message("unconfirmed").flash_key(),
+            "unconfirmed"
+        );
     }
 
     #[test]
