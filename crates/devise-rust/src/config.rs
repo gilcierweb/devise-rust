@@ -203,6 +203,44 @@ pub struct DeviseConfig {
     pub navigational_formats: Vec<String>,
     /// Responder class (default: "`Devise::Controllers::Responder`")
     pub responder: String,
+    /// HTTP status for validation-failure responses, the port's mirror of
+    /// Devise's `config.responder.error_status` (`devise/lib/devise.rb:224`).
+    ///
+    /// Default 200 is Devise's own responder default, `:ok`
+    /// (`devise/lib/devise/controllers/responder.rb:9`), while every
+    /// generated Devise app overrides it to 422
+    /// (`lib/generators/templates/devise.rb:308`). The framework controllers
+    /// apply this status to the six actions that render errors through
+    /// `respond_with` in Devise (registrations create and update, passwords
+    /// create and update, confirmations create, unlocks create), in BOTH the
+    /// HTML re-render and the JSON branch, because Devise's responder applies
+    /// `error_status` to every format.
+    ///
+    /// Devise itself carves the show actions out: `confirmations#show` and
+    /// `unlocks#show` hardcode 422 with a TODO to adopt `error_status` only
+    /// when the Devise default changes
+    /// (`confirmations_controller.rb:30-31`, `unlocks_controller.rb:32-33`),
+    /// so the port mirrors that hardcode. Set 422 to restore the
+    /// generated-Devise posture.
+    ///
+    /// Valid range is 100..=599 (both frameworks' `StatusCode::from_u16`
+    /// accept it); [`DeviseConfig::validate`] rejects anything else at boot.
+    pub error_status: u16,
+    /// HTTP status for responder redirects, the port's mirror of Devise's
+    /// `config.responder.redirect_status` (`devise/lib/devise.rb:225`).
+    ///
+    /// Devise's responder internal default is `:found` 302
+    /// (`devise/lib/devise/controllers/responder.rb:10`) while every
+    /// generated Devise app configures `:see_other` 303
+    /// (`lib/generators/templates/devise.rb:309`); the port pins the
+    /// generated-app value 303.
+    ///
+    /// Config-surface parity in this version: the framework redirect renders
+    /// (sign-out and flash redirects) answer 302 and do NOT read this option
+    /// yet, so the field exists for Devise-config parity and as the
+    /// documented home for a later wiring. See
+    /// [`DeviseConfig::validate`] for the 100..=599 gate.
+    pub redirect_status: u16,
     /// Reload routes (default: true)
     pub reload_routes: bool,
     /// Clean up CSRF token on authentication (default: true)
@@ -274,6 +312,8 @@ impl Default for DeviseConfig {
                 "turbo_stream".to_string(),
             ],
             responder: "Devise::Controllers::Responder".to_string(),
+            error_status: 200,
+            redirect_status: 303,
             reload_routes: true,
             clean_up_csrf_token_on_authentication: true,
             omniauth_path_prefix: None,
@@ -313,12 +353,33 @@ impl DeviseConfig {
     ///
     /// # Errors
     ///
-    /// [`DeviseError::Config`] when `secret_key` is empty or whitespace.
+    /// [`DeviseError::Config`] when `secret_key` is empty or whitespace, or
+    /// when [`DeviseConfig::error_status`] or
+    /// [`DeviseConfig::redirect_status`] falls outside the valid HTTP status
+    /// range 100..=599.
     pub fn validate(&self) -> Result<(), DeviseError> {
         if self.secret_key.trim().is_empty() {
             return Err(DeviseError::Config(
                 "Devise.secret_key must be set before using devise-rust: it keys the HMAC digests of all token columns (Devise's raise_no_secret_key)".to_string(),
             ));
+        }
+        // Same fail-loud boot posture as `secret_key`: an out-of-range status
+        // would otherwise surface as a panic or a silent fallback on every
+        // validation-failure render (a misconfiguration that fails once at
+        // boot instead of on every request). Devise raises on unknown status
+        // symbols at render time (`Rack::Utils.status_code`), so the port
+        // moves the failure to boot where `raise_no_secret_key` already
+        // lives. 100..=599 is the valid RFC 9110 range that both frameworks'
+        // `StatusCode::from_u16` accept.
+        for (field, status) in [
+            ("error_status", self.error_status),
+            ("redirect_status", self.redirect_status),
+        ] {
+            if !(100..=599).contains(&status) {
+                return Err(DeviseError::Config(format!(
+                    "Devise.{field} must be a valid HTTP status code in 100..=599, got {status}"
+                )));
+            }
         }
         Ok(())
     }
@@ -378,6 +439,8 @@ pub struct DeviseConfigOverride {
     pub scoped_views: Option<bool>,
     pub navigational_formats: Option<Vec<String>>,
     pub responder: Option<String>,
+    pub error_status: Option<u16>,
+    pub redirect_status: Option<u16>,
     pub reload_routes: Option<bool>,
     pub clean_up_csrf_token_on_authentication: Option<bool>,
     pub omniauth_path_prefix: Option<String>,
@@ -499,6 +562,8 @@ impl DeviseConfigOverride {
         // Copy assignment (config: T where T: Copy, override: Option<T>)
         apply_override!(resolved, self, Copy:
             stretches,
+            error_status,
+            redirect_status,
             http_authenticatable,
             http_authenticatable_on_xhr,
             params_authenticatable,
@@ -644,5 +709,71 @@ mod tests {
         assert_eq!(resolved.pepper, Some("my-pepper".to_string()));
         // Other values should come from global
         assert_eq!(resolved.remember_for, TimeDelta::weeks(2));
+    }
+
+    /// The two responder status options carry the pinned defaults of the
+    /// 261026-ghe parity item: `error_status` 200 is Devise `:ok`
+    /// (`devise/lib/devise/controllers/responder.rb:9`), and
+    /// `redirect_status` 303 is the generated-app `:see_other`
+    /// (`lib/generators/templates/devise.rb:309`).
+    #[test]
+    fn responder_status_defaults() {
+        let config = DeviseConfig::default();
+        assert_eq!(config.error_status, 200);
+        assert_eq!(config.redirect_status, 303);
+    }
+
+    /// A per-scope override wins over the global exactly like `stretches`;
+    /// an override that leaves the fields `None` keeps the global defaults.
+    #[test]
+    fn responder_status_override_cascade() {
+        let global = DeviseConfig::default();
+
+        let overridden = DeviseConfigOverride {
+            error_status: Some(422),
+            redirect_status: Some(307),
+            ..DeviseConfigOverride::default()
+        };
+        let resolved = overridden.resolve(&global);
+        assert_eq!(resolved.error_status, 422);
+        assert_eq!(resolved.redirect_status, 307);
+
+        let untouched = DeviseConfigOverride {
+            stretches: Some(10),
+            ..DeviseConfigOverride::default()
+        };
+        let resolved = untouched.resolve(&global);
+        assert_eq!(resolved.error_status, 200);
+        assert_eq!(resolved.redirect_status, 303);
+    }
+
+    /// An out-of-range status would panic or silently degrade on every
+    /// validation-failure render, so `validate()` fails loud at boot with a
+    /// [`DeviseError::Config`] naming the offending field (the same posture
+    /// as the `secret_key` check).
+    #[test]
+    fn validate_rejects_out_of_range_responder_status() {
+        let configured = |error_status: u16, redirect_status: u16| DeviseConfig {
+            secret_key: "test-secret-key".to_string(),
+            error_status,
+            redirect_status,
+            ..DeviseConfig::default()
+        };
+
+        for (error_status, redirect_status) in [(99, 303), (600, 303), (200, 42)] {
+            let config = configured(error_status, redirect_status);
+            let error = config
+                .validate()
+                .expect_err("an out-of-range status must not validate");
+            assert!(
+                matches!(error, DeviseError::Config(ref message)
+                    if message.contains("error_status") || message.contains("redirect_status")),
+                "unexpected error: {error:?}"
+            );
+        }
+
+        // The pinned defaults and the generated-app posture both validate.
+        assert!(configured(200, 303).validate().is_ok());
+        assert!(configured(422, 307).validate().is_ok());
     }
 }
