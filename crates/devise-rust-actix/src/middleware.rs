@@ -66,6 +66,21 @@ pub struct DeviseMiddlewareConfig {
     pub hooks: Arc<HookRegistry>,
 }
 
+/// A scope the activatable gate rejected this request.
+///
+/// Devise's `hooks/activatable.rb` runs on every `after_set_user` action,
+/// the fetch included: a record that fails `active_for_authentication?` is
+/// logged out and the request fails with its `inactive_message`. The
+/// middleware stages the rejection here (it owns no hook registry), and the
+/// response phase deletes the scope's session key.
+#[derive(Clone, Debug)]
+pub struct InactiveGate {
+    /// Scope whose record the gate rejected.
+    pub scope: String,
+    /// The record's `inactive_message` stem (`locked` / `unconfirmed`).
+    pub message: &'static str,
+}
+
 /// Per-request resolved authentication state staged in request extensions.
 ///
 /// The middleware fills this **before** the inner service is polled:
@@ -90,6 +105,11 @@ pub struct ResolvedAuth {
     /// Devise timeout failure for it instead of the plain unauthenticated
     /// one.
     pub timed_out: Option<String>,
+    /// Scope the activatable fetch gate rejected this request (Devise
+    /// `:locked` / `:unconfirmed`), staged by the resolution pass;
+    /// extractors render the matching Devise failure key for it instead of
+    /// the plain unauthenticated one.
+    pub inactive: Option<InactiveGate>,
 }
 
 /// Handle staged in request extensions: `Arc<Mutex<_>>` so the middleware
@@ -259,6 +279,7 @@ where
             payloads: payloads.clone(),
             config: Some(config.config.clone()),
             timed_out,
+            inactive: None,
         }));
         req.extensions_mut().insert(auth_request);
         req.extensions_mut().insert(handle.clone());
@@ -270,37 +291,75 @@ where
         Box::pin(async move {
             // Record resolution: adapter `.await`s happen here with no
             // `Session` handle alive (owned-extract, D-04).
-            let users = resolve_users(&config, &payloads).await;
+            let (users, inactive) = resolve_users(&config, &payloads).await;
             // Remember-me arm (CONCERNS #7 / RMB parity): when the session
             // holds no user for the scope, the strategy chain's rememberable
             // arm runs over the signature-verified cookie, so a
             // remember-only request authenticates in actix like axum does.
             // Stale cookies are tombstoned on the response below.
-            let (users, clears) = resolve_remember_users(
+            let (users, clears, remember_inactive) = resolve_remember_users(
                 &config,
                 scope.as_deref(),
                 users,
                 &auth_request_for_resolution,
             )
             .await;
+            let mut inactive = inactive;
+            inactive.extend(remember_inactive);
             if let Ok(mut guard) = remember_clears.lock() {
                 *guard = clears;
             }
             if let Ok(mut guard) = handle.lock() {
                 guard.users = users;
+                // The request scope's gate wins so the extractor reads it.
+                guard.inactive = inactive
+                    .iter()
+                    .find(|gate| Some(gate.scope.as_str()) == scope.as_deref())
+                    .or_else(|| inactive.first())
+                    .cloned();
             }
             let response = fut.await;
             match response {
-                Ok(service_response) => Ok(drain_remember_clears(
-                    service_response,
-                    &remember_clears,
-                    &config.config,
-                    &devise_rust::time::SystemClock,
+                // Devise `warden.logout(scope)` in `hooks/activatable.rb`:
+                // the rejected record's session key dies on the request that
+                // rejected it, so an unlocked account cannot resurrect it
+                // (T-261026-ghb-02). `Session::remove` is synchronous over
+                // the Rc-backed handle, so no await crosses it.
+                Ok(service_response) => Ok(drain_inactive_session_keys(
+                    drain_remember_clears(
+                        service_response,
+                        &remember_clears,
+                        &config.config,
+                        &devise_rust::time::SystemClock,
+                    ),
+                    &inactive,
                 )),
                 Err(err) => Err(err),
             }
         })
     }
+}
+
+/// Delete the scope session key of every gated scope (Devise
+/// `warden.logout(scope)`, `hooks/activatable.rb`).
+///
+/// actix-session's [`SessionExt::get_session`] on a `ServiceResponse`
+/// delegates to the request's Rc-backed handle, and [`Session::remove`] is
+/// synchronous, so the response-phase deletion never crosses an `await`.
+fn drain_inactive_session_keys<B>(
+    response: actix_web::dev::ServiceResponse<B>,
+    gates: &[InactiveGate],
+) -> actix_web::dev::ServiceResponse<B> {
+    if gates.is_empty() {
+        return response;
+    }
+    // The request-side handle reaches the same Rc-backed session the
+    // `ServiceResponse` impl would (and is generic over the body type).
+    let session = response.request().get_session();
+    for gate in gates {
+        session.remove(&keys::scope_session_key(&gate.scope));
+    }
+    response
 }
 
 /// Staged remember-cookie tombstones for the response phase (the strategy
@@ -348,6 +407,13 @@ fn drain_remember_clears<B>(
 /// Signature verification happens here (the staged snapshot carries the
 /// raw signed cookie); the core strategy sees only the plaintext triple,
 /// exactly like the axum layer's inbound path.
+///
+/// The activatable gate closes the arm (T-261026-ghb-01): a remember success
+/// bypasses `set_user`, so the hook registry never sees it. An inactive
+/// record is therefore NOT inserted into `users` and is returned as a
+/// staged [`InactiveGate`] for the request scope instead. There is no
+/// session key to delete here, and the remember cookie itself is left alone,
+/// matching Devise's failure app which does not clear it.
 async fn resolve_remember_users(
     config: &DeviseMiddlewareConfig,
     scope: Option<&str>,
@@ -356,29 +422,31 @@ async fn resolve_remember_users(
 ) -> (
     HashMap<String, Arc<dyn AnyDeviseModel>>,
     Vec<(String, String)>,
+    Vec<InactiveGate>,
 ) {
     let mut clears: Vec<(String, String)> = Vec::new();
+    let mut inactive: Vec<InactiveGate> = Vec::new();
     let Ok(jar_key) = crate::remember::derive_remember_key(&config.config) else {
-        return (users, clears);
+        return (users, clears, inactive);
     };
     let Some(scope) = scope else {
-        return (users, clears);
+        return (users, clears, inactive);
     };
     if users.contains_key(scope) {
-        return (users, clears);
+        return (users, clears, inactive);
     }
     let Some(finder) = config.finders.get(scope) else {
-        return (users, clears);
+        return (users, clears, inactive);
     };
     let Some(mapping) = config.scope_registry.get(scope) else {
-        return (users, clears);
+        return (users, clears, inactive);
     };
     if !mapping.has_module(devise_rust::scope::Module::Rememberable) {
-        return (users, clears);
+        return (users, clears, inactive);
     }
     let cookie_name = devise_rust::rememberable::remember_cookie_key(scope, &config.config);
     let Some(staged) = request.cookies.get(&cookie_name).cloned() else {
-        return (users, clears);
+        return (users, clears, inactive);
     };
     let staged_scope = scope.to_string();
     // Signature-verified plaintext; a failed verify keeps the raw value,
@@ -398,6 +466,19 @@ async fn resolve_remember_users(
                 .await
             {
                 Ok(devise_rust::failure::AuthOutcome::Success(record)) => {
+                    // Activatable gate on the remember arm: the record joined
+                    // the request without `set_user`, so the hooks never ran
+                    // (T-261026-ghb-01). No session key exists to delete on
+                    // this arm; the cookie is left for Devise's failure app.
+                    if let Some(gate) = record.as_activatable() {
+                        if !gate.active_for_authentication() {
+                            inactive.push(InactiveGate {
+                                scope: staged_scope.clone(),
+                                message: gate.inactive_message(),
+                            });
+                            break;
+                        }
+                    }
                     users.insert(scope.to_string(), Arc::from(record));
                 }
                 Ok(devise_rust::failure::AuthOutcome::ClearCookieAndPass { cookie_key }) => {
@@ -408,7 +489,7 @@ async fn resolve_remember_users(
             break;
         }
     }
-    (users, clears)
+    (users, clears, inactive)
 }
 
 /// Resolve session users for every scope that has a payload and a
@@ -416,11 +497,20 @@ async fn resolve_remember_users(
 ///
 /// Salt mismatches fail closed to "no user"; the session-key deletion side
 /// effect remains the bridge's job on its next synchronous fetch.
+///
+/// Every resolved record is then run through the activatable gate
+/// (`hooks/activatable.rb`, which validates the user activity on each
+/// request): a record failing `active_for_authentication?` is NOT inserted
+/// into `users`, and is returned as a staged [`InactiveGate`] instead. Core
+/// owns the rule through the object-safe `Activatable` view; this pass only
+/// performs the session I/O and the staging, mirroring the timeout pass's
+/// split. The response phase deletes the gated scope's session key.
 async fn resolve_users(
     config: &DeviseMiddlewareConfig,
     payloads: &HashMap<String, Value>,
-) -> HashMap<String, Arc<dyn AnyDeviseModel>> {
+) -> (HashMap<String, Arc<dyn AnyDeviseModel>>, Vec<InactiveGate>) {
     let mut users = HashMap::new();
+    let mut inactive: Vec<InactiveGate> = Vec::new();
     for (scope, value) in payloads {
         let Some(finder) = config.finders.get(scope) else {
             continue;
@@ -448,9 +538,19 @@ async fn resolve_users(
         if !devise_rust::crypto::secure_compare(&current_salt, stored_salt) {
             continue;
         }
+        // Activatable gate on the fetch (T-261026-ghb-01).
+        if let Some(gate) = record.as_activatable() {
+            if !gate.active_for_authentication() {
+                inactive.push(InactiveGate {
+                    scope: scope.clone(),
+                    message: gate.inactive_message(),
+                });
+                continue;
+            }
+        }
         users.insert(scope.clone(), Arc::from(record));
     }
-    users
+    (users, inactive)
 }
 
 /// Build an owned [`AuthRequest`] snapshot of an actix request.

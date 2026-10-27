@@ -11,11 +11,16 @@
 
 mod common;
 
+use actix_web::HttpResponse;
+use actix_web::dev::ServiceResponse;
+use actix_web::http::header;
 use actix_web::test;
 use common::{FixtureUser, SystemClock, TestState};
-use devise_rust::adapter::{Conditions, OrmAdapter, Value};
+use devise_rust::adapter::{Conditions, DeviseKey, OrmAdapter, Value};
 use devise_rust::failure::AnyDeviseModel;
+use devise_rust::time::Clock as _;
 use devise_rust_actix::test_helpers::{cookie_header, set_cookie_pairs};
+use std::collections::HashMap;
 
 /// Browser-style cookie jar: newest value per name, renewal-aware.
 struct Jar(Vec<String>);
@@ -1038,5 +1043,225 @@ async fn flow_sign_in_lock_without_paranoid_reports_locked() {
             .as_deref(),
         Some("locked"),
         "threshold lock without paranoid reports locked"
+    );
+}
+
+// ============================================================================
+// Activatable session-fetch gate (Devise `hooks/activatable.rb`): a locked
+// record held in the session authenticates nothing on the next request, the
+// scope session key dies on the request that rejected it, and neither an
+// unlock nor a live remember cookie resurrects the record
+// (T-261026-ghb-01/02).
+// ============================================================================
+
+/// Write the lock state of the seeded account straight through the test
+/// adapter (the fixture manipulation the lockable flow tests use).
+async fn flow_fetch_gate_write_lock(state: &TestState, key: &DeviseKey, locked: bool) {
+    let mut fields = HashMap::new();
+    if locked {
+        fields.insert(
+            "locked_at".to_string(),
+            Value::String(common::now_rfc3339()),
+        );
+        fields.insert("failed_attempts".to_string(), Value::Integer(20));
+    } else {
+        fields.insert("locked_at".to_string(), Value::Null);
+        fields.insert("failed_attempts".to_string(), Value::Integer(0));
+    }
+    state
+        .adapter
+        .update_columns(key, &fields)
+        .await
+        .expect("lock write");
+}
+
+/// Non-strict probe: whether the middleware resolved a record for the request.
+async fn flow_fetch_gate_soft(auth: devise_rust_actix::Auth<FixtureUser>) -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({ "authenticated": auth.is_authenticated() }))
+}
+
+/// GET the guarded route (the scope's `RequireAuth` probe) with the cookies
+/// of `cookie` replayed.
+async fn flow_fetch_gate_guarded(
+    app: &impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = ServiceResponse,
+        Error = actix_web::Error,
+    >,
+    cookie: &str,
+) -> ServiceResponse {
+    test::call_service(
+        app,
+        test::TestRequest::get()
+            .uri("/users_dashboard")
+            .insert_header((header::ACCEPT, "text/html"))
+            .insert_header((header::COOKIE, cookie))
+            .to_request(),
+    )
+    .await
+}
+
+/// Devise `hooks/activatable.rb` fetch arm: sign in, lock the account, then
+/// hit the guarded route with the session cookie replayed. The request is
+/// rejected (302 to the sign-in path, never 200), the flash carries the
+/// `locked` key, and the non-strict surface resolves anonymous. Unlocking
+/// the account afterwards still rejects, because the middleware deleted the
+/// scope session key on the request that rejected it.
+#[actix_web::test]
+async fn flow_fetch_gate_locked_session_rejects_and_survives_unlock() {
+    let soft: actix_web::Route = actix_web::web::get().to(flow_fetch_gate_soft);
+    let (state, app) = common::build_app_with(
+        common::test_state(common::default_mapping()),
+        vec![("/users_soft", soft)],
+    )
+    .await;
+    let user = seed_user(&state, "flowgate@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    jar.merge(&form_sign_in(&app, "flowgate@example.com", "secret123").await);
+    let live = flow_fetch_gate_guarded(&app, &jar.header()).await;
+    assert_eq!(
+        live.status(),
+        200,
+        "a live signed-in session passes the guarded route"
+    );
+    assert!(
+        !test::read_body_json::<serde_json::Value, _>(live).await["email"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "the guarded handler rendered the signed-in email"
+    );
+
+    // Lock the account: the session payload stays valid, but the record no
+    // longer passes `active_for_authentication?`.
+    flow_fetch_gate_write_lock(&state, &user.to_key(), true).await;
+
+    let rejected = flow_fetch_gate_guarded(&app, &jar.header()).await;
+    assert_eq!(
+        rejected.status(),
+        302,
+        "the locked session must not render the guarded route"
+    );
+    assert_eq!(
+        rejected
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "/users/sign_in",
+        "the rejection redirects to the scope sign-in path"
+    );
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&rejected))
+            .await
+            .as_deref(),
+        Some("locked"),
+        "the inactive message rides the flash"
+    );
+    // The non-strict surface stays anonymous on the same locked session.
+    let soft_resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/users_soft")
+            .insert_header((header::COOKIE, jar.header()))
+            .to_request(),
+    )
+    .await;
+    assert!(
+        soft_resp.status().is_success(),
+        "the soft probe never fails"
+    );
+    let soft_body: serde_json::Value = test::read_body_json(soft_resp).await;
+    assert_eq!(
+        soft_body["authenticated"],
+        serde_json::json!(false),
+        "the locked session resolves anonymous on the soft extractor"
+    );
+
+    // The browser keeps whatever cookies the rejected response carried
+    // (actix sessions are cookie-carried, so the deleted key ships here).
+    jar.merge(&rejected);
+
+    // Unlock the account: the dead session must stay dead (T-261026-ghb-02).
+    flow_fetch_gate_write_lock(&state, &user.to_key(), false).await;
+    let after_unlock = flow_fetch_gate_guarded(&app, &jar.header()).await;
+    assert_eq!(
+        after_unlock.status(),
+        302,
+        "the deleted session key must not resurrect after the unlock"
+    );
+    assert_eq!(
+        after_unlock
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "/users/sign_in",
+        "the unlocked replay still redirects to the sign-in path"
+    );
+    let after_body = actix_web::test::read_body(after_unlock).await;
+    assert!(
+        after_body.is_empty(),
+        "the guarded handler never ran after the unlock: {:?}",
+        String::from_utf8_lossy(&after_body)
+    );
+}
+
+/// The remember arm is gated too: a locked user whose SESSION is gone but
+/// whose remember cookie is still live resolves anonymous instead of
+/// resurrecting through the strategy chain (T-261026-ghb-01).
+#[actix_web::test]
+async fn flow_fetch_gate_remember_arm_rejects_locked_record() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    // The remember strategy's strict `generated_at > remember_created_at`
+    // window needs a stamped instant, so the minted cookie is genuinely
+    // ALIVE (the same fixture shape the two-cookie-jar regression uses).
+    let mut seeded =
+        FixtureUser::new_with_password("flowgate2@example.com", "secret123", &state.config)
+            .confirmed_now(&SystemClock);
+    seeded.remember_created_at = Some(SystemClock.now() - chrono::Duration::seconds(3600));
+    let user = state.adapter.create(seeded).await.expect("seed");
+
+    // Sign in with `remember_me` checked: the response mints BOTH the
+    // session cookie and a live remember cookie.
+    let mut jar = Jar::new();
+    let sign_in = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/users/sign_in")
+            .insert_header(("content-type", "application/x-www-form-urlencoded"))
+            .set_payload("email=flowgate2%40example.com&password=secret123&remember_me=1")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(sign_in.status(), 302, "the remember sign-in succeeds");
+    jar.merge(&sign_in);
+    let remember_pair = jar
+        .0
+        .iter()
+        .find(|pair| pair.starts_with("remember_user_token="))
+        .cloned()
+        .expect("the sign-in minted a live remember cookie");
+
+    // Lock the account: the remember cookie stays valid (Devise's failure
+    // app does not clear it), but the record no longer passes
+    // `active_for_authentication?`.
+    flow_fetch_gate_write_lock(&state, &user.to_key(), true).await;
+
+    // Replay ONLY the remember cookie: no session payload rides the request,
+    // so the remember arm is the only path to identity.
+    let rejected = flow_fetch_gate_guarded(&app, &remember_pair).await;
+    assert_eq!(
+        rejected.status(),
+        302,
+        "the locked remember arm must not render the guarded route"
+    );
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&rejected))
+            .await
+            .as_deref(),
+        Some("locked"),
+        "the inactive message rides the remember-arm rejection"
     );
 }

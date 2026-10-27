@@ -81,16 +81,22 @@ fn staged_request(req: &HttpRequest) -> AuthRequest {
 
 /// Build the unauthenticated failure response: core
 /// [`build_failure`], rendered through the 08-01 renderer.
+///
+/// `reason` is the Devise failure key the request earns: the timeout pass
+/// stages `FailureReason::Timeout`, the activatable gate the locked or
+/// unconfirmed reason, and an anonymous request the plain
+/// `FailureReason::Unauthenticated`.
 fn unauthenticated_response(
     request: &AuthRequest,
     mapping: Option<&Mapping>,
     config: Option<&DeviseConfig>,
+    reason: FailureReason,
 ) -> HttpResponse {
     let (Some(mapping), Some(config)) = (mapping, config) else {
         // No mapping resolved: fail closed with a bare 401.
         return HttpResponse::Unauthorized().finish();
     };
-    let failure = build_failure(request, mapping, config, FailureReason::Unauthenticated);
+    let failure = build_failure(request, mapping, config, reason);
     ActixFailureRenderer::new().render(&failure, mapping)
 }
 
@@ -212,6 +218,14 @@ impl<M: AnyDeviseModel + Send + Sync + 'static> FromRequest for RequireAuth<M> {
             .as_ref()
             .and_then(|r| r.timed_out.clone())
             .filter(|timed| timed == &scope);
+        // Devise `devise.failure.locked` / `unconfirmed`: a session record
+        // the activatable fetch gate rejected (`hooks/activatable.rb`)
+        // fails closed with its `inactive_message` key, not the plain
+        // unauthenticated one.
+        let inactive = resolved
+            .as_ref()
+            .and_then(|r| r.inactive.clone())
+            .filter(|gate| gate.scope == scope);
         // Devise `store_location!`: GET navigational non-XHR requests are
         // remembered in the session so post-sign-in can return here
         // (T-08-08: same-host-only parse; POST/absolute/relative-foreign
@@ -249,7 +263,9 @@ impl<M: AnyDeviseModel + Send + Sync + 'static> FromRequest for RequireAuth<M> {
         // flash is session state, not a renderer cookie) BEFORE the async
         // block — the `Session` handle never crosses an `await` (D-04).
         if let (Some(mapping), Some(config)) = (&mapping, &config) {
-            let reason = if timed_out.is_some() {
+            let reason = if let Some(gate) = &inactive {
+                devise_rust::failure::failure_reason_from_message(gate.message)
+            } else if timed_out.is_some() {
                 FailureReason::Timeout
             } else {
                 FailureReason::Unauthenticated
@@ -262,10 +278,25 @@ impl<M: AnyDeviseModel + Send + Sync + 'static> FromRequest for RequireAuth<M> {
             }
         }
         Box::pin(async move {
-            let response = if timed_out.is_some() {
+            let response = if inactive.is_some() {
+                // The inactive gate renders the standard unauthenticated
+                // response shape (the plain sign-in redirect), not the
+                // timeout variant that returns to the attempted path.
+                let reason = inactive
+                    .as_ref()
+                    .map_or(FailureReason::Unauthenticated, |gate| {
+                        devise_rust::failure::failure_reason_from_message(gate.message)
+                    });
+                build_unauthenticated_send_safe(&request, mapping, config, reason)
+            } else if timed_out.is_some() {
                 build_timeout_send_safe(&request, mapping, config)
             } else {
-                build_unauthenticated_send_safe(&request, mapping, config)
+                build_unauthenticated_send_safe(
+                    &request,
+                    mapping,
+                    config,
+                    FailureReason::Unauthenticated,
+                )
             };
             Err(error::InternalError::from_response("", response).into())
         })
@@ -292,14 +323,18 @@ fn build_timeout_send_safe(
 /// Construct the unauthenticated failure response inside the extractor
 /// future — inputs are all `Send`, the `!Send` `HttpResponse` never lives
 /// in future state across await points.
+///
+/// `reason` selects the Devise failure key (unauthenticated, locked,
+/// unconfirmed); the response shape stays the standard sign-in redirect.
 fn build_unauthenticated_send_safe(
     request: &AuthRequest,
     mapping: Option<Mapping>,
     config: Option<Arc<DeviseConfig>>,
+    reason: FailureReason,
 ) -> HttpResponse {
     match (mapping, config) {
         (Some(mapping), Some(config)) => {
-            let failure = build_failure(request, &mapping, &config, FailureReason::Unauthenticated);
+            let failure = build_failure(request, &mapping, &config, reason);
             ActixFailureRenderer::new().render(&failure, &mapping)
         }
         _ => HttpResponse::Unauthorized().finish(),
@@ -405,6 +440,7 @@ where
         &request,
         resolved.as_ref().and_then(|r| r.mapping.as_ref()),
         resolved.as_ref().and_then(|r| r.config.as_deref()),
+        FailureReason::Unauthenticated,
     ))
 }
 
@@ -496,6 +532,7 @@ pub fn authenticate_group(
         &request,
         resolved.as_ref().and_then(|r| r.mapping.as_ref()),
         resolved.as_ref().and_then(|r| r.config.as_deref()),
+        FailureReason::Unauthenticated,
     ))
 }
 
