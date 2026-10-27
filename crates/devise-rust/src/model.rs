@@ -123,6 +123,35 @@ fn value_blank(value: Option<&str>) -> bool {
     value_present(value).is_none()
 }
 
+/// `destroy_with_password` result: the Devise outcome split into "the record
+/// is gone" and "the record survives with the failure surface attached".
+///
+/// Devise (`database_authenticatable.rb:132-142`) returns a bare `bool`
+/// while the record's shared `errors` object carries the failure: a wrong
+/// `current_password` adds `:current_password :invalid` and a blank one adds
+/// `:current_password :blank`. A `bool` return discards that distinction, so
+/// callers cannot render Devise's copy ("is invalid" versus "can't be
+/// blank"). This enum pairs the two halves Devise keeps in one place; the
+/// port hands validation maps around explicitly, the same convention
+/// [`update_with_password`](DatabaseAuthenticatable::update_with_password)
+/// already ships.
+///
+/// The refusal map carries the `current_password` symbolic key ONLY. A model
+/// that wants its own `valid?` errors rendered alongside (Devise calls
+/// `valid?` on the refusal branch, populating the shared object) merges them
+/// into this map at the call site.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DestroyOutcome {
+    /// The password checked out and the adapter `delete` ran: Devise's
+    /// `valid_password?(current_password) && destroy` true branch.
+    Destroyed,
+    /// The password did NOT check out: the record is untouched (no adapter
+    /// delete runs) and the errors carry the `current_password` symbolic key,
+    /// `:blank` for a blank or whitespace-only submission and `:invalid`
+    /// otherwise.
+    Refused(ValidationErrors),
+}
+
 /// The adapter-value half of the same blank predicate: Ruby's `blank?` is
 /// `false` for every non-nil, non-empty (after trimming) value, so `0`,
 /// `false`, and typed JSON scalars stay present while a whitespace-only
@@ -345,23 +374,53 @@ pub trait DatabaseAuthenticatable: Authenticatable {
     }
 
     /// `destroy_with_password(current_password)` (DBAU-05): destroys the
-    /// record only when the supplied password is valid; returns whether the
-    /// record was destroyed (Devise: `valid_password? && destroy`).
+    /// record only when the supplied password is valid, and reports WHY it
+    /// refused when it did not.
+    ///
+    /// Devise (`database_authenticatable.rb:132-142`) refuses a wrong
+    /// `current_password` by adding `:current_password :invalid` to the
+    /// record's errors and a blank one by adding `:current_password :blank`,
+    /// then calls `valid?` so the shared `errors` object also carries the
+    /// model's other validation messages. The port keeps the same refusal
+    /// key split (the two keys carry distinct I18n copy) and pairs it with
+    /// the destroyed/refused outcome, because a bare `bool` cannot tell the
+    /// caller which failure copy to render.
+    ///
+    /// The refusal key uses the shared trim-aware blank predicate
+    /// ([`value_blank`]): Ruby's `current_password.blank?` is `true` for
+    /// `nil`, `""`, and `"   "` alike, so a whitespace-only submission is
+    /// `:blank`, never a bcrypt comparison.
+    ///
+    /// The refusal branch returns BEFORE any adapter call, so no code path
+    /// deletes the record on a wrong or blank password.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::adapter::OrmError`] when the adapter `delete` fails
+    /// on the valid-password branch (Devise's destroy raising).
     async fn destroy_with_password<A>(
         &self,
         current_password: &str,
         adapter: &A,
         config: &DeviseConfig,
-    ) -> Result<bool, crate::adapter::OrmError>
+    ) -> Result<DestroyOutcome, crate::adapter::OrmError>
     where
         Self: Sized,
         A: OrmAdapter<Self> + Send + Sync,
     {
-        if !self.valid_password(current_password, config) {
-            return Ok(false);
+        if self.valid_password(current_password, config) {
+            adapter.delete(&self.to_key()).await?;
+            return Ok(DestroyOutcome::Destroyed);
         }
-        adapter.delete(&self.to_key()).await?;
-        Ok(true)
+        let mut errors = ValidationErrors::new();
+        // Devise: `errors.add(:current_password, current_password.blank? ? :blank : :invalid)`.
+        let key = if value_blank(Some(current_password)) {
+            ":blank"
+        } else {
+            ":invalid"
+        };
+        errors.add("current_password", key);
+        Ok(DestroyOutcome::Refused(errors))
     }
 
     /// `after_database_authentication` hook (DBAU-07): documented no-op
@@ -1037,23 +1096,48 @@ pub trait Validatable: DatabaseAuthenticatable {
             }
         }
 
+        // Devise `validatable.rb:37-39` registers three independent
+        // validations, and only two of them carry an `if:` gate:
+        //
+        //   validates_presence_of     :password, if: :password_required?
+        //   validates_confirmation_of :password, if: :password_required?
+        //   validates_length_of       :password, minimum: proc { password_length.min },
+        //                               maximum: proc { password_length.max }, allow_blank: true
+        //
+        // The length validation has NO `password_required?` gate: its only
+        // gate is `allow_blank: true`, so a present password complains about
+        // its length whether or not the password is required, and a blank
+        // password never complains (that is the presence validation's job).
         if self.password_required() {
-            match value_present(self.password()) {
-                Some(password) => {
-                    if let Some(confirmation) = self.password_confirmation() {
-                        if confirmation != password {
-                            errors.add("password_confirmation", ":confirmation");
-                        }
-                    }
-                    // `password_length` mirrors Ruby's inclusive `..` range.
-                    let length = password.len();
-                    if length < config.password_length.start {
-                        errors.add("password", ":too_short");
-                    } else if length > config.password_length.end {
-                        errors.add("password", ":too_long");
-                    }
+            // `validates_presence_of :password, if: :password_required?`
+            // with Ruby's `present?` rule (Devise `blank?` is trim-aware).
+            if value_blank(self.password()) {
+                errors.add("password", ":blank");
+            }
+
+            // `validates_confirmation_of :password, if: :password_required?`.
+            // Rails compares the RAW attribute values, skipping only a nil
+            // confirmation, and reads a missing password as the empty
+            // string: a persisted record with a blank password but a present
+            // confirmation compares `""` against the confirmation and
+            // reports `:confirmation` alongside the presence `:blank`.
+            if let Some(confirmation) = self.password_confirmation() {
+                if confirmation != self.password().unwrap_or_default() {
+                    errors.add("password_confirmation", ":confirmation");
                 }
-                _ => errors.add("password", ":blank"),
+            }
+        }
+
+        // `validates_length_of :password, allow_blank: true` - ungated by
+        // `password_required?`, so the length rules apply whenever a
+        // non-blank password is present.
+        if let Some(password) = value_present(self.password()) {
+            // `password_length` mirrors Ruby's inclusive `..` range.
+            let length = password.len();
+            if length < config.password_length.start {
+                errors.add("password", ":too_short");
+            } else if length > config.password_length.end {
+                errors.add("password", ":too_long");
             }
         }
 
@@ -1722,6 +1806,12 @@ mod tests {
         /// rejection used to bite.
         #[serde(skip)]
         uniqueness_scope_id: Option<String>,
+        /// `password_required?` override, the `validatable_test.rb:105`
+        /// stubbing shape: `Some(false)` models a record whose password is
+        /// not required (so the length validation still applies),
+        /// `None`/`Some(true)` keep the trait default expression.
+        #[serde(skip)]
+        password_required_override: Option<bool>,
         #[serde(skip)]
         after_auth_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -1743,6 +1833,7 @@ mod tests {
                 raw_reset_token: None,
                 email_changed_override: None,
                 uniqueness_scope_id: Some("1".to_string()),
+                password_required_override: None,
                 after_auth_count: std::sync::Arc::default(),
             }
         }
@@ -1963,6 +2054,11 @@ mod tests {
 
         fn email_changed(&self) -> bool {
             self.email_changed_override.unwrap_or(true)
+        }
+
+        fn password_required(&self) -> bool {
+            self.password_required_override
+                .unwrap_or_else(|| !self.persisted() || self.password().is_some() || self.password_confirmation().is_some())
         }
     }
 
@@ -2444,16 +2540,26 @@ mod tests {
             TestUser::find_for_database_authentication(&conditions, &adapter, &config).await;
         assert_eq!(found.map(|u| u.id), Some(1));
 
-        // destroy_with_password destroys only on a valid password (DBAU-05).
+        // destroy_with_password refuses a wrong password and destroys on the
+        // valid one (DBAU-05); the full three-way outcome split is pinned in
+        // `destroy_with_password_error_surface`.
         assert!(
-            !DatabaseAuthenticatable::destroy_with_password(&user, "wrong", &adapter, &config)
-                .await
-                .unwrap()
+            matches!(
+                DatabaseAuthenticatable::destroy_with_password(&user, "wrong", &adapter, &config)
+                    .await
+                    .unwrap(),
+                DestroyOutcome::Refused(_)
+            ),
+            "a wrong current password refuses the destroy"
         );
         assert!(
-            DatabaseAuthenticatable::destroy_with_password(&user, "secret123", &adapter, &config)
-                .await
-                .unwrap()
+            matches!(
+                DatabaseAuthenticatable::destroy_with_password(&user, "secret123", &adapter, &config)
+                    .await
+                    .unwrap(),
+                DestroyOutcome::Destroyed
+            ),
+            "the valid current password destroys the record"
         );
         assert!(
             adapter
@@ -2465,6 +2571,93 @@ mod tests {
 
         // after_database_authentication hook exists and defaults to no-op (DBAU-07).
         DatabaseAuthenticatable::after_database_authentication(&user);
+    }
+
+    /// `destroy_with_password` mirrors the three Devise cases of
+    /// `database_authenticatable_test.rb:221-239`: a valid password
+    /// destroys, a wrong one refuses with `:current_password :invalid` and
+    /// leaves the record in the store, and a blank one (Devise's `nil`, spelled
+    /// here as `""` and as a whitespace-only string, since `blank?` is
+    /// trim-aware) refuses with `:current_password :blank`.
+    #[tokio::test]
+    async fn destroy_with_password_error_surface() {
+        let config = test_config();
+
+        // The valid password destroys the record (ruby test at :221).
+        let doomed_adapter = MemoryAdapter::<TestUser>::new();
+        let doomed = TestUser::testing("secret123", &config);
+        doomed_adapter.create(doomed.clone()).await.unwrap();
+        let outcome = DatabaseAuthenticatable::destroy_with_password(
+            &doomed,
+            "secret123",
+            &doomed_adapter,
+            &config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, DestroyOutcome::Destroyed);
+        assert!(
+            doomed_adapter
+                .get(&DeviseKey::from_i64(1))
+                .await
+                .unwrap()
+                .is_none(),
+            "the record must be gone from the store"
+        );
+
+        // A wrong password refuses with :invalid and the record survives
+        // (ruby test at :227).
+        let wrong_adapter = MemoryAdapter::<TestUser>::new();
+        let wrong = TestUser::testing("secret123", &config);
+        wrong_adapter.create(wrong.clone()).await.unwrap();
+        let outcome =
+            DatabaseAuthenticatable::destroy_with_password(&wrong, "other", &wrong_adapter, &config)
+                .await
+                .unwrap();
+        let DestroyOutcome::Refused(errors) = outcome else {
+            panic!("a wrong password must refuse, got {outcome:?}");
+        };
+        assert_eq!(
+            errors.get("current_password").map(Vec::as_slice),
+            Some(&[":invalid".to_string()][..])
+        );
+        assert!(
+            wrong_adapter
+                .get(&DeviseKey::from_i64(1))
+                .await
+                .unwrap()
+                .is_some(),
+            "the record must still be persisted after a refusal"
+        );
+
+        // A blank password refuses with :blank, both for the empty string and
+        // for a whitespace-only one (ruby test at :234, `current_password.blank?`).
+        for blank in ["", "   "] {
+            let blank_adapter = MemoryAdapter::<TestUser>::new();
+            let kept = TestUser::testing("secret123", &config);
+            blank_adapter.create(kept.clone()).await.unwrap();
+            let outcome = DatabaseAuthenticatable::destroy_with_password(
+                &kept, blank, &blank_adapter, &config,
+            )
+            .await
+            .unwrap();
+            let DestroyOutcome::Refused(errors) = outcome else {
+                panic!("a blank password must refuse, got {outcome:?}");
+            };
+            assert_eq!(
+                errors.get("current_password").map(Vec::as_slice),
+                Some(&[":blank".to_string()][..]),
+                "blank submission {blank:?} must report :blank"
+            );
+            assert!(
+                blank_adapter
+                    .get(&DeviseKey::from_i64(1))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "a refusal must never delete the record"
+            );
+        }
     }
 
     #[test]
@@ -2935,6 +3128,107 @@ mod tests {
         // Persisted record with no password fields: password not required.
         let persisted = TestUser::testing("secret123", &config);
         assert!(!Validatable::password_required(&persisted));
+    }
+
+    /// Devise's `password_length` bounds are configurable and pinned by the
+    /// Ruby suite at `validatable_test.rb:83` and `:89`: with a 7..72 range a
+    /// 5-char password is `:too_short`, a 73-char one `:too_long`, and both
+    /// bounds themselves pass (Ruby ranges are inclusive on both ends).
+    #[test]
+    fn validatable_custom_password_length_bounds() {
+        let config = DeviseConfig {
+            password_length: 7..72,
+            ..test_config()
+        };
+        for (len, expected) in [(5usize, Some(":too_short")), (73, Some(":too_long"))] {
+            let user = TestUser {
+                email: "bounds@example.com".to_string(),
+                password: Some("x".repeat(len)),
+                password_confirmation: Some("x".repeat(len)),
+                ..TestUser::default()
+            };
+            let errors = Validatable::validate(&user, &config);
+            let keys: Vec<String> = errors.get("password").cloned().unwrap_or_default();
+            assert_eq!(
+                keys,
+                expected.map_or_else(Vec::new, |key| vec![key.to_string()]),
+                "length {len} against the 7..72 range"
+            );
+        }
+        for len in [7usize, 72] {
+            let user = TestUser {
+                email: "bounds@example.com".to_string(),
+                password: Some("x".repeat(len)),
+                password_confirmation: Some("x".repeat(len)),
+                ..TestUser::default()
+            };
+            let errors = Validatable::validate(&user, &config);
+            assert!(errors.is_empty(), "length {len} must pass: {errors:?}");
+        }
+    }
+
+    /// `validatable.rb:37-39` plus `validatable_test.rb:75-81` and `:95-103`:
+    /// `validates_confirmation_of` compares the RAW values (Rails reads a
+    /// missing password as the empty string), so a persisted record with a
+    /// blank password and a present confirmation reports BOTH the presence
+    /// `:blank` on `password` and the `:confirmation` on
+    /// `password_confirmation`, and never a length error (`allow_blank: true`
+    /// keeps the length validation away from a blank password).
+    #[test]
+    fn validatable_blank_password_with_confirmation_errors_both() {
+        let config = test_config();
+        let mut user = TestUser::testing("secret123", &config);
+        user.password = None;
+        user.password_confirmation = Some("confirmation".to_string());
+
+        assert!(
+            Validatable::password_required(&user),
+            "the present confirmation keeps the password required (Devise `password_required?` reads the confirmation too)"
+        );
+        let errors = Validatable::validate(&user, &config);
+        assert_eq!(
+            errors.get("password").map(Vec::as_slice),
+            Some(&[":blank".to_string()][..])
+        );
+        assert_eq!(
+            errors.get("password_confirmation").map(Vec::as_slice),
+            Some(&[":confirmation".to_string()][..])
+        );
+        assert!(
+            !errors.get("password").is_some_and(|keys| keys
+                .iter()
+                .any(|key| key == ":too_short" || key == ":too_long")),
+            "a blank password never draws a length error: {errors:?}"
+        );
+    }
+
+    /// `validatable_test.rb:105` (`should complain about length even if
+    /// password is not required`) pins that `validates_length_of` carries
+    /// `allow_blank: true` and NO `password_required?` gate: the fixture knob
+    /// forces the record into the not-required state and the length error
+    /// still fires, while the gated `:blank`/`:confirmation` errors stay away.
+    #[test]
+    fn validatable_length_not_gated_on_password_required() {
+        let config = DeviseConfig {
+            password_length: 7..72,
+            ..test_config()
+        };
+        let user = TestUser {
+            email: "gated@example.com".to_string(),
+            password: Some("x".repeat(73)),
+            password_confirmation: Some("x".repeat(73)),
+            password_required_override: Some(false),
+            ..TestUser::default()
+        };
+        let errors = Validatable::validate(&user, &config);
+        assert_eq!(
+            errors.get("password").map(Vec::as_slice),
+            Some(&[":too_long".to_string()][..])
+        );
+        assert!(
+            errors.get("password_confirmation").is_none(),
+            "the confirmation validation is gated on password_required: {errors:?}"
+        );
     }
 
     #[tokio::test]

@@ -66,7 +66,7 @@ pub enum DeviseError {
 /// Mirrors `ActiveModel` `errors` with Devise's symbolic keys:
 /// `:blank`, `:invalid`, `:not_found`, `:expired`, `:already_confirmed`,
 /// `:not_locked`, `:confirmation_period_expired`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationErrors {
     inner: HashMap<String, Vec<String>>,
 }
