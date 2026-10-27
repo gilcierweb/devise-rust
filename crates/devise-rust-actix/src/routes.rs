@@ -392,7 +392,11 @@ fn error_status_of(config: &DeviseConfig) -> StatusCode {
 /// re-render AND the JSON body). The keyed error body is unchanged; only
 /// the status moves. The `confirmations#show` / `unlocks#show` call sites
 /// pass Devise's hardcoded 422 instead (their TODO carve-out).
-fn invalid_response(req: &HttpRequest, errors: &ValidationErrors, status: StatusCode) -> HttpResponse {
+fn invalid_response(
+    req: &HttpRequest,
+    errors: &ValidationErrors,
+    status: StatusCode,
+) -> HttpResponse {
     if wants_json(req) {
         return HttpResponse::build(status)
             .json(serde_json::json!({ "errors": errors_json(errors) }));
@@ -1336,11 +1340,7 @@ where
     // Devise carves `confirmations#show` out of the configurable
     // `error_status` with a TODO to adopt it only when the default changes
     // (`confirmations_controller.rb:30-31`); the port mirrors the hardcode.
-    invalid_response(
-        &req,
-        &resource.errors,
-        StatusCode::UNPROCESSABLE_ENTITY,
-    )
+    invalid_response(&req, &resource.errors, StatusCode::UNPROCESSABLE_ENTITY)
 }
 
 async fn confirmations_create<M, A, L>(
@@ -1415,11 +1415,7 @@ where
     // Devise carves `unlocks#show` out of the configurable `error_status`
     // with a TODO to adopt it only when the default changes
     // (`unlocks_controller.rb:32-33`); the port mirrors the hardcode.
-    invalid_response(
-        &req,
-        &resource.errors,
-        StatusCode::UNPROCESSABLE_ENTITY,
-    )
+    invalid_response(&req, &resource.errors, StatusCode::UNPROCESSABLE_ENTITY)
 }
 
 async fn unlocks_create<M, A, L>(

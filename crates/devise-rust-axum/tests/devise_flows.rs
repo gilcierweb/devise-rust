@@ -1859,7 +1859,7 @@ async fn flow_blank_password_paranoid_reports_invalid() {
     );
 }
 
-/// error_status wiring: a non-default `error_status` demonstrably reaches
+/// `error_status` wiring: a non-default `error_status` demonstrably reaches
 /// the wire through the real app (build via `test_state_with_config`), so
 /// the duplicate-email render reads the config instead of a constant.
 /// Setting `error_status` to 422 is also the documented one-line
