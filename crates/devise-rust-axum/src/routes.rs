@@ -1036,13 +1036,20 @@ where
     // that order.
     devise_rust::failure::AnyDeviseModel::after_database_authentication(&record);
 
-    // Devise warden `after_set_user` lockable hook: zero the counter on a
-    // successful sign-in (durable; the hook owns only the memo copy).
-    drop(record.reset_failed_attempts(st.adapter.as_ref()).await);
-
+    // Devise `hooks/activatable.rb` include order (`models.rb`): the
+    // activatable hook registers BEFORE the lockable hook, and its
+    // `throw :warden` aborts the request before the lockable
+    // `after_set_user` hook can run. A sign-in the activatable gate
+    // rejects must therefore NOT persist the counter reset, or a failed
+    // attempt on an inactive account would erase the brute-force history
+    // (IN-04).
     if !record.active_for_authentication() {
         return auth_fail(&auth_request, &st, record.inactive_message());
     }
+
+    // Devise warden `after_set_user` lockable hook: zero the counter on a
+    // successful sign-in (durable; the hook owns only the memo copy).
+    drop(record.reset_failed_attempts(st.adapter.as_ref()).await);
 
     // Trackable: the shared durable sign-in bookkeeping (current→last
     // shift + persist; the Authentication hooks are memo-only by the
@@ -1278,8 +1285,39 @@ where
             flash_redirect(&st.config, &st.mapping.sign_in_path(), &key)
         }
     } else {
+        // Devise `sign_up(resource_name, resource)` ->
+        // `sign_in(resource_name, resource)` (`registrations_controller.rb:99-101`):
+        // the sign-up IS an interactive sign-in, so the active branch runs the
+        // same pipeline `sessions#create` runs: the trackable bookkeeping, the
+        // Authentication hooks plus the devise key sweep through
+        // `AuthProxy::set_user`, then the physical session write. The port
+        // previously only inserted the payload, which left `sign_in_count`
+        // at 0 and never swept the stale keys (IN-03).
+        sign_in_bookkeeping(
+            &mut saved,
+            st.adapter.as_ref(),
+            &auth_request.peer_addr.clone().unwrap_or_default(),
+            st.clock.as_ref(),
+        )
+        .await;
         let (key, salt) = saved.session_pair();
         let scope = st.mapping.name.clone();
+        {
+            let mut proxy = handle.lock().await;
+            let opts = SetUserOpts {
+                event: SetUserEvent::Authentication,
+                store: false,
+                run_callbacks: true,
+                force: false,
+            };
+            if proxy
+                .set_user(&scope, Some(Box::new(saved)), opts)
+                .await
+                .is_err()
+            {
+                return internal_error();
+            }
+        }
         if bridge::insert_session_and_renew(&session, &scope, &key, &salt)
             .await
             .is_err()

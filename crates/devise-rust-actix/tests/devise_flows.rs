@@ -2114,7 +2114,7 @@ async fn flow_account_update_inactive_record_ignores_active_gate_for_flash() {
 /// Bypass-sign-in probe for the inactive-record fixture: install a session
 /// payload for a record the interactive sign-in refuses (the unconfirmed
 /// account the registrations#update flash matrix needs). Mirrors
-/// `test_helpers::bypass_sign_in` (IntegrationHelpers parity).
+/// `test_helpers::bypass_sign_in` (`IntegrationHelpers` parity).
 async fn bypass_sign_in_probe(
     session: actix_session::Session,
     state: web::Data<TestState>,
@@ -2130,4 +2130,130 @@ async fn bypass_sign_in_probe(
         .await
         .expect("bypass");
     HttpResponse::Ok().finish()
+}
+
+// ============================================================================
+// Sign-in order and the sign-up pipeline (IN-04 / IN-03):
+// Devise's `hooks/activatable.rb` registers before `hooks/lockable.rb`
+// (models.rb include order), and its `throw :warden` aborts the request
+// before the lockable `after_set_user` hook can reset the counter;
+// `registrations#create` signs the new record in through the SAME pipeline
+// `sessions#create` uses, so trackable writes once.
+// ============================================================================
+
+/// Write `failed_attempts` straight through the test adapter (the brute-force
+/// history the IN-04 test proves is preserved).
+async fn write_failed_attempts(state: &TestState, key: &DeviseKey, attempts: i64) {
+    let mut fields = HashMap::new();
+    fields.insert("failed_attempts".to_string(), Value::Integer(attempts));
+    state
+        .adapter
+        .update_columns(key, &fields)
+        .await
+        .expect("counter write");
+}
+
+/// IN-04: the activatable gate runs BEFORE the lockable reset, so a failed
+/// sign-in on an inactive (unconfirmed) account must leave the stored
+/// `failed_attempts` untouched. Resetting first would let an attacker erase
+/// brute-force history by submitting the correct password on an account they
+/// cannot yet use.
+#[actix_web::test]
+async fn flow_sign_in_inactive_account_preserves_failed_attempts() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    let user = seed_user_unconfirmed(&state, "inactive-count@example.com", "secret123").await;
+    let key = AnyDeviseModel::to_key(&user);
+    write_failed_attempts(&state, &key, 7).await;
+
+    // The CORRECT password: the account is authenticated, then the
+    // activatable gate rejects it with the confirmable inactive message.
+    let resp = form_sign_in(&app, "inactive-count@example.com", "secret123").await;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
+        Some("unconfirmed"),
+        "the rejection carries the confirmable inactive message"
+    );
+    let stored = state
+        .adapter
+        .get(&key)
+        .await
+        .expect("lookup")
+        .expect("record");
+    assert_eq!(
+        stored.failed_attempts, 7,
+        "a failed inactive sign-in must not reset the counter"
+    );
+}
+
+/// IN-03: `registrations#create` signs the new record in through the same
+/// pipeline `sessions#create` runs (trackable bookkeeping, devise key sweep,
+/// session insert), so `sign_in_count` is 1 after a sign-up with an active
+/// record. The port previously only inserted the session payload, leaving the
+/// trackable columns at zero (an unaudited sign-up).
+#[actix_web::test]
+async fn flow_sign_up_runs_the_sign_in_pipeline_with_trackable() {
+    // An unconfirmed record with a never-expiring access window is ACTIVE
+    // (`allow_unconfirmed_access_for: nil`), so the create action takes the
+    // sign-in branch (`registrations_controller.rb:22-25`).
+    let mut config = common::test_config();
+    config.allow_unconfirmed_access_for = None;
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
+
+    let mut jar = Jar::new();
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/users")
+            .insert_header(("content-type", "application/x-www-form-urlencoded"))
+            .set_payload(
+                "user[email]=signup-track@example.com&user[password]=secret123&user[password_confirmation]=secret123",
+            )
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
+        Some("signed_up"),
+        "an active sign-up record flashes signed_up (the sign-in branch)"
+    );
+    jar.merge(&resp);
+
+    // The sign-in pipeline ran: the follow-up authenticated request resolves
+    // the new account through the session the create action minted.
+    let probe = probe_private(&app, &jar.header()).await;
+    assert_eq!(
+        probe.status(),
+        200,
+        "the sign-up live-sessions the new account"
+    );
+
+    let mut conditions = Conditions::new();
+    conditions.insert(
+        "email",
+        Value::String("signup-track@example.com".to_string()),
+    );
+    let record = state
+        .adapter
+        .find_first(&conditions)
+        .await
+        .expect("lookup")
+        .expect("record");
+    assert_eq!(
+        record.sign_in_count, 1,
+        "trackable wrote exactly once on the sign-up path"
+    );
+    assert!(
+        record.current_sign_in_at.is_some(),
+        "the sign-in bookkeeping stamped the current sign-in time"
+    );
 }

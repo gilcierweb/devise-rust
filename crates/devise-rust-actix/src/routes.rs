@@ -673,57 +673,32 @@ where
         }
     }
 
-    // Devise warden `after_set_user` lockable hook: zero the counter on a
-    // successful sign-in.
-    drop(record.reset_failed_attempts(state.adapter.as_ref()).await);
-
+    // Devise `hooks/activatable.rb` include order (`models.rb`): the
+    // activatable hook registers BEFORE the lockable hook, and its
+    // `throw :warden` aborts the request before the lockable
+    // `after_set_user` hook can run. A sign-in the activatable gate rejects
+    // must therefore NOT persist the counter reset, or a failed attempt on an
+    // inactive account would erase the brute-force history (IN-04).
     if !record.active_for_authentication() {
         return auth_fail(&req, &session, &state.mapping, record.inactive_message());
     }
 
-    // Trackable: shift current→last, stamp now + peer IP (D-11: socket only).
-    {
-        let now = state.clock.now();
-        record.update_tracked_fields(now, req.connection_info().peer_addr());
-        let fields = HashMap::from([
-            (
-                "sign_in_count".to_string(),
-                AdapterValue::Integer(i64::try_from(record.sign_in_count()).unwrap_or(i64::MAX)),
-            ),
-            (
-                "current_sign_in_at".to_string(),
-                record
-                    .current_sign_in_at()
-                    .map_or(AdapterValue::Null, |t| AdapterValue::String(t.to_rfc3339())),
-            ),
-            (
-                "last_sign_in_at".to_string(),
-                record
-                    .last_sign_in_at()
-                    .map_or(AdapterValue::Null, |t| AdapterValue::String(t.to_rfc3339())),
-            ),
-            (
-                "current_sign_in_ip".to_string(),
-                record
-                    .current_sign_in_ip()
-                    .map_or(AdapterValue::Null, |ip| {
-                        AdapterValue::String(ip.to_string())
-                    }),
-            ),
-            (
-                "last_sign_in_ip".to_string(),
-                record.last_sign_in_ip().map_or(AdapterValue::Null, |ip| {
-                    AdapterValue::String(ip.to_string())
-                }),
-            ),
-        ]);
-        drop(
-            state
-                .adapter
-                .update_columns(&record.to_key(), &fields)
-                .await,
-        );
-    }
+    // Devise warden `after_set_user` lockable hook: zero the counter on a
+    // successful sign-in.
+    drop(record.reset_failed_attempts(state.adapter.as_ref()).await);
+
+    // Trackable: shift current to last, stamp now + peer IP (D-11: socket
+    // only) and persist the five columns. The peer is copied out first:
+    // `connection_info()` hands back a RefCell borrow that may not live
+    // across the helper's await (clippy `await_holding_refcell_ref`).
+    let peer_ip = req.connection_info().peer_addr().map(str::to_string);
+    sign_in_bookkeeping(
+        &mut record,
+        state.adapter.as_ref(),
+        peer_ip.as_deref(),
+        state.clock.as_ref(),
+    )
+    .await;
 
     let (key, salt) = record.session_pair();
     if insert_session_and_renew_sync(&session, &scope, &key, &salt).is_err() {
@@ -879,6 +854,60 @@ fn scope_session_present(session: &Session, scope: &str) -> bool {
         .is_some()
 }
 
+/// Trackable: the durable sign-in bookkeeping (current -> last shift + the
+/// five column writes; the `Authentication` hooks own only the memo copy by
+/// the Phase 5 hook design).
+///
+/// The single home `sessions#create` and `registrations#create` share, so
+/// the sign-up path writes the same five columns the interactive sign-in
+/// does (IN-03: Devise's `sign_up` delegates to `sign_in`, and
+/// `hooks/trackable.rb` runs on that `after_set_user`). Mirrors the
+/// same-named helper in the axum crate (framework parity, D-19).
+async fn sign_in_bookkeeping<M, A>(
+    record: &mut M,
+    adapter: &A,
+    peer_addr: Option<&str>,
+    clock: &dyn Clock,
+) where
+    M: FullDeviseModel,
+    A: OrmAdapter<M> + Send + Sync,
+{
+    record.update_tracked_fields(clock.now(), peer_addr);
+    let fields = HashMap::from([
+        (
+            "sign_in_count".to_string(),
+            AdapterValue::Integer(i64::try_from(record.sign_in_count()).unwrap_or(i64::MAX)),
+        ),
+        (
+            "current_sign_in_at".to_string(),
+            record
+                .current_sign_in_at()
+                .map_or(AdapterValue::Null, |t| AdapterValue::String(t.to_rfc3339())),
+        ),
+        (
+            "last_sign_in_at".to_string(),
+            record
+                .last_sign_in_at()
+                .map_or(AdapterValue::Null, |t| AdapterValue::String(t.to_rfc3339())),
+        ),
+        (
+            "current_sign_in_ip".to_string(),
+            record
+                .current_sign_in_ip()
+                .map_or(AdapterValue::Null, |ip| {
+                    AdapterValue::String(ip.to_string())
+                }),
+        ),
+        (
+            "last_sign_in_ip".to_string(),
+            record.last_sign_in_ip().map_or(AdapterValue::Null, |ip| {
+                AdapterValue::String(ip.to_string())
+            }),
+        ),
+    ]);
+    drop(adapter.update_columns(&record.to_key(), &fields).await);
+}
+
 // ============================================================================
 // Registrations controller (REGS / RegistrationsController)
 // ============================================================================
@@ -990,6 +1019,26 @@ where
             flash_redirect(&session, &state.mapping.sign_in_path(), &key)
         }
     } else {
+        // Devise `sign_up(resource_name, resource)` ->
+        // `sign_in(resource_name, resource)` (`registrations_controller.rb:99-101`):
+        // the sign-up IS an interactive sign-in, so the active branch sweeps
+        // the stale devise keys and runs the trackable bookkeeping the way
+        // `sessions#create` does, then writes the session. The port previously
+        // only inserted the payload, which left `sign_in_count` at 0 and never
+        // swept the keys (IN-03).
+        drop(expire_devise_data_sync(
+            &session,
+            &all_scope_names(&state),
+            &state.config,
+        ));
+        let peer_ip = req.connection_info().peer_addr().map(str::to_string);
+        sign_in_bookkeeping(
+            &mut saved,
+            state.adapter.as_ref(),
+            peer_ip.as_deref(),
+            state.clock.as_ref(),
+        )
+        .await;
         let (key, salt) = saved.session_pair();
         let scope = state.mapping.name.clone();
         if insert_session_and_renew_sync(&session, &scope, &key, &salt).is_err() {

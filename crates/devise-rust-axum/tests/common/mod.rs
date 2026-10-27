@@ -193,6 +193,17 @@ pub struct FixtureUser {
     pub raw_unlock_token: Option<String>,
     #[serde(skip)]
     pub remember_me_flag: Option<bool>,
+    /// Window stamp: the app config this record was BUILT under never expires
+    /// unconfirmed access (`allow_unconfirmed_access_for: nil`, Devise's
+    /// "unconfirmed access never expires"). `new_with_session` stamps it from
+    /// the controller's config because the fixture's
+    /// `active_for_authentication` has no other channel to the app config;
+    /// without it a controller-built record could never compose the
+    /// never-expiring window and no app config could reach the sign-up
+    /// sign-in branch. A REAL (serialized) column, because the memory oracle
+    /// round-trips every record through JSON on `update_columns` and a
+    /// `serde(skip)` stamp would be dropped by the sign-in bookkeeping.
+    pub unconfirmed_access_never_expires: bool,
 }
 
 impl FixtureUser {
@@ -292,9 +303,21 @@ impl PasswordVerifiable for FixtureUser {
 #[async_trait::async_trait]
 impl devise_rust::model::Authenticatable for FixtureUser {
     fn active_for_authentication(&self) -> bool {
+        // The confirmable gate composes on the window the record was BUILT
+        // under (see the field doc): a controller-built record carries the
+        // app's `allow_unconfirmed_access_for`, every other fixture record
+        // keeps the hardcoded test window.
+        let config = if self.unconfirmed_access_never_expires {
+            DeviseConfig {
+                allow_unconfirmed_access_for: None,
+                ..test_config()
+            }
+        } else {
+            test_config()
+        };
         devise_rust::model::compose_active_for_authentication(
             self,
-            &test_config(),
+            &config,
             &devise_rust::time::SystemClock,
         )
     }
@@ -363,7 +386,31 @@ impl DatabaseAuthenticatable for FixtureUser {
     }
 }
 
-impl Registerable for FixtureUser {}
+impl Registerable for FixtureUser {
+    /// Core's default `new_with_session` body (`model.rs`), plus the window
+    /// stamp the activity gate above reads.
+    fn new_with_session(
+        params: &serde_json::Map<String, serde_json::Value>,
+        session: &serde_json::Value,
+        config: &DeviseConfig,
+    ) -> Self {
+        let _ = session;
+        let params = devise_rust::model::normalize_attribute_map(params, config);
+        let mut record = Self::default();
+        record.assign_attributes(&params);
+        if let Some(password) = params.get("password").and_then(serde_json::Value::as_str) {
+            record.set_password(Some(password.to_string()), config);
+        }
+        if let Some(confirmation) = params
+            .get("password_confirmation")
+            .and_then(serde_json::Value::as_str)
+        {
+            record.set_password_confirmation(Some(confirmation.to_string()));
+        }
+        record.unconfirmed_access_never_expires = config.allow_unconfirmed_access_for.is_none();
+        record
+    }
+}
 
 #[async_trait::async_trait]
 impl Validatable for FixtureUser {

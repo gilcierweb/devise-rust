@@ -2285,7 +2285,7 @@ async fn submit_account_update(app: &Router, body: &str, cookie: &str) -> Respon
 }
 
 /// The flash keys a response staged into the signed flash cookie.
-async fn update_flash_keys(response: &Response, config: &DeviseConfig) -> Vec<String> {
+fn update_flash_keys(response: &Response, config: &DeviseConfig) -> Vec<String> {
     common::flash_keys_from_cookies(&set_cookie_pairs(response), config)
 }
 
@@ -2311,9 +2311,7 @@ async fn flow_account_update_password_change_flashes_updated_and_renews() {
     assert_eq!(resp.status(), StatusCode::FOUND);
     jar.merge(&resp);
     assert!(
-        update_flash_keys(&resp, &state.config)
-            .await
-            .contains(&"updated".to_string()),
+        update_flash_keys(&resp, &state.config).contains(&"updated".to_string()),
         "a password change with the config on flashes updated"
     );
     assert_ne!(
@@ -2354,9 +2352,7 @@ async fn flow_account_update_blank_password_still_renews_with_updated_flash() {
     assert_eq!(resp.status(), StatusCode::FOUND);
     jar.merge(&resp);
     assert!(
-        update_flash_keys(&resp, &state.config)
-            .await
-            .contains(&"updated".to_string()),
+        update_flash_keys(&resp, &state.config).contains(&"updated".to_string()),
         "a blank password keeps the updated branch"
     );
     assert_ne!(
@@ -2389,9 +2385,7 @@ async fn flow_account_update_password_change_without_sign_in_keeps_session() {
     assert_eq!(resp.status(), StatusCode::FOUND);
     jar.merge(&resp);
     assert!(
-        update_flash_keys(&resp, &state.config)
-            .await
-            .contains(&"updated_but_not_signed_in".to_string()),
+        update_flash_keys(&resp, &state.config).contains(&"updated_but_not_signed_in".to_string()),
         "config off plus a changed password flashes updated_but_not_signed_in"
     );
     assert_eq!(
@@ -2441,9 +2435,7 @@ async fn flow_account_update_inactive_record_ignores_active_gate_for_flash() {
     .await;
     assert_eq!(resp.status(), StatusCode::FOUND);
     assert!(
-        update_flash_keys(&resp, &state.config)
-            .await
-            .contains(&"updated".to_string()),
+        update_flash_keys(&resp, &state.config).contains(&"updated".to_string()),
         "an inactive record follows the Devise branch, not the active_for_authentication key"
     );
 
@@ -2508,4 +2500,134 @@ fn update_matrix_no_gate_app(state: common::TestState) -> (common::TestState, Ro
         .layer(devise_layer)
         .layer(session_layer);
     (state, app)
+}
+
+// ============================================================================
+// Sign-in order and the sign-up pipeline (IN-04 / IN-03):
+// Devise's `hooks/activatable.rb` registers before `hooks/lockable.rb`
+// (models.rb include order), and its `throw :warden` aborts the request
+// before the lockable `after_set_user` hook can reset the counter;
+// `registrations#create` signs the new record in through the SAME
+// pipeline `sessions#create` uses, so trackable writes once.
+// ============================================================================
+
+/// Write `failed_attempts` straight through the test adapter (the brute-force
+/// history the IN-04 test proves is preserved).
+async fn write_failed_attempts(
+    state: &common::TestState,
+    key: &devise_rust::adapter::DeviseKey,
+    attempts: i64,
+) {
+    let mut fields = std::collections::HashMap::new();
+    fields.insert("failed_attempts".to_string(), Value::Integer(attempts));
+    state
+        .adapter
+        .update_columns(key, &fields)
+        .await
+        .expect("counter write");
+}
+
+/// IN-04: the activatable gate runs BEFORE the lockable reset, so a failed
+/// sign-in on an inactive (unconfirmed) account must leave the stored
+/// `failed_attempts` untouched. Resetting first would let an attacker erase
+/// brute-force history by submitting the correct password on an account
+/// they cannot yet use.
+#[tokio::test]
+async fn flow_sign_in_inactive_account_preserves_failed_attempts() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    let user = seed_user_unconfirmed(&state, "inactive-count@example.com", "secret123").await;
+    let key = AnyDeviseModel::to_key(&user);
+    write_failed_attempts(&state, &key, 7).await;
+
+    // The CORRECT password: the account is authenticated, then the
+    // activatable gate rejects it with the confirmable inactive message.
+    let resp = form_sign_in(&app, "inactive-count@example.com", "secret123").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"unconfirmed".to_string()),
+        "the rejection carries the confirmable inactive message: {cookies:?}"
+    );
+    assert_eq!(
+        state
+            .adapter
+            .get(&key)
+            .await
+            .expect("lookup")
+            .expect("record")
+            .failed_attempts,
+        7,
+        "a failed inactive sign-in must not reset the counter"
+    );
+}
+
+/// IN-03: `registrations#create` signs the new record in through the same
+/// pipeline `sessions#create` runs (trackable bookkeeping, hooks, session
+/// insert), so `sign_in_count` is 1 after a sign-up with an active record.
+/// The port previously only inserted the session payload, leaving the
+/// trackable columns at zero (an unaudited sign-up).
+#[tokio::test]
+async fn flow_sign_up_runs_the_sign_in_pipeline_with_trackable() {
+    // An unconfirmed record with a never-expiring access window is ACTIVE
+    // (`allow_unconfirmed_access_for: nil`), so the create action takes the
+    // sign-in branch (`registrations_controller.rb:22-25`).
+    let mut config = common::test_config();
+    config.allow_unconfirmed_access_for = None;
+    let (state, app) = common::build_app(common::test_state_with_config(default_mapping(), config));
+
+    let mut jar = Jar::new();
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/users")
+            .header(
+                header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(Body::from(
+                "user[email]=signup-track@example.com&user[password]=secret123&user[password_confirmation]=secret123",
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"signed_up".to_string()),
+        "an active sign-up record flashes signed_up (the sign-in branch): {cookies:?}"
+    );
+    jar.merge(&resp);
+
+    // The sign-in pipeline ran: the follow-up authenticated request resolves
+    // the new account through the session the create action minted.
+    let probe = probe_private(&app, &jar.header()).await;
+    assert_eq!(
+        probe.status(),
+        StatusCode::OK,
+        "the sign-up live-sessions the new account"
+    );
+    let email = body_json(probe).await["email"].as_str().map(str::to_string);
+    assert_eq!(email.as_deref(), Some("signup-track@example.com"));
+
+    let mut conditions = Conditions::new();
+    conditions.insert(
+        "email",
+        Value::String("signup-track@example.com".to_string()),
+    );
+    let record = state
+        .adapter
+        .find_first(&conditions)
+        .await
+        .expect("lookup")
+        .expect("record");
+    assert_eq!(
+        record.sign_in_count, 1,
+        "trackable wrote exactly once on the sign-up path"
+    );
+    assert!(
+        record.current_sign_in_at.is_some(),
+        "the sign-in bookkeeping stamped the current sign-in time"
+    );
 }
