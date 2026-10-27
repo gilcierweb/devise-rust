@@ -642,16 +642,20 @@ fn param_for(map: &Map<String, JsonValue>, singular: &str, key: &str) -> String 
 ///
 /// The three actions used here are always registered by
 /// [`ParameterSanitizer::new`], so the unknown-action `Err` (Devise's
-/// `unknown_action!` raise) is unreachable; failing closed to an empty map
-/// keeps a future typo from ever widening the permitted set.
+/// `unknown_action!` raise) is unreachable; failing closed to a 500
+/// (never a silent empty-map pass-through) keeps a future typo loud
+/// instead of quietly widening the permitted set.
+///
+/// # Errors
+///
+/// [`devise_rust::error::DeviseError::Config`] when `action` has not been
+/// registered; the caller renders it as the framework's internal error.
 fn sanitized_params(
     config: &DeviseConfig,
     action: &str,
     params: &Map<String, JsonValue>,
-) -> Map<String, JsonValue> {
-    devise_rust::parameter::ParameterSanitizer::new(config)
-        .sanitize(action, params)
-        .unwrap_or_default()
+) -> Result<Map<String, JsonValue>, devise_rust::error::DeviseError> {
+    devise_rust::parameter::ParameterSanitizer::new(config).sanitize(action, params)
 }
 
 /// JSON vs HTML split (D-15): JSON when the request content-type or Accept
@@ -932,7 +936,10 @@ where
     auth_request.flags.allow_params_authentication = st.config.params_authenticatable;
     // S7: `sign_in_params` — the `:sign_in` sanitizer decides what the
     // controller may read (`sessions_controller.rb:34-36`).
-    let params = sanitized_params(&st.config, "sign_in", &body_map(params.0, &singular));
+    // Devise's `unknown_action!` raise renders as the framework's 500.
+    let Ok(params) = sanitized_params(&st.config, "sign_in", &body_map(params.0, &singular)) else {
+        return internal_error();
+    };
     let password = param_str(&params, "password").to_string();
     let remember = params
         .get("remember_me")
@@ -1242,7 +1249,10 @@ where
     // S7: `sign_up_params` — the `:sign_up` sanitizer decides which params
     // may build a record (`registrations_controller.rb:113-115`); the raw
     // body map never reaches `new_with_session`.
-    let params = sanitized_params(&st.config, "sign_up", &body_map(params.0, &singular));
+    // Devise's `unknown_action!` raise renders as the framework's 500.
+    let Ok(params) = sanitized_params(&st.config, "sign_up", &body_map(params.0, &singular)) else {
+        return internal_error();
+    };
     let mut record = M::new_with_session(&params, &JsonValue::Null, &st.config);
 
     let mut errors = record.validate(&st.config);
@@ -1257,8 +1267,12 @@ where
         return internal_error();
     };
     // Devise confirmable `after_commit :send_on_create_confirmation_instructions`.
+    // Devise propagates a failed delivery (Rails renders the raised
+    // delivery error as 500): the user MUST learn the instructions never
+    // went out; swallowing it behind an eprintln turns a broken mailer
+    // into silent "check your inbox" dead air.
     if saved.confirmation_required() {
-        if let Err(e) = saved
+        if let Err(error) = saved
             .send_confirmation_instructions(
                 st.adapter.as_ref(),
                 st.mailer.as_ref(),
@@ -1267,7 +1281,8 @@ where
             )
             .await
         {
-            eprintln!("send_confirmation_instructions: {e:?}");
+            let _ = error;
+            return internal_error();
         }
     }
     if let Some(message) = saved.post_sign_up_message() {
@@ -1359,7 +1374,12 @@ where
     // which params reach `update_with_password`
     // (`registrations_controller.rb:139-141`); the raw body map never
     // touches the record.
-    let mut params = sanitized_params(&st.config, "account_update", &body_map(params.0, &singular));
+    // Devise's `unknown_action!` raise renders as the framework's 500.
+    let Ok(mut params) =
+        sanitized_params(&st.config, "account_update", &body_map(params.0, &singular))
+    else {
+        return internal_error();
+    };
 
     // Capture the pre-update state Devise's `before_update` callbacks and
     // `set_flash_message_for_update` read after the fact.
@@ -1597,10 +1617,12 @@ where
     A: OrmAdapter<M> + Send + Sync + 'static,
     L: Mailer<M> + 'static,
 {
-    // Devise `assert_reset_token_passed`.
+    // Devise `assert_reset_token_passed` (`passwords_controller.rb:65-70`):
+    // the blank-token redirect goes to `new_session_path`, NOT the site
+    // root: the user must land on the sign-in form to start over.
     let token = query.get("reset_password_token").map_or("", String::as_str);
     if token.trim().is_empty() {
-        return flash_redirect(&st.config, "/", "no_token");
+        return flash_redirect(&st.config, &st.mapping.sign_in_path(), "no_token");
     }
     (
         StatusCode::OK,

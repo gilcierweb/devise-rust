@@ -40,6 +40,13 @@ use devise_rust::scope::Mapping;
 /// signed value derives from the flash key, never user data).
 pub const FLASH_COOKIE: &str = "devise.flash";
 
+/// Marker cookie name riding BESIDE the flash alert on the timeout path
+/// (Devise `failure_app.rb:137`: `flash[:timedout] = true if
+/// is_flashing_format?`): a signed `true` that lets a later failure's
+/// `flash.keep` branch (`failure_app.rb:89-91`) and the app's sign-in view
+/// tell a session expiry from a bad credential.
+pub const TIMEDOUT_FLASH_COOKIE: &str = "devise.flash.timedout";
+
 /// Failure renderer for axum: delegates classification to core
 /// `build_failure`, renders the resulting `Failure` as an axum `Response`.
 ///
@@ -112,6 +119,16 @@ impl FailureRenderer for AxumFailureRenderer {
                 if let Some(key) = &self.key {
                     if let Some(flash) = flash_cookie_header(key, flash_key) {
                         response.headers_mut().append(header::SET_COOKIE, flash);
+                    }
+                    // Devise stages the `timedout` marker BESIDE the timeout
+                    // alert (`failure_app.rb:137-139` sets `flash[:timedout] =
+                    // true` inside `redirect_url` while `redirect` stages the
+                    // alert): the marker rides the same signed transport and
+                    // the same read-once lifetime as the alert key.
+                    if *flash_key == FailureReason::Timeout.flash_key() {
+                        if let Some(marker) = timedout_cookie_header(key) {
+                            response.headers_mut().append(header::SET_COOKIE, marker);
+                        }
                     }
                 }
                 response
@@ -211,16 +228,38 @@ pub(crate) fn flash_cookie_header(key: &Key, flash_key: &str) -> Option<HeaderVa
         .and_then(|header| HeaderValue::from_str(&header.to_string()).ok())
 }
 
+/// Render the SIGNED `devise.flash.timedout` marker cookie (Devise
+/// `failure_app.rb:137`: the marker value is a literal `true`).
+pub(crate) fn timedout_cookie_header(key: &Key) -> Option<HeaderValue> {
+    let cookie = Cookie::build((TIMEDOUT_FLASH_COOKIE, "true".to_string()))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .secure(true)
+        .build();
+    let mut jar = CookieJar::new();
+    jar.signed_mut(key).add(cookie);
+    jar.delta()
+        .next()
+        .and_then(|header| HeaderValue::from_str(&header.to_string()).ok())
+}
+
 /// Verify one raw `devise.flash` cookie value, yielding the bare flash key.
 ///
 /// `None` means the signature did not verify (a tampered or foreign
 /// value) — the caller treats it as no flash and still clears the cookie.
 #[must_use]
 pub fn verified_flash_value(key: &Key, raw_value: &str) -> Option<String> {
+    verified_signed_cookie_value(key, FLASH_COOKIE, raw_value)
+}
+
+/// Name-generic signed-cookie verification shared by the flash alert and
+/// the timedout marker (same MAC-prefixed envelope, different slot).
+fn verified_signed_cookie_value(key: &Key, name: &str, raw_value: &str) -> Option<String> {
     let mut jar = CookieJar::new();
-    jar.add_original(Cookie::new(FLASH_COOKIE, raw_value.to_string()));
+    jar.add_original(Cookie::new(name.to_owned(), raw_value.to_string()));
     jar.signed(key)
-        .get(FLASH_COOKIE)
+        .get(name)
         .map(|cookie| cookie.value().to_string())
 }
 
@@ -233,6 +272,14 @@ pub struct FlashRead {
     /// (`Set-Cookie`), so the flash is consumed exactly once. Present
     /// whenever a flash cookie was seen — even a tampered one.
     pub clear: Option<HeaderValue>,
+    /// Whether a verified `devise.flash.timedout` marker cookie rode the
+    /// request (Devise `failure_app.rb:137`): the marker is part of the
+    /// same read-once pair as the alert key.
+    pub timedout: bool,
+    /// The clearing tombstone for the timedout marker, present whenever a
+    /// marker cookie was seen (the pair is swept together, exactly like
+    /// Devise's flash lifecycle clears both slots).
+    pub clear_timedout: Option<HeaderValue>,
 }
 
 /// Read-once Devise flash: verify the inbound signed `devise.flash`
@@ -241,13 +288,31 @@ pub struct FlashRead {
 /// Devise's flash is consumed on first render (Rails flash semantics);
 /// the cookie transport mirrors that by pairing every read with a removal
 /// cookie. A tampered value yields `key: None` AND the tombstone — a
-/// forged flash never renders and never survives either.
+/// forged flash never renders and never survives either. The
+/// `devise.flash.timedout` marker (`failure_app.rb:137`) rides the same
+/// read-once sweep: it is verified and cleared together with the alert.
 #[must_use]
 pub fn take_flash(request: &AuthRequest, config: &DeviseConfig) -> FlashRead {
+    // The timedout marker: same signed envelope, same one-shot lifetime.
+    let timedout = request
+        .cookies
+        .get(TIMEDOUT_FLASH_COOKIE)
+        .and_then(|raw| {
+            crate::remember::derive_remember_key(config)
+                .ok()
+                .and_then(|key| verified_signed_cookie_value(&key, TIMEDOUT_FLASH_COOKIE, raw))
+        })
+        .is_some_and(|value| value == "true");
+    let clear_timedout = request
+        .cookies
+        .get(TIMEDOUT_FLASH_COOKIE)
+        .map(|_| removal_timedout_flash_header());
     let Some(raw) = request.cookies.get(FLASH_COOKIE) else {
         return FlashRead {
             key: None,
             clear: None,
+            timedout,
+            clear_timedout,
         };
     };
     let clear = removal_flash_header();
@@ -257,12 +322,26 @@ pub fn take_flash(request: &AuthRequest, config: &DeviseConfig) -> FlashRead {
     FlashRead {
         key,
         clear: Some(clear),
+        timedout,
+        clear_timedout,
     }
 }
 
 /// The `devise.flash` removal cookie header (read-once consumption).
 fn removal_flash_header() -> HeaderValue {
     let mut cookie = Cookie::build((FLASH_COOKIE, String::new()))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .build();
+    cookie.make_removal();
+    HeaderValue::from_str(&cookie.to_string()).unwrap_or_else(|_| HeaderValue::from_static(""))
+}
+
+/// The `devise.flash.timedout` removal cookie header: the marker is swept
+/// with the alert (Devise's flash lifecycle clears the pair together).
+fn removal_timedout_flash_header() -> HeaderValue {
+    let mut cookie = Cookie::build((TIMEDOUT_FLASH_COOKIE, String::new()))
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)

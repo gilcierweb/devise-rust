@@ -284,6 +284,15 @@ impl<M: AnyDeviseModel + Send + Sync + 'static> FromRequest for RequireAuth<M> {
                 use actix_session::SessionExt as _;
                 let session = req.get_session();
                 crate::bridge::set_flash(&session, flash_key);
+                // Devise stages the `timedout` marker BESIDE the timeout
+                // alert (`failure_app.rb:137`: `flash[:timedout] = true if
+                // is_flashing_format?`): the flash_key branch above is the
+                // is_flashing_format guard, so the marker lands exactly
+                // where the reference puts it (the renderer itself has no
+                // session access, S11).
+                if timed_out.is_some() {
+                    crate::bridge::set_timedout_marker(&session);
+                }
             }
         }
         Box::pin(async move {

@@ -366,16 +366,26 @@ async fn fetch_and_dispatch_request_hooks(
     };
     let hook_result = hooks.run_hooks(&mut ctx).await;
 
-    if hook_result.is_ok() {
-        // Memoize (Fetch event: no hooks, no session write).
-        let opts = SetUserOpts {
-            event: SetUserEvent::Fetch,
-            store: false,
-            run_callbacks: false,
-            force: false,
-        };
-        let _ = proxy.set_user(scope, Some(record), opts).await;
+    if let Err(failure) = hook_result {
+        // A request-hook rejection (the timeout tick's `throw :warden,
+        // :timeout`) must reach the request's strict call as ITSELF: the
+        // layer runs non-strictly, so the failure is staged for the later
+        // extractor exactly like the activatable fetch gate above. Without
+        // the staging the strict call would re-fetch an already-signed-out
+        // session (locked by the hook) and render the generic
+        // unauthenticated key instead of Devise's `:timeout` one.
+        proxy.stage_session_fetch_failure(scope, failure);
+        return;
     }
+
+    // Memoize (Fetch event: no hooks, no session write).
+    let opts = SetUserOpts {
+        event: SetUserEvent::Fetch,
+        store: false,
+        run_callbacks: false,
+        force: false,
+    };
+    let _ = proxy.set_user(scope, Some(record), opts).await;
 }
 
 /// Non-strict warden fetch over the erased finder.

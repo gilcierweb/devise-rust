@@ -49,7 +49,11 @@ impl FailureRenderer for ActixFailureRenderer {
                 // response: the core renderer contract has no session
                 // access, and Devise's flash is session state — the actix
                 // callers (extractors) stage `flash_key` into the signed
-                // session before rendering through here (S11).
+                // session before rendering through here (S11). On the
+                // timeout path the extractors ALSO stage the `timedout`
+                // marker BESIDE the alert (`failure_app.rb:137`:
+                // `flash[:timedout] = true if is_flashing_format?`), the
+                // same pair Devise's failure app stages together.
                 let target = if location.is_empty() {
                     mapping.sign_in_path()
                 } else {

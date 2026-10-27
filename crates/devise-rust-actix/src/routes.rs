@@ -1299,7 +1299,7 @@ where
 async fn passwords_edit<M, A, L>(
     _req: HttpRequest,
     session: Session,
-    _state: web::Data<DeviseWebState<M, A, L>>,
+    state: web::Data<DeviseWebState<M, A, L>>,
     query: web::Query<HashMap<String, String>>,
 ) -> HttpResponse
 where
@@ -1307,11 +1307,13 @@ where
     A: OrmAdapter<M> + Send + Sync,
     L: Mailer<M>,
 {
-    // Devise `assert_reset_token_passed`.
+    // Devise `assert_reset_token_passed` (`passwords_controller.rb:65-70`):
+    // the blank-token redirect goes to `new_session_path`, NOT the site
+    // root: the user must land on the sign-in form to start over.
     let token = query.get("reset_password_token");
     let token_str = token.map_or("", String::as_str);
     if token_str.trim().is_empty() {
-        return flash_redirect(&session, "/", "no_token");
+        return flash_redirect(&session, &state.mapping.sign_in_path(), "no_token");
     }
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")

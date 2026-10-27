@@ -443,8 +443,9 @@ impl AuthProxy {
     /// The axum layer runs its fetch non-strictly (the request stays
     /// anonymous on a gate rejection), so the failure is staged here for
     /// the later strict call in the same request, which then renders the
-    /// gate's inactive message instead of a generic unauthenticated one.
-    /// Core's own fetch path stages the failure inline.
+    /// gate's inactive message or the timeout tick's `:timeout` instead of
+    /// a generic unauthenticated one. Core's own fetch path stages the
+    /// failure inline.
     ///
     /// The slot is per-request: the proxy is per-request in both
     /// frameworks, so a staged failure never outlives the request whose
@@ -459,6 +460,20 @@ impl AuthProxy {
         scope: &str,
         request: &AuthRequest,
     ) -> Result<(), Failure> {
+        // The staged fetch failure is the `throw :warden` message Devise's
+        // failure app renders for this request (the activatable gate's
+        // inactive message, the timeout tick's `:timeout`): it wins over
+        // the proxy lock the throwing hook may also have set, because the
+        // lock only exists to block FURTHER authentication attempts in the
+        // same request, never to mask the failure already thrown
+        // (`failure_app.rb` receives `:timeout`, never a lock error).
+        // Returning it here also poisons the whole request exactly like
+        // Devise's aborted warden cycle: neither presented credentials nor
+        // the remember arm may authenticate past a gate that already
+        // threw (`hooks/activatable.rb`, the timeout tick).
+        if let Some(failure) = self.fetch_gate_failures.get(scope).cloned() {
+            return Err(failure);
+        }
         if self.locked {
             return Err(Failure::Config("proxy locked".to_string()));
         }
@@ -469,13 +484,6 @@ impl AuthProxy {
             .is_some()
         {
             return Ok(());
-        }
-        // Devise's activatable hook throws on the fetch, which aborts the
-        // warden cycle: a session the gate rejected poisons the whole
-        // request, so neither presented credentials nor the remember arm
-        // may authenticate past it (`hooks/activatable.rb`).
-        if let Some(failure) = self.fetch_gate_failures.get(scope).cloned() {
-            return Err(failure);
         }
         match self.fetch_from_session(scope).await {
             Ok(Some(user)) => {

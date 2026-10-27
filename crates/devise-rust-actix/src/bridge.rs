@@ -75,12 +75,42 @@ pub fn set_flash(session: &Session, flash_key: &str) {
     let _ = session.insert(FLASH_SESSION_KEY, flash_key);
 }
 
+/// Session key carrying the timeout marker Devise stages BESIDE the
+/// timeout alert (`failure_app.rb:137`: `flash[:timedout] = true if
+/// is_flashing_format?`). The marker is how Devise's later
+/// `flash.keep(:timedout)` branch (`failure_app.rb:89-91`) recognizes a
+/// timeout-expired visitor, and how apps can tell a session expiry from a
+/// bad credential on the sign-in page.
+pub const TIMEDOUT_FLASH_SESSION_KEY: &str = "devise.flash.timedout";
+
+/// Stage the `timedout` flash marker beside the timeout alert (S11: the
+/// marker is session state, exactly like the alert key).
+pub fn set_timedout_marker(session: &Session) {
+    let _ = session.insert(TIMEDOUT_FLASH_SESSION_KEY, true);
+}
+
+/// Read-and-clear the staged `timedout` marker (the same read-once
+/// lifetime [`take_flash`] gives the alert key).
+#[must_use]
+pub fn take_timedout_marker(session: &Session) -> bool {
+    let value = session
+        .get::<bool>(TIMEDOUT_FLASH_SESSION_KEY)
+        .ok()
+        .flatten();
+    session.remove(TIMEDOUT_FLASH_SESSION_KEY);
+    value.unwrap_or(false)
+}
+
 /// Read-and-clear the staged flash (Rails' flash is read-once; the sweep
 /// mirrors `flash.discard`).
 #[must_use]
 pub fn take_flash(session: &Session) -> Option<String> {
     let value = session.get::<String>(FLASH_SESSION_KEY).ok().flatten();
     session.remove(FLASH_SESSION_KEY);
+    // The timedout marker rides the same read-once lifecycle as the alert
+    // (Devise's flash sweep clears the pair together; the dedicated
+    // [`take_timedout_marker`] read happens first when a caller wants it).
+    session.remove(TIMEDOUT_FLASH_SESSION_KEY);
     value
 }
 

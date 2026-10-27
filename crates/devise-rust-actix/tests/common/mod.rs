@@ -731,8 +731,32 @@ async fn private_probe(user: devise_rust_actix::RequireAuth<FixtureUser>) -> Htt
 /// Flash probe: takes the session-backed devise flash (read-once) and
 /// echoes it as JSON — the observable surface for the S11 flash contract.
 async fn flash_probe(session: actix_session::Session) -> HttpResponse {
+    // The timedout marker first: it rides the same read-once sweep as the
+    // alert key (Devise stages the pair together, failure_app.rb:137).
+    let timedout = devise_rust_actix::bridge::take_timedout_marker(&session);
     let flash = devise_rust_actix::bridge::take_flash(&session);
-    HttpResponse::Ok().json(serde_json::json!({ "flash": flash }))
+    HttpResponse::Ok().json(serde_json::json!({ "flash": flash, "timedout": timedout }))
+}
+
+/// Age the scope's timeoutable `last_request_at` tick far past the default
+/// 30-minute `timeout_in`: the timeoutable flow fixtures sign in normally,
+/// then stale the tick through this probe so the NEXT request times out
+/// (registered through [`build_app_with`]'s extra-route list).
+#[allow(clippy::unused_async)] // actix extractors force async handlers; the body is sync
+pub async fn age_tick_probe(
+    session: actix_session::Session,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    let scope = query
+        .get("scope")
+        .cloned()
+        .unwrap_or_else(|| "user".to_string());
+    let key = devise_rust::timeoutable::last_request_at_key(&scope);
+    // Same storage shape `bridge::tick_last_request_at` writes: an integer
+    // epoch actix-session serializes into the signed cookie.
+    let stale = <SystemClock as Clock>::now(&SystemClock).timestamp() - 7200;
+    drop(session.insert(&key, stale));
+    HttpResponse::Ok().finish()
 }
 
 /// Read the devise flash over a probe request, replaying `cookie_header`

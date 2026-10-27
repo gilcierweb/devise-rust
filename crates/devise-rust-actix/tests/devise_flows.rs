@@ -2257,3 +2257,112 @@ async fn flow_sign_up_runs_the_sign_in_pipeline_with_trackable() {
         "the sign-in bookkeeping stamped the current sign-in time"
     );
 }
+
+// ===========================================================================
+// 261026-ghh controller drift sweep: the no_token redirect target and the
+// timeout flash pair (the timedout marker Devise stages beside the timeout
+// alert, failure_app.rb:137).
+// ===========================================================================
+
+/// Devise's `assert_reset_token_passed` (`passwords_controller.rb:65-70`)
+/// redirects a blank-token edit to `new_session_path`, NOT to the site
+/// root: the user must land on the sign-in form with the `no_token` alert.
+#[actix_web::test]
+async fn flow_passwords_edit_without_token_redirects_to_sign_in_path() {
+    let (_state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/users/password/edit")
+            .insert_header(("accept", "text/html"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        resp.headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/users/sign_in"),
+        "a missing reset token redirects to the scope sign-in path, not /"
+    );
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
+        Some("no_token"),
+        "the no_token alert rides the redirect"
+    );
+}
+
+/// A session the timeoutable pass expires fails with the Devise timeout
+/// flash PAIR: the `timeout` alert key and the `timedout` marker
+/// (`failure_app.rb:135-139` stages both; the marker is how a later
+/// failure knows to keep the pair).
+#[actix_web::test]
+async fn flow_timeout_failure_carries_timeout_flash_and_marker() {
+    let (state, app) = common::build_app_with(
+        common::test_state(common::default_mapping()),
+        vec![(
+            "/devise-test/age-tick",
+            web::get().to(common::age_tick_probe),
+        )],
+    )
+    .await;
+    seed_user(&state, "timedout@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    let resp = form_sign_in(&app, "timedout@example.com", "secret123").await;
+    assert_eq!(resp.status(), 302);
+    jar.merge(&resp);
+
+    // Age the timeoutable tick far past the default 30-minute window.
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/devise-test/age-tick?scope=user")
+            .insert_header(("cookie", jar.header()))
+            .to_request(),
+    )
+    .await;
+    assert!(resp.status().is_success(), "age probe reachable");
+    jar.merge(&resp);
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/users_dashboard")
+            .insert_header(("cookie", jar.header()))
+            .insert_header(("accept", "text/html"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        302,
+        "an expired session answers the navigational timeout redirect"
+    );
+    jar.merge(&resp);
+
+    // The flash probe reports the read-once pair: alert key AND marker.
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/devise-test/flash")
+            .insert_header(("cookie", jar.header()))
+            .to_request(),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(
+        body["flash"].as_str(),
+        Some("timeout"),
+        "the timeout alert key rides the redirect: {body}"
+    );
+    assert_eq!(
+        body["timedout"], true,
+        "the timedout marker rides the SAME redirect (failure_app.rb:137): {body}"
+    );
+}

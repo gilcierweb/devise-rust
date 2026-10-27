@@ -29,10 +29,10 @@ use devise_rust::time::Clock;
 use devise_rust_axum::{DeviseLayer, DeviseWebState, devise_for_router, session_manager_layer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use tower_sessions::service::SessionManagerLayer;
+use tower_sessions::service::SignedCookie;
 use tower_sessions::session::{Id, Record};
 use tower_sessions::session_store::SessionStore;
-use tower_sessions::service::SignedCookie;
-use tower_sessions::service::SessionManagerLayer;
 use tower_sessions::{MemoryStore, Session, session_store};
 
 pub use devise_rust::adapter::OrmAdapter as OrmAdapterTrait;
@@ -692,6 +692,30 @@ pub fn flash_keys_from_cookies(cookies: &[String], config: &DeviseConfig) -> Vec
         .collect()
 }
 
+/// Verify the signed `devise.flash.timedout` marker cookie among captured
+/// `Set-Cookie` pairs: Devise stages the marker BESIDE the timeout alert
+/// (`failure_app.rb:137`: `flash[:timedout] = true`), so the pair must ride
+/// the failure response together.
+pub fn timedout_marker_from_cookies(cookies: &[String], config: &DeviseConfig) -> bool {
+    let key = devise_rust_axum::callbacks::derive_session_key(&config.secret_key)
+        .expect("flash key derives");
+    cookies
+        .iter()
+        .filter_map(|pair| {
+            let value = pair.strip_prefix("devise.flash.timedout=")?;
+            let value = value.split(';').next()?;
+            let mut jar = cookie::CookieJar::new();
+            jar.add_original(cookie::Cookie::new(
+                "devise.flash.timedout",
+                value.to_string(),
+            ));
+            jar.signed(&key)
+                .get("devise.flash.timedout")
+                .map(|cookie| cookie.value().to_string())
+        })
+        .any(|value| value == "true")
+}
+
 /// The test configuration with fast `stretches` (4) and a fixed 32-byte secret.
 pub fn test_config() -> DeviseConfig {
     DeviseConfig {
@@ -699,6 +723,15 @@ pub fn test_config() -> DeviseConfig {
         stretches: 4,
         ..DeviseConfig::default()
     }
+}
+
+/// The default mapping plus `Module::Timeoutable`: core registers the
+/// per-request timeout tick hook only when the module is on the mapping,
+/// so the timeoutable flow fixtures need the module present.
+pub fn timeout_mapping() -> Mapping {
+    let mut mapping = default_mapping();
+    mapping.modules.push(Module::Timeoutable);
+    mapping
 }
 
 /// Default mapping builder (full module matrix), with overrides applied.
@@ -840,15 +873,29 @@ pub fn build_app(state: TestState) -> (TestState, Router) {
     devise_app(state, session_layer)
 }
 
+/// [`build_app`] over a caller-chosen mailer: the failing-mailer fixtures
+/// need the full standard stack with delivery errors, so only the mailer
+/// type differs from [`TestState`].
+pub fn build_app_with_mailer<L>(
+    state: DeviseWebState<FixtureUser, IdAssigningAdapter, L>,
+) -> (DeviseWebState<FixtureUser, IdAssigningAdapter, L>, Router)
+where
+    L: devise_rust::mailer::Mailer<FixtureUser> + Send + Sync + 'static,
+{
+    let session_layer = session_manager_layer(&state.config).expect("session layer builds");
+    devise_app(state, session_layer)
+}
+
 /// [`build_app`] over an EXPLICIT session layer: the failure-path fixtures
 /// drive the renewal gates through a store whose `cycle_id` budget is spent
 /// (SESS-05 / D-04 propagation assertions).
-fn devise_app<S>(
-    state: TestState,
+fn devise_app<S, L>(
+    state: DeviseWebState<FixtureUser, IdAssigningAdapter, L>,
     session_layer: SessionManagerLayer<S, SignedCookie>,
-) -> (TestState, Router)
+) -> (DeviseWebState<FixtureUser, IdAssigningAdapter, L>, Router)
 where
     S: SessionStore + Clone,
+    L: devise_rust::mailer::Mailer<FixtureUser> + Send + Sync + 'static,
 {
     let mut hooks = HookRegistry::new();
     devise_rust::hooks::register_devise_hooks(&mut hooks, &state.mapping);
@@ -898,9 +945,40 @@ where
                 async move { bypass_sign_out_probe(config, session).await }
             }),
         )
+        .route(
+            "/devise-test/age-tick",
+            axum::routing::get(
+                |session: Session,
+                 Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                    age_tick_probe(session, &query).await
+                },
+            ),
+        )
         .layer(devise_layer)
         .layer(session_layer);
     (state, app)
+}
+
+/// Age the scope's timeoutable `last_request_at` tick far past the default
+/// 30-minute `timeout_in` (the timeoutable flow fixtures sign in normally,
+/// then stale the tick through this probe so the NEXT request times out).
+async fn age_tick_probe(
+    session: Session,
+    query: &std::collections::HashMap<String, String>,
+) -> StatusCode {
+    let scope = query
+        .get("scope")
+        .cloned()
+        .unwrap_or_else(|| "user".to_string());
+    let stale = SystemClock.now().timestamp() - 7200;
+    session
+        .insert_value(
+            &devise_rust::timeoutable::last_request_at_key(&scope),
+            serde_json::json!(stale),
+        )
+        .await
+        .expect("tick ages");
+    StatusCode::OK
 }
 
 // ============================================================================

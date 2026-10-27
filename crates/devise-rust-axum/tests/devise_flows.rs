@@ -2643,10 +2643,8 @@ async fn flow_sign_up_runs_the_sign_in_pipeline_with_trackable() {
 #[tokio::test]
 async fn flow_account_update_failed_renewal_answers_internal_error() {
     let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (state, app) = common::build_app_with_cycle_switch(
-        common::test_state(default_mapping()),
-        closed.clone(),
-    );
+    let (state, app) =
+        common::build_app_with_cycle_switch(common::test_state(default_mapping()), closed.clone());
     seed_user(&state, "renew-update@example.com", "secret123").await;
     let mut jar = Jar::new();
 
@@ -2678,8 +2676,7 @@ async fn flow_account_update_failed_renewal_answers_internal_error() {
     );
     let cookies = set_cookie_pairs(&resp);
     assert!(
-        !common::flash_keys_from_cookies(&cookies, &state.config)
-            .contains(&"updated".to_string()),
+        !common::flash_keys_from_cookies(&cookies, &state.config).contains(&"updated".to_string()),
         "no success flash may survive a failed renewal: {cookies:?}"
     );
 }
@@ -2689,10 +2686,8 @@ async fn flow_account_update_failed_renewal_answers_internal_error() {
 #[tokio::test]
 async fn flow_registrations_destroy_failed_renewal_answers_internal_error() {
     let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (state, app) = common::build_app_with_cycle_switch(
-        common::test_state(default_mapping()),
-        closed.clone(),
-    );
+    let (state, app) =
+        common::build_app_with_cycle_switch(common::test_state(default_mapping()), closed.clone());
     seed_user(&state, "renew-destroy@example.com", "secret123").await;
     let mut jar = Jar::new();
 
@@ -2729,10 +2724,8 @@ async fn flow_registrations_destroy_failed_renewal_answers_internal_error() {
 #[tokio::test]
 async fn flow_passwords_update_failed_renewal_answers_internal_error() {
     let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (state, app) = common::build_app_with_cycle_switch(
-        common::test_state(default_mapping()),
-        closed.clone(),
-    );
+    let (state, app) =
+        common::build_app_with_cycle_switch(common::test_state(default_mapping()), closed.clone());
     seed_user(&state, "renew-reset@example.com", "secret123").await;
     let token = reset_token_for(&state, &app, "renew-reset@example.com").await;
 
@@ -2746,10 +2739,207 @@ async fn flow_passwords_update_failed_renewal_answers_internal_error() {
     );
     let cookies = set_cookie_pairs(&resp);
     assert!(
-        !common::flash_keys_from_cookies(&cookies, &state.config)
-            .contains(&"updated".to_string())
+        !common::flash_keys_from_cookies(&cookies, &state.config).contains(&"updated".to_string())
             && !common::flash_keys_from_cookies(&cookies, &state.config)
                 .contains(&"updated_not_active".to_string()),
         "no success flash may survive a failed renewal: {cookies:?}"
+    );
+}
+
+// ============================================================================
+// 261026-ghh controller drift sweep: mailer failure, no_token target, and
+// the timeout flash pair (the `timedout` marker Devise stages beside the
+// `timeout` alert, failure_app.rb:137).
+// ============================================================================
+
+/// A mailer whose every delivery fails (the "SMTP down" stand-in, mirroring
+/// the actix `FailingMailer` fixture).
+#[derive(Default)]
+struct FailingMailer;
+
+impl devise_rust::mailer::Mailer<FixtureUser> for FailingMailer {
+    fn confirmation_instructions(
+        &self,
+        _record: &FixtureUser,
+        _token: Option<&str>,
+        _context: &devise_rust::mailer::MailerContext,
+    ) -> Result<String, devise_rust::error::DeviseError> {
+        Err(devise_rust::error::DeviseError::Mailer(
+            "SMTP unavailable (test)".to_string(),
+        ))
+    }
+
+    fn reset_password_instructions(
+        &self,
+        _record: &FixtureUser,
+        _token: Option<&str>,
+        _context: &devise_rust::mailer::MailerContext,
+    ) -> Result<String, devise_rust::error::DeviseError> {
+        Err(devise_rust::error::DeviseError::Mailer(
+            "SMTP unavailable (test)".to_string(),
+        ))
+    }
+
+    fn unlock_instructions(
+        &self,
+        _record: &FixtureUser,
+        _token: Option<&str>,
+        _context: &devise_rust::mailer::MailerContext,
+    ) -> Result<String, devise_rust::error::DeviseError> {
+        Err(devise_rust::error::DeviseError::Mailer(
+            "SMTP unavailable (test)".to_string(),
+        ))
+    }
+
+    fn email_changed(
+        &self,
+        _record: &FixtureUser,
+        _token: Option<&str>,
+        _context: &devise_rust::mailer::MailerContext,
+    ) -> Result<String, devise_rust::error::DeviseError> {
+        Err(devise_rust::error::DeviseError::Mailer(
+            "SMTP unavailable (test)".to_string(),
+        ))
+    }
+
+    fn password_change(
+        &self,
+        _record: &FixtureUser,
+        _token: Option<&str>,
+        _context: &devise_rust::mailer::MailerContext,
+    ) -> Result<String, devise_rust::error::DeviseError> {
+        Err(devise_rust::error::DeviseError::Mailer(
+            "SMTP unavailable (test)".to_string(),
+        ))
+    }
+}
+
+/// Devise propagates a failed confirmation delivery after sign-up as a 500
+/// (Rails renders the raised delivery error): swallowing it behind an
+/// eprintln turns a broken mailer into silent "check your inbox" dead air.
+#[tokio::test]
+async fn flow_sign_up_with_failing_mailer_answers_internal_error() {
+    use devise_rust_axum::DeviseWebState;
+
+    type FailingState = DeviseWebState<FixtureUser, common::IdAssigningAdapter, FailingMailer>;
+
+    let state = FailingState::new(
+        common::default_mapping(),
+        common::registry_with(std::slice::from_ref(&common::default_mapping())),
+        std::sync::Arc::new(common::test_config()),
+        std::sync::Arc::new(common::IdAssigningAdapter::new()),
+        std::sync::Arc::new(FailingMailer),
+        std::sync::Arc::new(SystemClock),
+    )
+    .expect("failing-mailer state builds");
+    let (_state, app) = common::build_app_with_mailer(state);
+
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/users")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::from(
+                "user[email]=m-mailer%40example.com&user[password]=secret123&user[password_confirmation]=secret123",
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a failed confirmation delivery must NOT report a successful sign-up"
+    );
+}
+
+/// Devise's `assert_reset_token_passed` (`passwords_controller.rb:65-70`)
+/// redirects a blank-token edit to `new_session_path`, NOT to the site
+/// root: the user must land on the sign-in form with the `no_token` alert.
+#[tokio::test]
+async fn flow_passwords_edit_without_token_redirects_to_sign_in_path() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping()));
+
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/users/password/edit")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let location = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        location, "/users/sign_in",
+        "a missing reset token redirects to the scope sign-in path, not /"
+    );
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"no_token".to_string()),
+        "the no_token alert rides the redirect: {cookies:?}"
+    );
+}
+
+/// A session the timeoutable hook expires fails with the Devise timeout
+/// flash PAIR: the `timeout` alert key and the `timedout` marker
+/// (`failure_app.rb:135-139` stages both; the marker is how a later
+/// failure knows to keep the pair).
+#[tokio::test]
+async fn flow_timeout_failure_carries_timeout_flash_and_marker() {
+    let (state, app) = common::build_app(common::test_state(common::timeout_mapping()));
+    seed_user(&state, "timedout@example.com", "secret123").await;
+    let mut jar = Jar::new();
+
+    let resp = form_sign_in(&app, "timedout@example.com", "secret123").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    jar.merge(&resp);
+
+    // Age the timeoutable tick far past the default 30-minute window.
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/devise-test/age-tick?scope=user")
+            .header(header::COOKIE, jar.header())
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert!(resp.status().is_success(), "age probe reachable");
+    jar.merge(&resp);
+
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/users_dashboard")
+            .header(header::COOKIE, jar.header())
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "an expired session answers the navigational timeout redirect"
+    );
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"timeout".to_string()),
+        "the timeout alert key rides the redirect: {cookies:?}"
+    );
+    assert!(
+        common::timedout_marker_from_cookies(&cookies, &state.config),
+        "the timedout marker rides the SAME redirect (failure_app.rb:137): {cookies:?}"
     );
 }
