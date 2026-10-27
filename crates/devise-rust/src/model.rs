@@ -2057,8 +2057,11 @@ mod tests {
         }
 
         fn password_required(&self) -> bool {
-            self.password_required_override
-                .unwrap_or_else(|| !self.persisted() || self.password().is_some() || self.password_confirmation().is_some())
+            self.password_required_override.unwrap_or_else(|| {
+                !self.persisted()
+                    || self.password().is_some()
+                    || self.password_confirmation().is_some()
+            })
         }
     }
 
@@ -2528,9 +2531,27 @@ mod tests {
         DatabaseAuthenticatable::update_without_password(&mut plain, &mut params, &config);
         assert_eq!(plain.encrypted_password, encrypted_before);
         assert_eq!(plain.email, "safe@example.com");
+    }
 
-        // find_for_database_authentication routes through find_for_authentication (DBAU-10).
-        // (Runs before the destroy checks below: the record must exist.)
+    /// The lookup and destroy half of the `DatabaseAuthenticatable` surface:
+    /// `find_for_database_authentication` routes through
+    /// `find_for_authentication` (DBAU-10), `destroy_with_password` refuses a
+    /// wrong password and destroys on the valid one (DBAU-05; the full
+    /// three-way outcome split is pinned in
+    /// `destroy_with_password_error_surface`), and the
+    /// `after_database_authentication` hook defaults to a no-op (DBAU-07).
+    #[tokio::test]
+    async fn database_authenticatable_lookup_and_destroy() {
+        let config = DeviseConfig {
+            stretches: 4,
+            send_email_changed_notification: true,
+            send_password_change_notification: true,
+            ..DeviseConfig::default()
+        };
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let user = TestUser::testing("secret123", &config);
+        adapter.create(user.clone()).await.unwrap();
+
         let mut conditions = Conditions::new();
         conditions.insert(
             "email",
@@ -2540,9 +2561,6 @@ mod tests {
             TestUser::find_for_database_authentication(&conditions, &adapter, &config).await;
         assert_eq!(found.map(|u| u.id), Some(1));
 
-        // destroy_with_password refuses a wrong password and destroys on the
-        // valid one (DBAU-05); the full three-way outcome split is pinned in
-        // `destroy_with_password_error_surface`.
         assert!(
             matches!(
                 DatabaseAuthenticatable::destroy_with_password(&user, "wrong", &adapter, &config)
@@ -2554,9 +2572,14 @@ mod tests {
         );
         assert!(
             matches!(
-                DatabaseAuthenticatable::destroy_with_password(&user, "secret123", &adapter, &config)
-                    .await
-                    .unwrap(),
+                DatabaseAuthenticatable::destroy_with_password(
+                    &user,
+                    "secret123",
+                    &adapter,
+                    &config
+                )
+                .await
+                .unwrap(),
                 DestroyOutcome::Destroyed
             ),
             "the valid current password destroys the record"
@@ -2569,7 +2592,6 @@ mod tests {
                 .is_none()
         );
 
-        // after_database_authentication hook exists and defaults to no-op (DBAU-07).
         DatabaseAuthenticatable::after_database_authentication(&user);
     }
 
@@ -2610,10 +2632,14 @@ mod tests {
         let wrong_adapter = MemoryAdapter::<TestUser>::new();
         let wrong = TestUser::testing("secret123", &config);
         wrong_adapter.create(wrong.clone()).await.unwrap();
-        let outcome =
-            DatabaseAuthenticatable::destroy_with_password(&wrong, "other", &wrong_adapter, &config)
-                .await
-                .unwrap();
+        let outcome = DatabaseAuthenticatable::destroy_with_password(
+            &wrong,
+            "other",
+            &wrong_adapter,
+            &config,
+        )
+        .await
+        .unwrap();
         let DestroyOutcome::Refused(errors) = outcome else {
             panic!("a wrong password must refuse, got {outcome:?}");
         };
@@ -2637,7 +2663,10 @@ mod tests {
             let kept = TestUser::testing("secret123", &config);
             blank_adapter.create(kept.clone()).await.unwrap();
             let outcome = DatabaseAuthenticatable::destroy_with_password(
-                &kept, blank, &blank_adapter, &config,
+                &kept,
+                blank,
+                &blank_adapter,
+                &config,
             )
             .await
             .unwrap();

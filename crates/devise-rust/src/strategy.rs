@@ -252,13 +252,9 @@ impl Default for ParamsStrategy {
 /// this predicate inside its own `valid?` gate, and the params strategy gets
 /// the same answer as the by-product of the merge.
 fn request_keys_present(request: &AuthRequest, config: &DeviseConfig) -> bool {
-    config
-        .request_keys
-        .iter()
-        .all(|key| {
-            crate::model::value_present(request.request_values.get(key).map(String::as_str))
-                .is_some()
-        })
+    config.request_keys.iter().all(|key| {
+        crate::model::value_present(request.request_values.get(key).map(String::as_str)).is_some()
+    })
 }
 
 /// Merge Devise's `request_keys` lookup conditions into the authentication
@@ -362,9 +358,7 @@ impl Strategy for ParamsStrategy {
         // fatal to the chain.
         config.params_authenticatable
             && request.flags.allow_params_authentication
-            && self
-                .credentials(request, &mapping.name, config)
-                .is_some()
+            && self.credentials(request, &mapping.name, config).is_some()
     }
 
     /// Devise's `:params_auth` slot in `skip_session_storage`.
@@ -1104,7 +1098,8 @@ mod tests {
         let strategy = ParamsStrategy::default();
         // The params carry a stranger's address; the request snapshot carries
         // the seeded one, so the merge must win on the later parse.
-        let mut request = params_request(&[("email", "wrong@example.com"), ("password", "secret123")]);
+        let mut request =
+            params_request(&[("email", "wrong@example.com"), ("password", "secret123")]);
         request
             .request_values
             .insert("email".to_string(), "test@example.com".to_string());
@@ -1162,7 +1157,8 @@ mod tests {
         };
         let finder = seeded_finder(&config).await;
         let strategy = ParamsStrategy::default();
-        let mut request = params_request(&[("email", "test@example.com"), ("password", "secret123")]);
+        let mut request =
+            params_request(&[("email", "test@example.com"), ("password", "secret123")]);
         request
             .request_values
             .insert("subdomain".to_string(), "   ".to_string());

@@ -627,7 +627,11 @@ fn build_auth_request(req: &ServiceRequest, scope: Option<&str>) -> AuthRequest 
 /// the values are otherwise inert.
 fn request_values_from(req: &ServiceRequest, peer_addr: Option<&str>) -> HashMap<String, String> {
     let mut values = HashMap::new();
-    if let Some(host) = req.headers().get("host").and_then(|value| value.to_str().ok()) {
+    if let Some(host) = req
+        .headers()
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+    {
         values.insert("host".to_string(), host.to_string());
     }
     if let Some(peer) = peer_addr {

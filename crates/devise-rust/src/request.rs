@@ -463,10 +463,7 @@ impl AuthRequest {
     /// assert_eq!(request.request_values.get("host").map(String::as_str), Some("app.example.com"));
     /// ```
     #[must_use]
-    pub fn request_values(
-        mut self,
-        values: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
+    pub fn request_values(mut self, values: impl IntoIterator<Item = (String, String)>) -> Self {
         self.request_values.extend(values);
         self
     }

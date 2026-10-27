@@ -284,7 +284,9 @@ async fn flow_sign_in_request_keys_missing_aborts_before_lookup() {
     let resp = form_sign_in(&app, "flow-rk@example.com", "secret123").await;
     assert_eq!(resp.status(), StatusCode::FOUND);
     assert_eq!(
-        resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
         Some("/users/sign_in"),
         "the navigational failure path redirects back to the sign-in form"
     );

@@ -942,11 +942,7 @@ where
     // On failure the generic `invalid` failure is reported (not
     // `not_found_in_database`): no lookup ran, so nothing is known about the
     // account either way.
-    if !devise_rust::strategy::merge_request_keys(
-        &mut conditions,
-        &auth_request,
-        &st.config,
-    ) {
+    if !devise_rust::strategy::merge_request_keys(&mut conditions, &auth_request, &st.config) {
         return auth_fail(&auth_request, &st, "invalid");
     }
     let Some(mut record) =

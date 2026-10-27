@@ -83,9 +83,7 @@ fn staged_request(req: &HttpRequest) -> AuthRequest {
         request.request_values.insert("host".to_string(), host);
     }
     if let Some(peer) = req.connection_info().peer_addr().map(str::to_string) {
-        request
-            .request_values
-            .insert("remote_ip".to_string(), peer);
+        request.request_values.insert("remote_ip".to_string(), peer);
     }
     request
 }

@@ -278,7 +278,12 @@ async fn flow_sign_in_request_keys_missing_aborts_before_lookup() {
     // the generic invalid failure is reported.
     let resp = form_sign_in(&app, "flow-rk@example.com", "secret123").await;
     assert_eq!(resp.status(), 302);
-    assert_eq!(resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()), Some("/users/sign_in"));
+    assert_eq!(
+        resp.headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/users/sign_in")
+    );
     jar_assert_anon(&app, &resp, "a missing request key must abort the sign in").await;
     assert_eq!(
         common::flash_of(&app, &session_cookie(&resp))

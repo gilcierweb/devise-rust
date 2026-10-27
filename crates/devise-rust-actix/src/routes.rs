@@ -576,11 +576,8 @@ where
                 req.path().to_string(),
             )
         });
-    if !devise_rust::strategy::merge_request_keys(
-        &mut conditions,
-        &staged_snapshot,
-        &state.config,
-    ) {
+    if !devise_rust::strategy::merge_request_keys(&mut conditions, &staged_snapshot, &state.config)
+    {
         return auth_fail(&req, &session, &state.mapping, "invalid");
     }
     let Some(mut record) =
