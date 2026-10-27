@@ -242,6 +242,63 @@ impl Default for ParamsStrategy {
     }
 }
 
+/// Whether every Devise `request_keys` entry resolves to a present,
+/// non-blank value on the request snapshot.
+///
+/// The shared presence half of [`merge_request_keys`]: Devise's
+/// `parse_authentication_key_values` (over `request_values`) returns false on
+/// the first blank or missing key, which makes `with_authentication_hash`
+/// false and the strategy simply not valid. The HTTP Basic strategy consults
+/// this predicate inside its own `valid?` gate, and the params strategy gets
+/// the same answer as the by-product of the merge.
+fn request_keys_present(request: &AuthRequest, config: &DeviseConfig) -> bool {
+    config
+        .request_keys
+        .iter()
+        .all(|key| {
+            crate::model::value_present(request.request_values.get(key).map(String::as_str))
+                .is_some()
+        })
+}
+
+/// Merge Devise's `request_keys` lookup conditions into the authentication
+/// conditions (core translation of `parse_authentication_key_values` over
+/// `request_values`, `strategies/authenticatable.rb:157-167`).
+///
+/// Devise builds the authentication hash in two parse passes
+/// (`with_authentication_hash`): the params (or HTTP Basic) keys first, then
+/// the request-derived keys, so a same-named request value OVERWRITES a param
+/// value (later parse wins). Each pass reports failure on the first key whose
+/// value is missing or blank, and that failure makes the whole strategy not
+/// apply rather than widening the lookup: a configured request key is a
+/// REQUIRED lookup condition, never an optional refinement.
+///
+/// Returns `false` when any configured request key is missing or blank, in
+/// which case the caller must not run a find (the strategy does not apply).
+///
+/// Every listed key is enforced here: this port's `request_keys` is a
+/// `Vec<String>`, which has no equivalent of Devise's `{key => enforce}`
+/// Hash form that lets an app opt a key out of enforcement.
+///
+/// Values are inserted RAW (no `ParameterFilter` normalization): Devise
+/// routes params through the filter, while `request.send(key)` values enter
+/// the authentication hash unnormalized.
+pub fn merge_request_keys(
+    conditions: &mut Conditions,
+    request: &AuthRequest,
+    config: &DeviseConfig,
+) -> bool {
+    for key in &config.request_keys {
+        match crate::model::value_present(request.request_values.get(key).map(String::as_str)) {
+            Some(value) => {
+                conditions.insert(key.clone(), Value::String(value.to_string()));
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
 impl ParamsStrategy {
     /// Attach the failed-attempt sink (builder).
     #[must_use]
@@ -256,7 +313,20 @@ impl ParamsStrategy {
 
 impl ParamsStrategy {
     /// Collect identity conditions plus the password for a scope.
-    fn credentials(&self, request: &AuthRequest, scope: &str) -> Option<(Conditions, String)> {
+    ///
+    /// Returns `None` when any required input is missing: an authentication
+    /// key or the password is absent from the params, or a configured
+    /// `request_keys` entry is missing or blank on the request snapshot
+    /// ([`merge_request_keys`]). In Devise the last case is
+    /// `with_authentication_hash` returning false inside `valid?`, so the
+    /// strategy does not apply at all instead of running a find
+    /// (`strategies/authenticatable.rb:79` and `:128-134`).
+    fn credentials(
+        &self,
+        request: &AuthRequest,
+        scope: &str,
+        config: &DeviseConfig,
+    ) -> Option<(Conditions, String)> {
         let mut conditions = Conditions::new();
         let mut found = false;
         for key in &self.authentication_keys {
@@ -273,6 +343,12 @@ impl ParamsStrategy {
         if !found {
             return None;
         }
+        // Devise's second parse pass over the request-derived keys: the
+        // values overwrite a same-named param condition (later parse wins),
+        // and a missing or blank required key fails the parse.
+        if !merge_request_keys(&mut conditions, request, config) {
+            return None;
+        }
         let password = extract_param(request, scope, "password")?;
         Some((conditions, password))
     }
@@ -286,7 +362,9 @@ impl Strategy for ParamsStrategy {
         // fatal to the chain.
         config.params_authenticatable
             && request.flags.allow_params_authentication
-            && self.credentials(request, &mapping.name).is_some()
+            && self
+                .credentials(request, &mapping.name, config)
+                .is_some()
     }
 
     /// Devise's `:params_auth` slot in `skip_session_storage`.
@@ -301,7 +379,7 @@ impl Strategy for ParamsStrategy {
         finder: &dyn ModelFinder,
         config: &DeviseConfig,
     ) -> Result<AuthOutcome, Failure> {
-        let Some((conditions, password)) = self.credentials(request, &mapping.name) else {
+        let Some((conditions, password)) = self.credentials(request, &mapping.name, config) else {
             return Ok(AuthOutcome::Pass);
         };
         let Some(mut user) = finder
@@ -419,7 +497,11 @@ impl Strategy for HttpBasicStrategy {
         if request.is_xhr() && !self.http_authenticatable_on_xhr {
             return false;
         }
-        true
+        // Devise runs `with_authentication_hash` inside `valid?`
+        // (`valid_for_http_auth?`, `strategies/authenticatable.rb:64-67`), so
+        // a missing or blank required request key makes this strategy not
+        // apply exactly as it does for the params strategy.
+        request_keys_present(request, config)
     }
 
     /// Devise's `:http_auth` slot - the default member of
@@ -455,6 +537,14 @@ impl Strategy for HttpBasicStrategy {
         );
         let mut conditions = Conditions::new();
         conditions.insert(key, Value::String(username));
+        // Devise's second parse pass over the request-derived keys runs
+        // inside `with_authentication_hash` before `authenticate!` is ever
+        // reached, so a missing or blank required key can only surface here
+        // as a defense in depth: pass through instead of widening the lookup
+        // (`strategies/authenticatable.rb:147-167`).
+        if !merge_request_keys(&mut conditions, request, config) {
+            return Ok(AuthOutcome::Pass);
+        }
         let Some(user) = finder
             .find_first_boxed(&conditions)
             .await
@@ -995,6 +1085,147 @@ mod tests {
         assert_eq!(
             FailureReason::NotFoundInDatabase.flash_key(),
             "not_found_in_database"
+        );
+    }
+
+    /// Devise's `request_keys` second parse pass
+    /// (`strategies/authenticatable.rb:157-167`, integration contract
+    /// `authenticatable_test.rb:579-608`): a request-derived value joins the
+    /// authentication hash AFTER the params keys, so it OVERWRITES a
+    /// same-named param value, and the lookup then finds the record the
+    /// request-derived value names.
+    #[tokio::test]
+    async fn test_request_keys_params_value_overwrites_param_value() {
+        let config = DeviseConfig {
+            request_keys: vec!["email".to_string()],
+            ..test_config()
+        };
+        let finder = seeded_finder(&config).await;
+        let strategy = ParamsStrategy::default();
+        // The params carry a stranger's address; the request snapshot carries
+        // the seeded one, so the merge must win on the later parse.
+        let mut request = params_request(&[("email", "wrong@example.com"), ("password", "secret123")]);
+        request
+            .request_values
+            .insert("email".to_string(), "test@example.com".to_string());
+        assert!(
+            strategy.valid(&request, &test_mapping(), &config).await,
+            "a present request key keeps the strategy valid"
+        );
+        match strategy
+            .authenticate(&request, &test_mapping(), &finder, &config)
+            .await
+        {
+            Ok(AuthOutcome::Success(user)) => {
+                assert_eq!(user.to_key(), crate::adapter::DeviseKey::from_i64(1));
+            }
+            other => panic!("expected the request-key lookup to succeed, got {other:?}"),
+        }
+    }
+
+    /// A configured `request_keys` entry with no value on the request is a
+    /// MISSING lookup condition: Devise's second parse pass returns false,
+    /// `valid?` reports false, and the chain fails with the generic invalid
+    /// failure instead of looking the params email up (integration test
+    /// `authenticatable_test.rb:600`).
+    #[tokio::test]
+    async fn test_request_keys_missing_value_makes_params_strategy_not_valid() {
+        let config = DeviseConfig {
+            request_keys: vec!["subdomain".to_string()],
+            ..test_config()
+        };
+        let finder = seeded_finder(&config).await;
+        let strategy = ParamsStrategy::default();
+        // Correct credentials, still refused: the missing key aborts the parse.
+        let request = params_request(&[("email", "test@example.com"), ("password", "secret123")]);
+        assert!(
+            !strategy.valid(&request, &test_mapping(), &config).await,
+            "a missing request key must make the strategy not apply"
+        );
+        let outcome = strategy
+            .authenticate(&request, &test_mapping(), &finder, &config)
+            .await;
+        assert!(
+            matches!(outcome, Ok(AuthOutcome::Pass)),
+            "the strategy must never reach a find: {outcome:?}"
+        );
+    }
+
+    /// Devise's `presence` check treats a whitespace-only request value as
+    /// missing (Ruby `blank?`), so `"   "` aborts the parse exactly as an
+    /// absent key does (integration test at `authenticatable_test.rb:600`).
+    #[tokio::test]
+    async fn test_request_keys_blank_value_behaves_like_missing() {
+        let config = DeviseConfig {
+            request_keys: vec!["subdomain".to_string()],
+            ..test_config()
+        };
+        let finder = seeded_finder(&config).await;
+        let strategy = ParamsStrategy::default();
+        let mut request = params_request(&[("email", "test@example.com"), ("password", "secret123")]);
+        request
+            .request_values
+            .insert("subdomain".to_string(), "   ".to_string());
+        assert!(!strategy.valid(&request, &test_mapping(), &config).await);
+        let outcome = strategy
+            .authenticate(&request, &test_mapping(), &finder, &config)
+            .await;
+        assert!(
+            matches!(outcome, Ok(AuthOutcome::Pass)),
+            "a blank request key must not reach a find: {outcome:?}"
+        );
+    }
+
+    /// HTTP Basic reads the same request-key set
+    /// (`strategies/authenticatable.rb:64-67`): a present request value
+    /// overwrites the Basic username condition, and a missing one makes the
+    /// strategy not valid at all.
+    #[tokio::test]
+    async fn test_request_keys_http_basic_value_overwrites_and_missing_aborts() {
+        use base64::Engine as _;
+        let config = DeviseConfig {
+            http_authenticatable: true,
+            request_keys: vec!["email".to_string()],
+            ..test_config()
+        };
+        let finder = seeded_finder(&config).await;
+        let strategy = HttpBasicStrategy::default();
+        let mapping = test_mapping();
+        let raw = base64::engine::general_purpose::STANDARD.encode("wrong@example.com:secret123");
+        let mut request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
+        request
+            .headers
+            .insert("authorization".to_string(), format!("Basic {raw}"));
+        request
+            .request_values
+            .insert("email".to_string(), "test@example.com".to_string());
+        assert!(strategy.valid(&request, &mapping, &config).await);
+        match strategy
+            .authenticate(&request, &mapping, &finder, &config)
+            .await
+        {
+            Ok(AuthOutcome::Success(user)) => {
+                assert_eq!(user.to_key(), crate::adapter::DeviseKey::from_i64(1));
+            }
+            other => panic!("expected the request-key lookup to succeed, got {other:?}"),
+        }
+
+        // Same header, key configured to a value the request never carries:
+        // the strategy does not apply, so no find runs.
+        let absent = DeviseConfig {
+            request_keys: vec!["subdomain".to_string()],
+            ..config
+        };
+        assert!(
+            !strategy.valid(&request, &mapping, &absent).await,
+            "a missing request key must make the Basic strategy not apply"
+        );
+        let outcome = strategy
+            .authenticate(&request, &mapping, &finder, &absent)
+            .await;
+        assert!(
+            matches!(outcome, Ok(AuthOutcome::Pass)),
+            "the Basic strategy must never reach a find: {outcome:?}"
         );
     }
 

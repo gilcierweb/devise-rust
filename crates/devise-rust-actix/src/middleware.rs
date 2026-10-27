@@ -605,6 +605,8 @@ fn build_auth_request(req: &ServiceRequest, scope: Option<&str>) -> AuthRequest 
     // any proxy-supplied header.
     let peer_addr = req.connection_info().peer_addr().map(str::to_string);
 
+    let request_values = request_values_from(req, peer_addr.as_deref());
+
     AuthRequest {
         method,
         path: req.path().to_string(),
@@ -614,5 +616,22 @@ fn build_auth_request(req: &ServiceRequest, scope: Option<&str>) -> AuthRequest 
         query: params,
         flags,
         peer_addr,
+        request_values,
     }
+}
+
+/// Bridge the Devise request-object methods `request_keys` reads
+/// (`strategies/authenticatable.rb:151-155`): `request.host` from the Host
+/// header and `request.remote_ip` from the socket peer (D-20: never a proxy
+/// header). The map travels with the snapshot into the controller merge, so
+/// the values are otherwise inert.
+fn request_values_from(req: &ServiceRequest, peer_addr: Option<&str>) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    if let Some(host) = req.headers().get("host").and_then(|value| value.to_str().ok()) {
+        values.insert("host".to_string(), host.to_string());
+    }
+    if let Some(peer) = peer_addr {
+        values.insert("remote_ip".to_string(), peer.to_string());
+    }
+    values
 }

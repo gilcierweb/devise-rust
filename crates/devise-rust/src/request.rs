@@ -126,6 +126,30 @@ pub struct AuthRequest {
     /// forged header can never reach `update_tracked_fields`. Proxy-aware
     /// IP resolution is a future opt-in, not this phase.
     pub peer_addr: Option<String>,
+    /// Request-derived values keyed by name, for Devise's `request_keys`
+    /// lookup conditions.
+    ///
+    /// Devise (`strategies/authenticatable.rb:151-155`) reads each configured
+    /// request key off the request object itself (`request.send(key)`, for
+    /// example `request.host` or `request.subdomain`), then merges the result
+    /// into the authentication hash AFTER the params keys
+    /// (`parse_authentication_key_values(auth_values, authentication_keys) &&
+    /// parse_authentication_key_values(request_values, request_keys)`), so a
+    /// same-named request value overwrites the param value.
+    ///
+    /// Rust request types carry no arbitrary `send(key)` methods, so the
+    /// port's translation is a bridge-populated map. The two bridges populate
+    /// exactly two keys with their Devise request-object mappings: `host`
+    /// from the `Host` header (`request.host`) and `remote_ip` from the socket
+    /// peer (`request.remote_ip`, the D-20 rule: never a proxy header).
+    ///
+    /// The values are used strictly as DB lookup conditions, never for
+    /// redirects or authorization. They are `#[serde(default)]` so a
+    /// previously recorded snapshot without the field keeps deserializing
+    /// with an empty map, which makes every configured request key fail
+    /// closed exactly as a request that never carried it would.
+    #[serde(default)]
+    pub request_values: HashMap<String, String>,
 }
 
 impl AuthRequest {
@@ -143,6 +167,7 @@ impl AuthRequest {
             query: HashMap::new(),
             flags: RequestFlags::default(),
             peer_addr: None,
+            request_values: HashMap::new(),
         }
     }
 
@@ -395,6 +420,7 @@ pub fn build_auth_request_with_peer(
         query,
         flags,
         peer_addr,
+        request_values: HashMap::new(),
     }
 }
 
@@ -417,6 +443,33 @@ impl AuthRequest {
         self.params.extend(params);
         self
     }
+
+    /// Attach the request-derived values the `request_keys` conditions read.
+    ///
+    /// The bridge populates this map from the framework's request object
+    /// (`request.send(key)` parity, `strategies/authenticatable.rb:151-155`):
+    /// `host` from the Host header and `remote_ip` from the socket peer only.
+    /// Values are stored RAW: Devise routes params through the
+    /// `ParameterFilter` but request-derived values enter the authentication
+    /// hash unnormalized.
+    ///
+    /// == Examples
+    ///
+    /// ```
+    /// use devise_rust::request::{AuthRequest, HttpMethod};
+    ///
+    /// let request = AuthRequest::new(HttpMethod::Get, "/users/sign_in")
+    ///     .request_values([("host".to_string(), "app.example.com".to_string())]);
+    /// assert_eq!(request.request_values.get("host").map(String::as_str), Some("app.example.com"));
+    /// ```
+    #[must_use]
+    pub fn request_values(
+        mut self,
+        values: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.request_values.extend(values);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +490,35 @@ mod tests {
     fn test_http_method_display() {
         assert_eq!(HttpMethod::Get.to_string(), "GET");
         assert_eq!(HttpMethod::Post.to_string(), "POST");
+    }
+
+    /// The `request_values` builder fills the map the `request_keys`
+    /// conditions read (`strategies/authenticatable.rb:151-155`), and the
+    /// field is `#[serde(default)]` so a snapshot recorded before the field
+    /// existed still deserializes (with an empty map, which makes every
+    /// configured request key fail closed rather than panic).
+    #[test]
+    fn test_request_values_builder_and_serde_default() {
+        let request = AuthRequest::new(HttpMethod::Get, "/users/sign_in").request_values([
+            ("host".to_string(), "app.example.com".to_string()),
+            ("remote_ip".to_string(), "203.0.113.7".to_string()),
+        ]);
+        assert_eq!(
+            request.request_values.get("host").map(String::as_str),
+            Some("app.example.com")
+        );
+        assert_eq!(
+            request.request_values.get("remote_ip").map(String::as_str),
+            Some("203.0.113.7")
+        );
+
+        // A hand-written snapshot lacking the field: serde fills the empty map.
+        let snapshot = r#"{"method":"Post","path":"/users/sign_in","headers":{},"params":{},"cookies":{},"query":{},"flags":{"skip_storage":false,"skip_timeout":false,"skip_timeoutable":false,"skip_trackable":false,"allow_params_authentication":true},"peer_addr":null}"#;
+        let restored: AuthRequest = serde_json::from_str(snapshot).expect("snapshot deserializes");
+        assert!(
+            restored.request_values.is_empty(),
+            "the serde default must be an empty map"
+        );
     }
 
     #[test]

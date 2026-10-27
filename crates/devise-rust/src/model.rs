@@ -115,11 +115,11 @@ pub fn normalize_auth_conditions(conditions: &Conditions, config: &DeviseConfig)
 /// guard, and `Validatable::validate` all read this one function so the
 /// definition of "present" cannot drift between the write, the validation,
 /// and the reset paths.
-fn value_present(value: Option<&str>) -> Option<&str> {
+pub(crate) fn value_present(value: Option<&str>) -> Option<&str> {
     value.filter(|item| !item.trim().is_empty())
 }
 
-fn value_blank(value: Option<&str>) -> bool {
+pub(crate) fn value_blank(value: Option<&str>) -> bool {
     value_present(value).is_none()
 }
 
