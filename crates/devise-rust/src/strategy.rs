@@ -308,21 +308,27 @@ impl ParamsStrategy {
 }
 
 impl ParamsStrategy {
-    /// Collect identity conditions plus the password for a scope.
+    /// Collect the identity conditions for a scope.
     ///
     /// Returns `None` when any required input is missing: an authentication
-    /// key or the password is absent from the params, or a configured
-    /// `request_keys` entry is missing or blank on the request snapshot
-    /// ([`merge_request_keys`]). In Devise the last case is
-    /// `with_authentication_hash` returning false inside `valid?`, so the
-    /// strategy does not apply at all instead of running a find
-    /// (`strategies/authenticatable.rb:79` and `:128-134`).
+    /// key absent from the params, or a configured `request_keys` entry
+    /// missing or blank on the request snapshot ([`merge_request_keys`]). In
+    /// Devise the last case is `with_authentication_hash` returning false
+    /// inside `valid?`, so the strategy does not apply at all instead of
+    /// running a find (`strategies/authenticatable.rb:79` and `:128-134`).
+    ///
+    /// The password is deliberately NOT collected here: Devise gates `valid?`
+    /// on the params hash and the required authentication keys only
+    /// (`strategies/authenticatable.rb:17-19`, with `valid_password?` at
+    /// `:118-125` noting it only checks presence, not correctness). A
+    /// password-less POST is a VALID strategy run that fails at
+    /// `authenticate!` time instead of invalidating the strategy.
     fn credentials(
         &self,
         request: &AuthRequest,
         scope: &str,
         config: &DeviseConfig,
-    ) -> Option<(Conditions, String)> {
+    ) -> Option<Conditions> {
         let mut conditions = Conditions::new();
         let mut found = false;
         for key in &self.authentication_keys {
@@ -345,8 +351,7 @@ impl ParamsStrategy {
         if !merge_request_keys(&mut conditions, request, config) {
             return None;
         }
-        let password = extract_param(request, scope, "password")?;
-        Some((conditions, password))
+        Some(conditions)
     }
 }
 
@@ -355,7 +360,9 @@ impl Strategy for ParamsStrategy {
     async fn valid(&self, request: &AuthRequest, mapping: &Mapping, config: &DeviseConfig) -> bool {
         // Devise gates the capability inside `valid?`
         // (`valid_for_params_auth?`): a disabled strategy is skipped, never
-        // fatal to the chain.
+        // fatal to the chain. Password presence is NOT a validity gate
+        // (`strategies/authenticatable.rb:17-19` and `:118-125`): only the
+        // params hash and the required authentication keys decide.
         config.params_authenticatable
             && request.flags.allow_params_authentication
             && self.credentials(request, &mapping.name, config).is_some()
@@ -373,9 +380,21 @@ impl Strategy for ParamsStrategy {
         finder: &dyn ModelFinder,
         config: &DeviseConfig,
     ) -> Result<AuthOutcome, Failure> {
-        let Some((conditions, password)) = self.credentials(request, &mapping.name, config) else {
+        let Some(conditions) = self.credentials(request, &mapping.name, config) else {
             return Ok(AuthOutcome::Pass);
         };
+        // Devise `password.present? && mapping.to.find_for_database_authentication(...)`
+        // (`strategies/database_authenticatable.rb:10`): a blank or absent
+        // password short-circuits the lookup AND the failed-attempt
+        // accounting, failing the unknown-account key. Under paranoid the
+        // `ParanoidStrategy` wrapper converts that to the unified `invalid`
+        // after the dummy hash (`:22-25`): the submitted password was blank,
+        // so hashing the empty string equalizes timing exactly as Devise
+        // hashing the blank password does.
+        if crate::model::value_blank(extract_param(request, &mapping.name, "password").as_deref()) {
+            return Err(Failure::NotFound);
+        }
+        let password = extract_param(request, &mapping.name, "password").unwrap_or_default();
         let Some(mut user) = finder
             .find_first_boxed(&conditions)
             .await
@@ -511,7 +530,7 @@ impl Strategy for HttpBasicStrategy {
         finder: &dyn ModelFinder,
         config: &DeviseConfig,
     ) -> Result<AuthOutcome, Failure> {
-        let Some((username, password)) = request.http_basic_credentials() else {
+        let Some((username, password_opt)) = request.http_basic_credentials() else {
             return Ok(AuthOutcome::Pass);
         };
         let key = self.http_authentication_key.clone().unwrap_or_else(|| {
@@ -539,6 +558,16 @@ impl Strategy for HttpBasicStrategy {
         if !merge_request_keys(&mut conditions, request, config) {
             return Ok(AuthOutcome::Pass);
         }
+        // Same short-circuit as the params arm
+        // (`strategies/database_authenticatable.rb:10`): the password slot of
+        // the Basic hash may be nil or empty (`http_auth_hash`,
+        // `strategies/authenticatable.rb:98-101`), and in that shape the
+        // strategy stays valid while failing the unknown-account key before
+        // any find and before any attempt accounting.
+        if crate::model::value_blank(password_opt.as_deref()) {
+            return Err(Failure::NotFound);
+        }
+        let password = password_opt.unwrap_or_default();
         let Some(user) = finder
             .find_first_boxed(&conditions)
             .await
@@ -1571,6 +1600,175 @@ mod tests {
         assert_eq!(
             ParanoidStrategy::new(ParamsStrategy::default()).id(),
             "params"
+        );
+    }
+
+    /// Spy sink counting how many attempts the strategy chain recorded.
+    struct CountingSink(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::failed_attempt::FailedAttemptSink for CountingSink {
+        async fn record(
+            &self,
+            _key: &DeviseKey,
+            _password_ok: bool,
+        ) -> crate::failed_attempt::AttemptVerdict {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::failed_attempt::AttemptVerdict::Recorded
+        }
+    }
+
+    /// Build an `Authorization: Basic` header over the raw `user:password`
+    /// shape (STANDARD engine, mirroring `test_disabled_strategy_is_skipped_not_fatal`).
+    fn basic_header(raw: &str) -> String {
+        use base64::Engine as _;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        )
+    }
+
+    /// Devise `database_authenticatable.rb:10`: `password.present? && find...`
+    /// short-circuits the lookup, so an absent password on a SEEDED account
+    /// fails with the unknown-account key instead of reaching a find. A running
+    /// lookup would report `InvalidCredentials` for any wrong password, so
+    /// `NotFound` proves no find ran.
+    #[tokio::test]
+    async fn absent_password_params_skips_lookup_and_reports_not_found() {
+        let config = test_config();
+        let finder = seeded_finder(&config).await;
+        let strategy = ParamsStrategy::default();
+        let mapping = test_mapping();
+
+        // No password field at all.
+        let missing = params_request(&[("email", "test@example.com")]);
+        assert!(
+            strategy.valid(&missing, &mapping, &config).await,
+            "an absent password keeps the params strategy valid (authenticatable.rb:17-19)"
+        );
+        let outcome = strategy
+            .authenticate(&missing, &mapping, &finder, &config)
+            .await;
+        assert!(
+            matches!(outcome, Err(Failure::NotFound)),
+            "the blank-password branch must fail before the find: {outcome:?}"
+        );
+
+        // Whitespace-only password: `present?` is trim-aware.
+        let blank = params_request(&[("email", "test@example.com"), ("password", "   ")]);
+        assert!(strategy.valid(&blank, &mapping, &config).await);
+        let outcome = strategy
+            .authenticate(&blank, &mapping, &finder, &config)
+            .await;
+        assert!(
+            matches!(outcome, Err(Failure::NotFound)),
+            "a whitespace-only password takes the same branch: {outcome:?}"
+        );
+    }
+
+    /// `database_authenticatable.rb:22-25`: under paranoid the wrapper
+    /// converts the blank-password `NotFound` into the unified `invalid`
+    /// after the dummy hash.
+    #[tokio::test]
+    async fn absent_password_paranoid_reports_unified_invalid() {
+        let config = paranoid_config();
+        let finder = seeded_finder(&config).await;
+        let strategy = ParanoidStrategy::new(ParamsStrategy::default());
+        let request = params_request(&[("email", "test@example.com")]);
+        let outcome = strategy
+            .authenticate(&request, &test_mapping(), &finder, &config)
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(Failure::InvalidCredentials { message }) if message == "invalid"
+            ),
+            "paranoid masks the blank-password branch: {outcome:?}"
+        );
+    }
+
+    /// Lockable accounting must never run for a blank credential: Devise
+    /// short-circuits before `validate`, so the counter does not move. A
+    /// wrong-password control on the same sink records exactly one attempt.
+    #[tokio::test]
+    async fn absent_password_records_no_failed_attempt() {
+        let config = test_config();
+        let finder = seeded_finder(&config).await;
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let strategy = ParamsStrategy::default()
+            .with_failed_attempt_sink(std::sync::Arc::new(CountingSink(count.clone())));
+        let mapping = test_mapping();
+
+        let blank = params_request(&[("email", "test@example.com"), ("password", "  ")]);
+        let outcome = strategy
+            .authenticate(&blank, &mapping, &finder, &config)
+            .await;
+        assert!(matches!(outcome, Err(Failure::NotFound)));
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a blank credential must not touch the lockable counter"
+        );
+
+        let wrong = params_request(&[("email", "test@example.com"), ("password", "wrong")]);
+        let control = strategy
+            .authenticate(&wrong, &mapping, &finder, &config)
+            .await;
+        assert!(matches!(control, Err(Failure::InvalidCredentials { .. })));
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the wrong-password control still records one attempt"
+        );
+    }
+
+    /// `authenticatable.rb:98-101` plus `:122-125`: the Basic password slot
+    /// may be nil (no colon) or empty, and in both shapes the strategy stays
+    /// valid and fails the unknown-account key.
+    #[tokio::test]
+    async fn absent_password_http_basic_shapes_fail_closed() {
+        let mut config = test_config();
+        config.http_authenticatable = true;
+        let finder = seeded_finder(&config).await;
+        let strategy = HttpBasicStrategy::default();
+        let mapping = test_mapping();
+
+        for raw in ["test@example.com", "test@example.com:"] {
+            let mut request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
+            request
+                .headers
+                .insert("authorization".to_string(), basic_header(raw));
+            assert!(
+                strategy.valid(&request, &mapping, &config).await,
+                "a missing or empty Basic password keeps the strategy valid: {raw}"
+            );
+            let outcome = strategy
+                .authenticate(&request, &mapping, &finder, &config)
+                .await;
+            assert!(
+                matches!(outcome, Err(Failure::NotFound)),
+                "the Basic blank-password branch must fail before the find ({raw}): {outcome:?}"
+            );
+        }
+
+        // Paranoid conversion applies to the Basic arm too.
+        let mut paranoid = paranoid_config();
+        paranoid.http_authenticatable = true;
+        let mut request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
+        request.headers.insert(
+            "authorization".to_string(),
+            basic_header("test@example.com"),
+        );
+        let wrapped = ParanoidStrategy::new(HttpBasicStrategy::default());
+        let outcome = wrapped
+            .authenticate(&request, &mapping, &finder, &paranoid)
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(Failure::InvalidCredentials { message }) if message == "invalid"
+            ),
+            "paranoid masks the Basic blank-password branch: {outcome:?}"
         );
     }
 }

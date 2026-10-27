@@ -278,13 +278,18 @@ impl AuthRequest {
             .is_some_and(|v| v.starts_with("Basic "))
     }
 
-    /// Extract HTTP Basic credentials (username, password)
+    /// Extract HTTP Basic credentials (username, optional password)
     ///
-    /// Returns None if header is missing, malformed, or not Basic.
+    /// Returns `None` when the header is missing, malformed, or not Basic.
+    /// The password half mirrors `decode_credentials`
+    /// (`strategies/authenticatable.rb:122-125`): the decoded value splits
+    /// on the first colon with limit 2, so a colonless payload yields a
+    /// username with no password at all (`None`) while an empty password
+    /// after the colon stays a present-but-empty slot (`Some("")`).
     ///
     /// Parses HTTP Basic credentials, mirroring warden's basic-auth decoding.
     #[must_use]
-    pub fn http_basic_credentials(&self) -> Option<(String, String)> {
+    pub fn http_basic_credentials(&self) -> Option<(String, Option<String>)> {
         let auth = self.headers.get("authorization")?;
         let encoded = auth.strip_prefix("Basic ")?;
         let decoded =
@@ -292,7 +297,7 @@ impl AuthRequest {
         let decoded = String::from_utf8(decoded).ok()?;
         let mut parts = decoded.splitn(2, ':');
         let username = parts.next()?.to_string();
-        let password = parts.next()?.to_string();
+        let password = parts.next().map(str::to_string);
         Some((username, password))
     }
 
@@ -613,11 +618,53 @@ mod tests {
             "Basic dXNlcjpwYXNz".to_string(),
         )]);
         let creds = req.http_basic_credentials();
-        assert_eq!(creds, Some(("user".to_string(), "pass".to_string())));
+        assert_eq!(creds, Some(("user".to_string(), Some("pass".to_string()))));
 
         // Malformed
         let req = AuthRequest::new(HttpMethod::Get, "/")
             .headers([("authorization".to_string(), "Basic not-base64!".to_string())]);
+        assert!(req.http_basic_credentials().is_none());
+    }
+
+    /// `authenticatable.rb:122-125` (`decode_credentials`): the decoded value
+    /// splits on the first colon with limit 2, so a colonless payload yields a
+    /// username with NO password while an empty password after the colon
+    /// stays a present-but-empty slot.
+    #[test]
+    fn test_http_basic_credentials_split_shape() {
+        // "user" with no colon: the password slot is missing, not empty.
+        let colonless = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "user");
+        let req = AuthRequest::new(HttpMethod::Get, "/")
+            .headers([("authorization".to_string(), format!("Basic {colonless}"))]);
+        assert_eq!(
+            req.http_basic_credentials(),
+            Some(("user".to_string(), None))
+        );
+
+        // "user:" with an empty password: the slot exists and is empty.
+        let empty_pass =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "user:");
+        let req = AuthRequest::new(HttpMethod::Get, "/")
+            .headers([("authorization".to_string(), format!("Basic {empty_pass}"))]);
+        assert_eq!(
+            req.http_basic_credentials(),
+            Some(("user".to_string(), Some(String::new())))
+        );
+
+        // A password carrying its own colons keeps everything after the first.
+        let with_colons = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "user:pa:ss:word",
+        );
+        let req = AuthRequest::new(HttpMethod::Get, "/")
+            .headers([("authorization".to_string(), format!("Basic {with_colons}"))]);
+        assert_eq!(
+            req.http_basic_credentials(),
+            Some(("user".to_string(), Some("pa:ss:word".to_string())))
+        );
+
+        // Missing header still aborts the whole call.
+        let req = AuthRequest::new(HttpMethod::Get, "/");
         assert!(req.http_basic_credentials().is_none());
     }
 

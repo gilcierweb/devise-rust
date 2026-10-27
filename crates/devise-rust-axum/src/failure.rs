@@ -164,7 +164,7 @@ impl FailureRenderer for AxumFailureRenderer {
 /// Strategy and hook failures carry Devise's thrown message; the renderer
 /// needs the matching `FailureReason` flash key when re-classifying
 /// through core `build_failure` (`:timeout`, `:locked`, `:unconfirmed`,
-/// `:invalid`, else unauthenticated).
+/// `:invalid`, `:not_found_in_database`, else unauthenticated).
 #[must_use]
 pub fn failure_reason(failure: &Failure) -> FailureReason {
     match failure {
@@ -172,6 +172,10 @@ pub fn failure_reason(failure: &Failure) -> FailureReason {
         Failure::Locked { .. } => FailureReason::Locked,
         Failure::Unconfirmed { .. } => FailureReason::Unconfirmed,
         Failure::InvalidCredentials { .. } => FailureReason::Invalid,
+        // Devise's `fail(:not_found_in_database)` reaches the renderer as
+        // `Failure::NotFound`; without this arm it degrades to the generic
+        // unauthenticated key and the entry loses its Devise flash key.
+        Failure::NotFound => FailureReason::NotFoundInDatabase,
         _ => FailureReason::Unauthenticated,
     }
 }
@@ -265,4 +269,45 @@ fn removal_flash_header() -> HeaderValue {
         .build();
     cookie.make_removal();
     HeaderValue::from_str(&cookie.to_string()).unwrap_or_else(|_| HeaderValue::from_static(""))
+}
+
+#[cfg(test)]
+mod failure_reason_tests {
+    use super::*;
+
+    /// Devise's `fail(:not_found_in_database)` surfaces through the strategy
+    /// chain as `Failure::NotFound`, so the classifier must map it to the
+    /// matching `FailureReason` (T-261026-ghd-02): a raw `NotFound` that
+    /// degrades to `Unauthenticated` would render the generic key instead of
+    /// the Devise one.
+    #[test]
+    fn failure_reason_maps_not_found() {
+        assert_eq!(
+            failure_reason(&Failure::NotFound),
+            FailureReason::NotFoundInDatabase
+        );
+        assert_eq!(
+            failure_reason(&Failure::InvalidCredentials { message: "invalid" }).flash_key(),
+            "invalid"
+        );
+        assert_eq!(
+            failure_reason(&Failure::NotFound).flash_key(),
+            "not_found_in_database"
+        );
+    }
+
+    /// Every other raw variant keeps its existing classification: an
+    /// unmapped shape still falls back to `Unauthenticated`.
+    #[test]
+    fn failure_reason_keeps_unauthenticated_fallback() {
+        assert_eq!(failure_reason(&Failure::Timeout), FailureReason::Timeout);
+        assert_eq!(
+            failure_reason(&Failure::Unauthenticated { message: "invalid" }),
+            FailureReason::Unauthenticated
+        );
+        assert_eq!(
+            failure_reason(&Failure::Internal("boom".to_string())),
+            FailureReason::Unauthenticated
+        );
+    }
 }
