@@ -157,6 +157,8 @@ exact names.
 | `scoped_views` | `bool` | false | informational; framework templates replace Rails views |
 | `navigational_formats` | `Vec<String>` | `["*/*", :html, :turbo_stream]` | formats that get redirects and flashes instead of 401 |
 | `responder` | `String` | `"Devise::Controllers::Responder"` | informational; failure renderers replace the responder |
+| `error_status` | `u16` | 200 (`:ok`) | status for validation-failure renders (registrations create and update, passwords create and update, confirmations create, unlocks create) in both frameworks, HTML and JSON alike; confirmations and unlocks show keep Devise's hardcoded 422; set 422 to restore the generated-Devise posture |
+| `redirect_status` | `u16` | 303 (`:see_other`) | mirrors `config.responder.redirect_status` (generated Devise apps use `:see_other`); informational in this port, the redirect renders answer 302 and do not read it yet |
 | `reload_routes` | `bool` | true | informational; route specs are built at startup in Rust |
 | `clean_up_csrf_token_on_authentication` | `bool` | true | rotate the CSRF token on sign in via the framework bridge |
 | `omniauth_path_prefix` | `Option<String>` | nil | global prefix override; default is `{scope_path}/auth` |

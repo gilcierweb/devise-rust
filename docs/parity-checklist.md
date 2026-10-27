@@ -1094,7 +1094,7 @@ Route generation maps to `Mapping::route_specs` and the framework routers; both 
 | 38 | `test/failure_app_test.rb:375` | calls the original controller if inactive account | waived | see row 36 | reason: recall re-dispatch simplification. v1 impact: same as row 36. |
 | 39 | `test/failure_app_test.rb:387` | calls the original controller with the proper environment considering the relative url root | waived | see row 36 | reason: recall re-dispatch simplification. v1 impact: same as row 36. |
 | 40 | `test/failure_app_test.rb:403` | respects the i18n locale passed via warden options when recalling original controller | waived | see row 36 | reason: recall re-dispatch simplification. v1 impact: same as row 36. |
-| 41 | `test/failure_app_test.rb:417` | respects the configured responder error_status for the status code | ported | `crates/devise-rust/src/failure.rs tests (status_code per decision)` | the responder-configurable status surface is fixed to the Devise defaults in v1 |
+| 41 | `test/failure_app_test.rb:417` | respects the configured responder error_status for the status code | ported | `crates/devise-rust/src/failure.rs tests (status_code per decision)` | `DeviseConfig::error_status` (default 200) is configurable and honored on the six validation-failure renders; the failure-app statuses stay fixed (401 http_auth, 302 navigational and recall) |
 | 42 | `test/failure_app_test.rb:431` | respects the configured responder redirect_status if the recall app returns a redirect status code | ported | `crates/devise-rust/src/failure.rs tests (redirect status)` | |
 | 43 | `test/failure_app_test.rb:444` | uses default hardcoded responder error_status for the status code since responders version does not support configuring it | ported | `crates/devise-rust/src/failure.rs tests (status_code)` | |
 | 44 | `test/failure_app_test.rb:456` | users default hardcoded responder redirect_status for the status code | ported | `crates/devise-rust/src/failure.rs tests (redirect status)` | |
@@ -1204,7 +1204,7 @@ The Rails generators map to the `devise-migrations` CLI and the DDL emitter (`cr
 |---|---|---|---|---|---|
 | 1 | `test/generators/install_generator_test.rb:10` | assert all files are properly created | ported | `crates/devise-rust-migrations/tests/snapshots.rs (cli_smoke_writes_devise_create_layout)` | the install step is the migrations CLI plus the config idiom in the guides |
 | 2 | `test/generators/install_generator_test.rb:16` | fails if no ORM is specified | ported | `crates/devise-rust-migrations/tests/snapshots.rs (cli_unknown_module_exits_two)` | invalid input fails loudly |
-| 3 | `test/generators/install_generator_test.rb:27` | responder error_status based on rack version | waived | `crates/devise-rust/src/failure.rs tests (status_code fixed to Devise defaults)` | reason: rack-version-dependent responder statuses are a Rails responders integration detail; the port pins the Devise default statuses. v1 impact: none for standard clients. |
+| 3 | `test/generators/install_generator_test.rb:27` | responder error_status based on rack version | waived | `crates/devise-rust/src/failure.rs tests (status_code per decision)` | reason: rack-version-dependent responder statuses are a Rails responders integration detail; the port ships DeviseConfig::error_status (200 default) and redirect_status (303 default), and the rack-version choice itself stays a Rails integration detail. v1 impact: none for standard clients. |
 
 ### generators/mongoid_generator_test.rb (2 blocks)
 
