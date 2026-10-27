@@ -1455,7 +1455,12 @@ where
     // so the re-sign-in and the flash can never disagree.
     if sign_in_after_change_password {
         let (key, salt) = AnyDeviseModel::session_pair(&persisted);
-        drop(bridge::bypass_sign_in_and_renew(&session, &scope, &key, &salt).await);
+        if bridge::bypass_sign_in_and_renew(&session, &scope, &key, &salt)
+            .await
+            .is_err()
+        {
+            return internal_error();
+        }
         rotate_csrf_token(&session, &scope, &st.config).await;
     }
     // Devise `set_flash_message_for_update` (`registrations_controller.rb:151-162`):
@@ -1500,7 +1505,9 @@ where
     } else {
         bridge::sign_out_and_renew(&session, &scope).await
     };
-    drop(sign_out);
+    if sign_out.is_err() {
+        return internal_error();
+    }
     rotate_csrf_token(&session, &scope, &st.config).await;
     if wants_json(&auth_request) {
         StatusCode::NO_CONTENT.into_response()
@@ -1713,7 +1720,12 @@ where
         AnyDeviseModel::after_database_authentication(&resource.record);
         let scope = st.mapping.name.clone();
         let (key, salt) = AnyDeviseModel::session_pair(&resource.record);
-        drop(bridge::insert_session_and_renew(&session, &scope, &key, &salt).await);
+        if bridge::insert_session_and_renew(&session, &scope, &key, &salt)
+            .await
+            .is_err()
+        {
+            return internal_error();
+        }
         rotate_csrf_token(&session, &scope, &st.config).await;
     }
 

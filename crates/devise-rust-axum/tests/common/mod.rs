@@ -29,7 +29,11 @@ use devise_rust::time::Clock;
 use devise_rust_axum::{DeviseLayer, DeviseWebState, devise_for_router, session_manager_layer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tower_sessions::Session;
+use tower_sessions::session::{Id, Record};
+use tower_sessions::session_store::SessionStore;
+use tower_sessions::service::SignedCookie;
+use tower_sessions::service::SessionManagerLayer;
+use tower_sessions::{MemoryStore, Session, session_store};
 
 pub use devise_rust::adapter::OrmAdapter as OrmAdapterTrait;
 pub use devise_rust::time::SystemClock;
@@ -832,6 +836,20 @@ async fn bypass_sign_out_probe(
 /// app's layers — the actix suite could build a standalone mini-app
 /// because actix sessions are cookie-carried).
 pub fn build_app(state: TestState) -> (TestState, Router) {
+    let session_layer = session_manager_layer(&state.config).expect("session layer builds");
+    devise_app(state, session_layer)
+}
+
+/// [`build_app`] over an EXPLICIT session layer: the failure-path fixtures
+/// drive the renewal gates through a store whose `cycle_id` budget is spent
+/// (SESS-05 / D-04 propagation assertions).
+fn devise_app<S>(
+    state: TestState,
+    session_layer: SessionManagerLayer<S, SignedCookie>,
+) -> (TestState, Router)
+where
+    S: SessionStore + Clone,
+{
     let mut hooks = HookRegistry::new();
     devise_rust::hooks::register_devise_hooks(&mut hooks, &state.mapping);
 
@@ -844,7 +862,6 @@ pub fn build_app(state: TestState) -> (TestState, Router) {
     )
     .with_hooks(Arc::new(hooks))
     .with_finder(&scope_name, finder);
-    let session_layer = session_manager_layer(&state.config).expect("session layer builds");
 
     // The bypass probes capture the shared Arcs (the devise router already
     // consumed the typed state into `Router<()>`).
@@ -884,6 +901,93 @@ pub fn build_app(state: TestState) -> (TestState, Router) {
         .layer(devise_layer)
         .layer(session_layer);
     (state, app)
+}
+
+// ============================================================================
+// Failure-path fixture: a session store whose id-rotation budget is spent.
+// The D-04 renewal gates must answer 500 (not a flashed success) when the
+// cycle fails, so the propagation needs a store that can actually fail.
+// ============================================================================
+
+/// Wire a [`CycleFailStore`] into the same app [`build_app`] builds, driven
+/// by a shared switch the fixture flips when the NEXT session-id rotation
+/// must fail.
+///
+/// The cookie attributes mirror [`session_manager_layer`] (`SameSite=Lax`,
+/// signed over the Devise-derived key, `HttpOnly`, `Secure`) so the only
+/// difference from the default app is the store's failure switch.
+pub fn build_app_with_cycle_switch(
+    state: TestState,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+) -> (TestState, Router) {
+    let key = devise_rust_axum::callbacks::derive_session_key(&state.config.secret_key)
+        .expect("session key derives");
+    let session_layer = SessionManagerLayer::new(CycleFailStore::new(closed))
+        .with_same_site(cookie::SameSite::Lax)
+        .with_http_only(true)
+        .with_secure(true)
+        .with_signed(key);
+    devise_app(state, session_layer)
+}
+
+/// `MemoryStore` whose `delete` (the store call `Session::cycle_id` makes
+/// when rotating the session id) fails once the shared switch closes.
+///
+/// tower-sessions rotates the id by deleting the old record and re-creating
+/// it under a fresh id, so a failing `delete` IS a failed session-id
+/// renewal. The switch lets a fixture sign in normally and then watch the
+/// NEXT transition's cycle fail: every renewal helper must propagate that
+/// failure as a 500 instead of flashing success (D-04 renewal gates).
+#[derive(Debug)]
+pub struct CycleFailStore {
+    inner: MemoryStore,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CycleFailStore {
+    /// A store that refuses rotations once `closed` flips to `true`.
+    pub fn new(closed: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            inner: MemoryStore::default(),
+            closed,
+        }
+    }
+
+    /// A fresh open switch paired with the store that watches it.
+    pub fn pair() -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (Self::new(closed.clone()), closed)
+    }
+}
+
+impl Clone for CycleFailStore {
+    fn clone(&self) -> Self {
+        Self::new(self.closed.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionStore for CycleFailStore {
+    async fn create(&self, session_record: &mut Record) -> session_store::Result<()> {
+        self.inner.create(session_record).await
+    }
+
+    async fn save(&self, session_record: &Record) -> session_store::Result<()> {
+        self.inner.save(session_record).await
+    }
+
+    async fn load(&self, session_id: &Id) -> session_store::Result<Option<Record>> {
+        self.inner.load(session_id).await
+    }
+
+    async fn delete(&self, session_id: &Id) -> session_store::Result<()> {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(session_store::Error::Backend(
+                "session-id renewal refused: cycle switch closed".to_string(),
+            ));
+        }
+        self.inner.delete(session_id).await
+    }
 }
 
 // ============================================================================

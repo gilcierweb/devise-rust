@@ -2631,3 +2631,125 @@ async fn flow_sign_up_runs_the_sign_in_pipeline_with_trackable() {
         "the sign-in bookkeeping stamped the current sign-in time"
     );
 }
+
+// ============================================================================
+// D-04 renewal-gate propagation (261026-ghh): a failed session-id cycle must
+// answer 500, never a flashed success. The `CycleFailStore` budget lets a
+// sign-in succeed and the NEXT transition's cycle fail.
+// ============================================================================
+
+/// The account-update renewal (`bypass_sign_in_and_renew`) propagates a
+/// failed cycle as a 500 instead of flashing `updated`.
+#[tokio::test]
+async fn flow_account_update_failed_renewal_answers_internal_error() {
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (state, app) = common::build_app_with_cycle_switch(
+        common::test_state(default_mapping()),
+        closed.clone(),
+    );
+    seed_user(&state, "renew-update@example.com", "secret123").await;
+    let mut jar = Jar::new();
+
+    // The switch stays open through the sign-in.
+    let resp = form_sign_in(&app, "renew-update@example.com", "secret123").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    jar.merge(&resp);
+    closed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // The account update's cycle spends the spent budget: 500, not a
+    // flashed success.
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::PATCH)
+            .uri("/users")
+            .header(header::COOKIE, jar.header())
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "user[current_password]=secret123&user[password]=rotated-pass&user[password_confirmation]=rotated-pass",
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a failed account-update renewal must fail the request"
+    );
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        !common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"updated".to_string()),
+        "no success flash may survive a failed renewal: {cookies:?}"
+    );
+}
+
+/// The registrations#destroy renewal (`sign_out_and_renew`) propagates a
+/// failed cycle as a 500 instead of flashing `destroyed`.
+#[tokio::test]
+async fn flow_registrations_destroy_failed_renewal_answers_internal_error() {
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (state, app) = common::build_app_with_cycle_switch(
+        common::test_state(default_mapping()),
+        closed.clone(),
+    );
+    seed_user(&state, "renew-destroy@example.com", "secret123").await;
+    let mut jar = Jar::new();
+
+    let resp = form_sign_in(&app, "renew-destroy@example.com", "secret123").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    jar.merge(&resp);
+    closed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::DELETE)
+            .uri("/users")
+            .header(header::COOKIE, jar.header())
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a failed destroy renewal must fail the request"
+    );
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        !common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"destroyed".to_string()),
+        "no success flash may survive a failed renewal: {cookies:?}"
+    );
+}
+
+/// The passwords#update sign-in renewal (`insert_session_and_renew`)
+/// propagates a failed cycle as a 500 instead of flashing `updated`.
+#[tokio::test]
+async fn flow_passwords_update_failed_renewal_answers_internal_error() {
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (state, app) = common::build_app_with_cycle_switch(
+        common::test_state(default_mapping()),
+        closed.clone(),
+    );
+    seed_user(&state, "renew-reset@example.com", "secret123").await;
+    let token = reset_token_for(&state, &app, "renew-reset@example.com").await;
+
+    // Close the switch: the reset sign-in renewal must fail.
+    closed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let resp = submit_reset(&app, &token, "brand-new-pass").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a failed reset sign-in renewal must fail the request"
+    );
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        !common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"updated".to_string())
+            && !common::flash_keys_from_cookies(&cookies, &state.config)
+                .contains(&"updated_not_active".to_string()),
+        "no success flash may survive a failed renewal: {cookies:?}"
+    );
+}

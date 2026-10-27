@@ -1172,7 +1172,9 @@ where
     // so the re-sign-in and the flash can never disagree.
     if sign_in_after_change_password {
         let (key, salt) = devise_rust::failure::AnyDeviseModel::session_pair(&persisted);
-        drop(bypass_sign_in_and_renew_sync(&session, &scope, &key, &salt));
+        if bypass_sign_in_and_renew_sync(&session, &scope, &key, &salt).is_err() {
+            return HttpResponse::InternalServerError().finish();
+        }
         rotate_csrf_token(&session, &scope, &state.config);
     }
     // Devise `set_flash_message_for_update` (`registrations_controller.rb:151-162`):
@@ -1216,7 +1218,9 @@ where
     } else {
         sign_out_and_renew(&session, &scope)
     };
-    drop(sign_out);
+    if sign_out.is_err() {
+        return HttpResponse::InternalServerError().finish();
+    }
     rotate_csrf_token(&session, &scope, &state.config);
     if wants_json(&req) {
         HttpResponse::NoContent().finish()
@@ -1432,7 +1436,9 @@ where
         devise_rust::failure::AnyDeviseModel::after_database_authentication(&resource.record);
         let scope = state.mapping.name.clone();
         let (key, salt) = devise_rust::failure::AnyDeviseModel::session_pair(&resource.record);
-        drop(insert_session_and_renew_sync(&session, &scope, &key, &salt));
+        if insert_session_and_renew_sync(&session, &scope, &key, &salt).is_err() {
+            return HttpResponse::InternalServerError().finish();
+        }
         rotate_csrf_token(&session, &scope, &state.config);
     }
 
