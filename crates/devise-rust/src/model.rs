@@ -387,7 +387,8 @@ pub trait DatabaseAuthenticatable: Authenticatable {
     /// caller which failure copy to render.
     ///
     /// The refusal key uses the shared trim-aware blank predicate
-    /// ([`value_blank`]): Ruby's `current_password.blank?` is `true` for
+    /// (`value_blank`, the single home of Devise's `String#present?` rule):
+    /// Ruby's `current_password.blank?` is `true` for
     /// `nil`, `""`, and `"   "` alike, so a whitespace-only submission is
     /// `:blank`, never a bcrypt comparison.
     ///
