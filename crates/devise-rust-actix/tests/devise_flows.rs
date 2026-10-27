@@ -1330,3 +1330,97 @@ async fn flow_fetch_gate_remember_arm_rejects_locked_record() {
         "the inactive message rides the remember-arm rejection"
     );
 }
+
+// ============================================================================
+// Blank-password sign-in gate (Devise `strategies/database_authenticatable.rb:10`
+// and `:22-25`): a password-less POST on a KNOWN email never runs the
+// lookup and never moves `failed_attempts`, so the known-email lockout-DoS
+// vector is closed (T-261026-ghd-03).
+// ============================================================================
+
+/// Devise parity: a blank password on a seeded account fails with the
+/// unknown-account key (`not_found_in_database` outside paranoid) instead of
+/// running the lookup, and the lockable counter stays untouched. A
+/// wrong-password control on the same row does move the counter, proving
+/// only the blank branch skips accounting.
+#[actix_web::test]
+async fn flow_blank_password_reports_not_found_in_database() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    let user = seed_user(&state, "blank@example.com", "secret123").await;
+    assert_eq!(user.failed_attempts, 0, "the fixture starts unlocked");
+
+    let resp = form_sign_in(&app, "blank@example.com", "").await;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
+        Some("not_found_in_database"),
+        "blank password reports not_found_in_database"
+    );
+
+    // The lookup never ran and the counter never moved.
+    let stored = state
+        .adapter
+        .get(&user.to_key())
+        .await
+        .expect("reload")
+        .expect("user persists");
+    assert_eq!(
+        stored.failed_attempts, 0,
+        "a blank password must not increment failed_attempts"
+    );
+
+    // Wrong-password control: the counting path still runs.
+    let resp = form_sign_in(&app, "blank@example.com", "wrongpass").await;
+    assert_eq!(resp.status(), 302);
+    let stored = state
+        .adapter
+        .get(&user.to_key())
+        .await
+        .expect("reload")
+        .expect("user persists");
+    assert_eq!(
+        stored.failed_attempts, 1,
+        "the wrong-password control still counts an attempt"
+    );
+
+    // JSON leg (D-09 shape): 401 with the same symbolic key.
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/users/sign_in")
+            .insert_header(("content-type", "application/json"))
+            .insert_header(("accept", "application/json"))
+            .set_payload(r#"{"email":"blank@example.com","password":""}"#)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 401);
+    let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+    assert_eq!(body["error"], serde_json::json!("not_found_in_database"));
+}
+
+/// Devise parity: inside paranoid mode the same blank-password POST reports
+/// the unified `invalid` key and never leaks account existence.
+#[actix_web::test]
+async fn flow_blank_password_paranoid_reports_invalid() {
+    let mut config = common::test_config();
+    config.paranoid = true;
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
+    seed_user(&state, "blank-paranoid@example.com", "secret123").await;
+
+    let resp = form_sign_in(&app, "blank-paranoid@example.com", "").await;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
+        Some("invalid"),
+        "unified invalid flash under paranoid"
+    );
+}

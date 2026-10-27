@@ -945,6 +945,21 @@ where
     if !devise_rust::strategy::merge_request_keys(&mut conditions, &auth_request, &st.config) {
         return auth_fail(&auth_request, &st, "invalid");
     }
+    // Devise `password.present? && find_for_database_authentication`
+    // (`strategies/database_authenticatable.rb:10`): a blank password
+    // short-circuits the lookup, fails with the unknown-account key
+    // (invalid under paranoid after the dummy hash, which
+    // `unknown_account_failure` performs), and never counts an attempt -
+    // otherwise a blank POST on a known email would be a lockout-DoS
+    // vector. The gate sits AFTER the request-keys parse (which Devise
+    // runs inside `valid?`) and immediately BEFORE the find.
+    if password.trim().is_empty() {
+        return auth_fail(
+            &auth_request,
+            &st,
+            devise_rust::strategy::unknown_account_failure(&st.config),
+        );
+    }
     let Some(mut record) =
         M::find_for_authentication(&conditions, st.adapter.as_ref(), &st.config).await
     else {

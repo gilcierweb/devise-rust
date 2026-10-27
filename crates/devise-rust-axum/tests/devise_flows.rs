@@ -1755,3 +1755,96 @@ async fn flow_fetch_gate_locked_session_rejects_and_survives_unlock() {
         "the unlocked replay still resolves anonymous"
     );
 }
+
+// ============================================================================
+// Blank-password sign-in gate (Devise `strategies/database_authenticatable.rb:10`
+// and `:22-25`): a password-less POST on a KNOWN email never runs the
+// lookup and never moves `failed_attempts`, so the known-email lockout-DoS
+// vector is closed (T-261026-ghd-03).
+// ============================================================================
+
+/// Devise parity: a blank password on a seeded account fails with the
+/// unknown-account key (`not_found_in_database` outside paranoid) instead of
+/// running the lookup, and the lockable counter stays untouched. A
+/// wrong-password control on the same row does move the counter, proving
+/// only the blank branch skips accounting.
+#[tokio::test]
+async fn flow_blank_password_reports_not_found_in_database() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    let user = seed_user(&state, "blank@example.com", "secret123").await;
+    assert_eq!(user.failed_attempts, 0, "the fixture starts unlocked");
+
+    let resp = form_sign_in(&app, "blank@example.com", "").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"not_found_in_database".to_string()),
+        "blank password reports not_found_in_database: {cookies:?}"
+    );
+
+    // The lookup never ran and the counter never moved.
+    let stored = state
+        .adapter
+        .get(&user.to_key())
+        .await
+        .expect("reload")
+        .expect("user persists");
+    assert_eq!(
+        stored.failed_attempts, 0,
+        "a blank password must not increment failed_attempts"
+    );
+
+    // Wrong-password control: the counting path still runs.
+    let resp = form_sign_in(&app, "blank@example.com", "wrongpass").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let stored = state
+        .adapter
+        .get(&user.to_key())
+        .await
+        .expect("reload")
+        .expect("user persists");
+    assert_eq!(
+        stored.failed_attempts, 1,
+        "the wrong-password control still counts an attempt"
+    );
+
+    // JSON leg (D-09 shape): 401 with the same symbolic key.
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/users/sign_in")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::from(r#"{"email":"blank@example.com","password":""}"#))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], serde_json::json!("not_found_in_database"));
+}
+
+/// Devise parity: inside paranoid mode the same blank-password POST reports
+/// the unified `invalid` key and never leaks account existence.
+#[tokio::test]
+async fn flow_blank_password_paranoid_reports_invalid() {
+    let mut config = common::test_config();
+    config.paranoid = true;
+    let (state, app) = common::build_app(common::test_state_with_config(default_mapping(), config));
+    seed_user(&state, "blank-paranoid@example.com", "secret123").await;
+
+    let resp = form_sign_in(&app, "blank-paranoid@example.com", "").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"invalid".to_string()),
+        "unified invalid flash under paranoid: {cookies:?}"
+    );
+    assert!(
+        !common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"not_found_in_database".to_string()),
+        "paranoid must not leak account absence: {cookies:?}"
+    );
+}
