@@ -1593,8 +1593,11 @@ async fn probe_private(
 async fn flow_reset_password_unlocks_under_email_strategy() {
     let mut config = common::test_config();
     config.unlock_strategy = "email".to_string();
-    let (state, app) =
-        common::build_app(common::test_state_with_config(common::default_mapping(), config)).await;
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
     let user = seed_user(&state, "reset-unlock@example.com", "secret123").await;
     lock_record(&state, &user.to_key()).await;
     let token = reset_token_for(&state, &app, "reset-unlock@example.com").await;
@@ -1611,7 +1614,10 @@ async fn flow_reset_password_unlocks_under_email_strategy() {
 
     // The email strategy ran the unlock: no lock and a zeroed counter.
     let (locked, attempts) = lock_state(&state, &user.to_key()).await;
-    assert!(!locked, "unlock_access clears locked_at under the email strategy");
+    assert!(
+        !locked,
+        "unlock_access clears locked_at under the email strategy"
+    );
     assert_eq!(attempts, 0, "unlock_access zeroes failed_attempts");
 
     // Signed in: the guarded probe resolves the record.
@@ -1637,8 +1643,11 @@ async fn flow_reset_password_unlocks_under_email_strategy() {
 async fn flow_reset_password_keeps_lock_under_time_strategy() {
     let mut config = common::test_config();
     config.unlock_strategy = "time".to_string();
-    let (state, app) =
-        common::build_app(common::test_state_with_config(common::default_mapping(), config)).await;
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
     let user = seed_user(&state, "reset-time@example.com", "secret123").await;
     lock_record(&state, &user.to_key()).await;
     let token = reset_token_for(&state, &app, "reset-time@example.com").await;
@@ -1746,8 +1755,11 @@ async fn flow_reset_password_signs_in_unconfirmed_record() {
 async fn flow_reset_password_without_sign_in_leaves_visitor_anonymous() {
     let mut config = common::test_config();
     config.sign_in_after_reset_password = false;
-    let (state, app) =
-        common::build_app(common::test_state_with_config(common::default_mapping(), config)).await;
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
     let user = seed_user(&state, "reset-nosign@example.com", "secret123").await;
     let token = reset_token_for(&state, &app, "reset-nosign@example.com").await;
     // Fresh hook-flag handle on the stored row (see the unconfirmed test).
@@ -1779,5 +1791,91 @@ async fn flow_reset_password_without_sign_in_leaves_visitor_anonymous() {
         probe.status(),
         302,
         "the reset without sign-in leaves no live session"
+    );
+}
+
+/// The captured mails whose subject is the password-change notice.
+fn password_change_mails(state: &TestState) -> Vec<devise_rust::mailer::SentMail> {
+    state
+        .mailer
+        .sent_mails()
+        .into_iter()
+        .filter(|mail| mail.subject == "Password Changed")
+        .collect()
+}
+
+/// Devise `after_update :send_password_change_notification`
+/// (`database_authenticatable.rb:163-168`): a successful token reset mails
+/// the password-change notice to the record's current address when the
+/// config enables it (the port has no callbacks, so the controller path
+/// owns the decision).
+#[actix_web::test]
+async fn flow_reset_password_sends_password_change_notification() {
+    let mut config = common::test_config();
+    config.send_password_change_notification = true;
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
+    seed_user(&state, "reset-notify@example.com", "secret123").await;
+    let token = reset_token_for(&state, &app, "reset-notify@example.com").await;
+
+    let resp = submit_reset(&app, &token, "brand-new-pass").await;
+    assert_eq!(resp.status(), 302);
+
+    let changed = password_change_mails(&state);
+    assert_eq!(
+        changed.len(),
+        1,
+        "exactly one password_change delivery: {:?}",
+        state
+            .mailer
+            .sent_mails()
+            .iter()
+            .map(|m| (&m.to, &m.subject))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        changed[0].to, "reset-notify@example.com",
+        "the notice goes to the current address"
+    );
+}
+
+/// Devise parity: with `send_password_change_notification` off the reset
+/// stays silent (the Devise default).
+#[actix_web::test]
+async fn flow_reset_password_notification_disabled_stays_silent() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    seed_user(&state, "reset-quiet@example.com", "secret123").await;
+    let token = reset_token_for(&state, &app, "reset-quiet@example.com").await;
+
+    let resp = submit_reset(&app, &token, "brand-new-pass").await;
+    assert_eq!(resp.status(), 302);
+    assert!(
+        password_change_mails(&state).is_empty(),
+        "no password_change notice when the config is off"
+    );
+}
+
+/// Devise parity: a failed reset never mails the notice (no digest moved,
+/// so the `after_update` decision stays pending-free).
+#[actix_web::test]
+async fn flow_reset_password_failure_sends_no_notification() {
+    let mut config = common::test_config();
+    config.send_password_change_notification = true;
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
+    seed_user(&state, "reset-failed@example.com", "secret123").await;
+
+    // Unknown token: the update renders errors and persists nothing.
+    let resp = submit_reset(&app, "totally-unknown", "brand-new-pass").await;
+    assert_eq!(resp.status(), 200);
+    assert!(
+        password_change_mails(&state).is_empty(),
+        "a failed reset mails no password_change notice"
     );
 }

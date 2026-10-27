@@ -1247,6 +1247,34 @@ where
         .body("edit")
 }
 
+/// The record's password digest BEFORE a token reset, resolved through the
+/// SAME token lookup `reset_password_by_token` runs, so the controller can
+/// compare the persisted value against the new one exactly like Devise's
+/// `after_update` callback does (`database_authenticatable.rb:163-168`).
+/// A blank or unknown token resolves to `None`; the reset then fails and no
+/// notification can be pending anyway.
+async fn digest_before_reset<M, A>(
+    attrs: &serde_json::Map<String, JsonValue>,
+    adapter: &A,
+    config: &DeviseConfig,
+) -> Option<String>
+where
+    M: Recoverable,
+    A: OrmAdapter<M> + Send + Sync,
+{
+    let token = attrs
+        .get("reset_password_token")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    if token.is_empty() {
+        return None;
+    }
+    let Ok(Some(record)) = M::with_reset_password_token(token, adapter, config).await else {
+        return None;
+    };
+    record.encrypted_password().map(str::to_string)
+}
+
 async fn passwords_update<M, A, L>(
     req: HttpRequest,
     session: Session,
@@ -1260,6 +1288,14 @@ where
 {
     let singular = state.mapping.singular.clone();
     let attrs = body_map(body, &singular);
+    // Devise `after_update :send_password_change_notification`
+    // (`database_authenticatable.rb:163-168`): the callback fires on any
+    // `encrypted_password` change, so the pre-reset digest has to be read
+    // BEFORE the reset writes the new one. Devise fires it from a callback;
+    // this controller path owns the decision (the model's own helper reads
+    // config plus the skip flag, so the two paths cannot drift).
+    let before_digest =
+        digest_before_reset::<M, A>(&attrs, state.adapter.as_ref(), &state.config).await;
     let outcome = M::reset_password_by_token(
         &attrs,
         state.adapter.as_ref(),
@@ -1272,6 +1308,37 @@ where
     };
     if !resource.is_valid() {
         return invalid_response(&req, &resource.errors, error_status_of(&state.config));
+    }
+
+    // Mirror the `after_update` decision on the reset path: mail the notice
+    // when the digest moved and the config enables it. A mailer failure
+    // fails the request like every other framework notification send.
+    let mut changes = HashMap::new();
+    changes.insert(
+        "encrypted_password".to_string(),
+        AdapterValue::String(
+            resource
+                .record
+                .encrypted_password()
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    );
+    let previous = before_digest.map_or_else(HashMap::new, |digest| {
+        HashMap::from([(
+            "encrypted_password".to_string(),
+            AdapterValue::String(digest),
+        )])
+    });
+    if devise_rust::model::DatabaseAuthenticatable::send_password_change_notification(
+        &resource.record,
+        &devise_rust::adapter::ChangeSet::new(previous, changes),
+        state.mailer.as_ref(),
+        &state.config,
+    )
+    .is_err()
+    {
+        return HttpResponse::InternalServerError().finish();
     }
 
     // Devise `unlockable?` (`passwords_controller.rb:79-83`): the unlock
