@@ -1897,3 +1897,279 @@ async fn error_status_config_reaches_validation_render() {
         "taken key must reach the 422 render: {body}"
     );
 }
+
+// ============================================================================
+// Passwords update parity (Devise `passwords_controller.rb#update`, lines
+// 37-46 for the flash and sign-in branch, 79-83 for `unlockable?`):
+// unlock only under the email strategy, sign in UNCONDITIONALLY when
+// `sign_in_after_reset_password`, the flash matrix, and the
+// `after_database_authentication` hook (T-261026-ghf-01/02).
+// ============================================================================
+
+/// Stamp the account locked through the test adapter (the lockable flow
+/// fixture: a `locked_at` value plus a counter over the threshold).
+async fn lock_record(state: &common::TestState, key: &devise_rust::adapter::DeviseKey) {
+    let mut fields = std::collections::HashMap::new();
+    fields.insert(
+        "locked_at".to_string(),
+        Value::String(common::now_rfc3339()),
+    );
+    fields.insert("failed_attempts".to_string(), Value::Integer(20));
+    state
+        .adapter
+        .update_columns(key, &fields)
+        .await
+        .expect("lock write");
+}
+
+/// The stored lock state of a record, read through the adapter.
+async fn lock_state(state: &common::TestState, key: &devise_rust::adapter::DeviseKey) -> (bool, u32) {
+    let record = state
+        .adapter
+        .get(key)
+        .await
+        .expect("lookup")
+        .expect("record");
+    (record.locked_at.is_some(), record.failed_attempts)
+}
+
+/// POST the create action and read the raw reset token off the captured
+/// mail (the emailed-token round trip the update action requires).
+async fn reset_token_for(state: &common::TestState, app: &Router, email: &str) -> String {
+    let resp = call(
+        app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/users/password")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("user[email]={}", urlencode(email))))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND, "instructions redirect");
+    state
+        .mailer
+        .sent_mails()
+        .last()
+        .and_then(|mail| mail.template_vars.token.clone())
+        .expect("reset mail carries the raw token")
+}
+
+/// PUT the update action with a valid token and a new password (the
+/// `resource_params` Devise feeds `reset_password_by_token`).
+async fn submit_reset(app: &Router, token: &str, password: &str) -> Response {
+    call(
+        app,
+        Request::builder()
+            .method(Method::PATCH)
+            .uri("/users/password")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "user[reset_password_token]={token}&user[password]={password}&user[password_confirmation]={password}"
+            )))
+            .expect("request"),
+    )
+    .await
+}
+
+/// GET the guarded probe with the given cookie replayed (200 only when a
+/// live, active session resolves).
+async fn probe_private(app: &Router, cookie: &str) -> Response {
+    call(
+        app,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/users_dashboard")
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await
+}
+
+/// Devise `passwords_controller.rb#update` + `unlockable?`: an email-unlock
+/// strategy unlocks the locked account on reset, the active record flashes
+/// `updated`, and the reset signs the user in with the new password.
+#[tokio::test]
+async fn flow_reset_password_unlocks_under_email_strategy() {
+    let mut config = common::test_config();
+    config.unlock_strategy = "email".to_string();
+    let (state, app) = common::build_app(common::test_state_with_config(default_mapping(), config));
+    let user = seed_user(&state, "reset-unlock@example.com", "secret123").await;
+    lock_record(&state, &user.to_key()).await;
+    let token = reset_token_for(&state, &app, "reset-unlock@example.com").await;
+
+    let mut jar = Jar::new();
+    let resp = submit_reset(&app, &token, "brand-new-pass").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    jar.merge(&resp);
+    let keys = common::flash_keys_from_cookies(&jar.0, &state.config);
+    assert!(
+        keys.contains(&"updated".to_string()),
+        "the unlocked record is active, so Devise flashes updated: {keys:?}"
+    );
+
+    // The email strategy ran the unlock: no lock and a zeroed counter.
+    let (locked, attempts) = lock_state(&state, &user.to_key()).await;
+    assert!(!locked, "unlock_access clears locked_at under the email strategy");
+    assert_eq!(attempts, 0, "unlock_access zeroes failed_attempts");
+
+    // Signed in: the guarded probe resolves the record.
+    let probe = probe_private(&app, &jar.header()).await;
+    assert_eq!(probe.status(), StatusCode::OK, "the reset signs the user in");
+    assert_eq!(
+        body_json(probe).await["email"],
+        serde_json::json!("reset-unlock@example.com")
+    );
+
+    // The NEW password is the one that authenticates.
+    let resp = form_sign_in(&app, "reset-unlock@example.com", "brand-new-pass").await;
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"signed_in".to_string()),
+        "signed_in flash expected: {cookies:?}"
+    );
+}
+
+/// Devise `unlockable?` guard: a `:time` unlock strategy NEVER unlocks on a
+/// password reset, so the time penalty survives the reset. The reset still
+/// succeeds and signs the record in unconditionally (the ghb activatable
+/// gate rejects the next request with the `locked` message).
+#[tokio::test]
+async fn flow_reset_password_keeps_lock_under_time_strategy() {
+    let mut config = common::test_config();
+    config.unlock_strategy = "time".to_string();
+    let (state, app) = common::build_app(common::test_state_with_config(default_mapping(), config));
+    let user = seed_user(&state, "reset-time@example.com", "secret123").await;
+    lock_record(&state, &user.to_key()).await;
+    let token = reset_token_for(&state, &app, "reset-time@example.com").await;
+
+    let mut jar = Jar::new();
+    let resp = submit_reset(&app, &token, "brand-new-pass").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    jar.merge(&resp);
+    let keys = common::flash_keys_from_cookies(&jar.0, &state.config);
+    assert!(
+        keys.contains(&"updated_not_active".to_string()),
+        "a locked record is inactive, so Devise flashes updated_not_active: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"updated".to_string()),
+        "the inactive record must not flash updated: {keys:?}"
+    );
+
+    // No unlock ran: the time penalty is intact.
+    let (locked, attempts) = lock_state(&state, &user.to_key()).await;
+    assert!(locked, "the time strategy never unlocks on a reset");
+    assert_eq!(attempts, 20, "the failed-attempt counter stays");
+
+    // Devise signs in unconditionally, so a session exists; the activatable
+    // fetch gate rejects it with the inactive message (item ghb).
+    let rejected = probe_private(&app, &jar.header()).await;
+    assert_eq!(
+        rejected.status(),
+        StatusCode::FOUND,
+        "the locked session resolves dead on the next request"
+    );
+    assert_eq!(
+        rejected
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/users/sign_in"),
+        "the inactive record redirects to the sign-in path"
+    );
+    let cookies = set_cookie_pairs(&rejected);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"locked".to_string()),
+        "the inactive message rides the flash: {cookies:?}"
+    );
+}
+
+/// Devise parity: an unconfirmed record resets, flashes `updated_not_active`,
+/// is signed in UNCONDITIONALLY (Devise does not gate the sign-in on
+/// `active_for_authentication?`), and fires `after_database_authentication`
+/// before the sign-in. The activatable fetch gate rejects the next request
+/// with `unconfirmed`, matching the reference behavior.
+#[tokio::test]
+async fn flow_reset_password_signs_in_unconfirmed_record() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user_unconfirmed(
+        &state,
+        "reset-unconfirmed@example.com",
+        "secret123",
+    )
+    .await;
+    let token = reset_token_for(&state, &app, "reset-unconfirmed@example.com").await;
+
+    let mut jar = Jar::new();
+    let resp = submit_reset(&app, &token, "brand-new-pass").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    jar.merge(&resp);
+    let keys = common::flash_keys_from_cookies(&jar.0, &state.config);
+    assert!(
+        keys.contains(&"updated_not_active".to_string()),
+        "an unconfirmed record flashes updated_not_active: {keys:?}"
+    );
+    assert!(
+        common::after_db_auth_fired("reset-unconfirmed@example.com"),
+        "the reset path fires after_database_authentication before the sign-in"
+    );
+
+    // A session exists (signed in unconditionally) and dies on the next
+    // request, carrying the confirmable inactive message.
+    let rejected = probe_private(&app, &jar.header()).await;
+    assert_eq!(rejected.status(), StatusCode::FOUND);
+    assert_eq!(
+        rejected
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/users/sign_in"),
+        "the inactive session redirects to the sign-in path"
+    );
+    let cookies = set_cookie_pairs(&rejected);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"unconfirmed".to_string()),
+        "unconfirmed rides the flash of the rejected request: {cookies:?}"
+    );
+}
+
+/// Devise parity: with `sign_in_after_reset_password` off, the successful
+/// reset flashes `updated_not_active` even for an active record and leaves
+/// the visitor anonymous (no session is minted).
+#[tokio::test]
+async fn flow_reset_password_without_sign_in_leaves_visitor_anonymous() {
+    let mut config = common::test_config();
+    config.sign_in_after_reset_password = false;
+    let (state, app) = common::build_app(common::test_state_with_config(default_mapping(), config));
+    seed_user(&state, "reset-nosign@example.com", "secret123").await;
+    let token = reset_token_for(&state, &app, "reset-nosign@example.com").await;
+
+    let resp = submit_reset(&app, &token, "brand-new-pass").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    let keys = common::flash_keys_from_cookies(&cookies, &state.config);
+    assert!(
+        keys.contains(&"updated_not_active".to_string()),
+        "no sign-in means updated_not_active, even for an active record: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"updated".to_string()),
+        "updated must not fire without the sign-in branch: {keys:?}"
+    );
+    assert!(
+        !common::after_db_auth_fired("reset-nosign@example.com"),
+        "no sign-in branch means no after_database_authentication firing"
+    );
+
+    // No session: the guarded probe rejects as anonymous.
+    let probe = probe_private(&app, "").await;
+    assert_eq!(
+        probe.status(),
+        StatusCode::FOUND,
+        "the reset without sign-in leaves no live session"
+    );
+}

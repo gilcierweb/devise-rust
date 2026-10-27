@@ -1274,22 +1274,35 @@ where
         return invalid_response(&req, &resource.errors, error_status_of(&state.config));
     }
 
-    // Devise: unlock locked accounts on email-unlockable models.
+    // Devise `unlockable?` (`passwords_controller.rb:79-83`): the unlock
+    // only runs when the configured unlock strategy includes :email AND the
+    // account is actually locked, so a :time (or :none) penalty survives a
+    // password reset (T-261026-ghf-01).
     if resource
         .record
-        .access_locked(&state.config, state.clock.as_ref())
+        .unlock_strategy_enabled("email", &state.config)
+        && resource
+            .record
+            .access_locked(&state.config, state.clock.as_ref())
     {
         drop(resource.record.unlock_access(state.adapter.as_ref()).await);
     }
 
-    if state.config.sign_in_after_reset_password && resource.record.active_for_authentication() {
+    // Devise `passwords_controller.rb:40-45`: the sign-in after a reset is
+    // UNCONDITIONAL under `sign_in_after_reset_password` (the reference
+    // never gates it on `active_for_authentication?`), the flash splits on
+    // activity, and `after_database_authentication` fires before the sign-in
+    // (T-261026-ghf-02).
+    let active = resource.record.active_for_authentication();
+    if state.config.sign_in_after_reset_password {
+        devise_rust::failure::AnyDeviseModel::after_database_authentication(&resource.record);
         let scope = state.mapping.name.clone();
         let (key, salt) = devise_rust::failure::AnyDeviseModel::session_pair(&resource.record);
         drop(insert_session_and_renew_sync(&session, &scope, &key, &salt));
         rotate_csrf_token(&session, &scope, &state.config);
     }
 
-    let key = if resource.record.active_for_authentication() {
+    let key = if state.config.sign_in_after_reset_password && active {
         "updated"
     } else {
         "updated_not_active"
