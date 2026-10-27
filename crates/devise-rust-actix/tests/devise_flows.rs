@@ -258,7 +258,7 @@ async fn flow_sign_in_unknown_email_paranoid_reports_invalid() {
 /// `authenticatable_test.rb:579-608`): a configured request key the bridge
 /// snapshot never carries (neither `host`-mapped nor `remote_ip`-mapped) is a
 /// MISSING REQUIRED lookup condition, so the parse fails and the request
-/// never reaches `find_for_authentication` — which is why CORRECT
+/// never reaches `find_for_authentication`: which is why CORRECT
 /// credentials fail exactly like the wrong-password flow: the navigational
 /// 302 plus the generic `invalid` flash, and the returned cookies stay
 /// anonymous.
