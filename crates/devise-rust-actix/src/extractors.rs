@@ -76,6 +76,17 @@ fn staged_request(req: &HttpRequest) -> AuthRequest {
                 .insert(name.as_str().to_lowercase(), v.to_string());
         }
     }
+    // Same bridge the middleware snapshot carries
+    // (`strategies/authenticatable.rb:151-155`): host from the Host header
+    // and remote_ip from the socket peer only (D-20).
+    if let Some(host) = request.headers.get("host").cloned() {
+        request.request_values.insert("host".to_string(), host);
+    }
+    if let Some(peer) = req.connection_info().peer_addr().map(str::to_string) {
+        request
+            .request_values
+            .insert("remote_ip".to_string(), peer);
+    }
     request
 }
 

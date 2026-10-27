@@ -253,6 +253,66 @@ async fn flow_sign_in_unknown_email_paranoid_reports_invalid() {
     );
 }
 
+/// Devise's `request_keys` second parse pass
+/// (`strategies/authenticatable.rb:147-167`, integration contract
+/// `authenticatable_test.rb:579-608`): a configured request key the bridge
+/// snapshot never carries (neither `host`-mapped nor `remote_ip`-mapped) is a
+/// MISSING REQUIRED lookup condition, so the parse fails and the request
+/// never reaches `find_for_authentication` — which is why CORRECT
+/// credentials fail exactly like the wrong-password flow: the navigational
+/// 302 plus the generic `invalid` flash, and the returned cookies stay
+/// anonymous.
+#[actix_web::test]
+async fn flow_sign_in_request_keys_missing_aborts_before_lookup() {
+    let mut config = common::test_config();
+    config.request_keys = vec!["subdomain".to_string()];
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
+    seed_user(&state, "flow-rk@example.com", "secret123").await;
+
+    // Correct credentials, no `subdomain` on the bridge snapshot: Devise's
+    // `with_authentication_hash` returns false, so no strategy applies and
+    // the generic invalid failure is reported.
+    let resp = form_sign_in(&app, "flow-rk@example.com", "secret123").await;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()), Some("/users/sign_in"));
+    jar_assert_anon(&app, &resp, "a missing request key must abort the sign in").await;
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
+        Some("invalid"),
+        "a missing required request key reports the generic invalid failure"
+    );
+}
+
+/// Replay the failure response's cookies against a guarded route and assert
+/// the request stays anonymous (a failed sign-in must not mint a session).
+async fn jar_assert_anon(
+    app: &impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse,
+        Error = actix_web::Error,
+    >,
+    resp: &actix_web::dev::ServiceResponse,
+    message: &str,
+) {
+    let mut jar = Jar::new();
+    jar.merge(resp);
+    let probe = test::call_service(
+        app,
+        test::TestRequest::get()
+            .uri("/users_dashboard")
+            .insert_header(("cookie", jar.header()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(probe.status(), 302, "{message}");
+}
+
 /// Devise: invalid password → 302 back to `sign_in` with `invalid` flash
 /// (HTML) and 401 + symbolic key for JSON callers (D-09/D-15).
 #[actix_web::test]

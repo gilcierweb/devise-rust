@@ -635,3 +635,60 @@ fn request_values_from(req: &ServiceRequest, peer_addr: Option<&str>) -> HashMap
     }
     values
 }
+
+#[cfg(test)]
+mod request_values_tests {
+    use super::*;
+
+    /// A request-shaped snapshot whose `Host` header says one thing and
+    /// whose `X-Forwarded-For` header says another (the spoofed value).
+    fn snapshot_with_forged_proxy_header() -> ServiceRequest {
+        ServiceRequest::from_request(
+            actix_web::test::TestRequest::post()
+                .uri("/users/sign_in")
+                .insert_header(("host", "app.example.com"))
+                .insert_header(("x-forwarded-for", "203.0.113.9"))
+                .to_http_request(),
+        )
+    }
+
+    /// The bridge fills `request_values` from the Devise request-object
+    /// equivalents (`strategies/authenticatable.rb:151-155`): `request.host`
+    /// from the Host header, `request.remote_ip` from the socket peer only.
+    /// With no socket peer resolved the key is simply absent, and the forged
+    /// proxy header never reaches the map (D-20).
+    #[test]
+    fn build_auth_request_carries_host_and_socket_peer_only() {
+        let req = snapshot_with_forged_proxy_header();
+
+        let snapshot = build_auth_request(&req, None);
+        assert_eq!(
+            snapshot.request_values.get("host").map(String::as_str),
+            Some("app.example.com"),
+            "host maps the Host header"
+        );
+        assert!(
+            !snapshot.request_values.contains_key("remote_ip"),
+            "no resolved peer, no remote_ip key: {:?}",
+            snapshot.request_values
+        );
+        for key in ["x-forwarded-for", "forwarded", "x-real-ip"] {
+            assert!(
+                !snapshot.request_values.contains_key(key),
+                "{key} must never reach the map: {:?}",
+                snapshot.request_values
+            );
+        }
+
+        let bridged = request_values_from(&req, Some("198.51.100.7"));
+        assert_eq!(
+            bridged.get("host").map(String::as_str),
+            Some("app.example.com")
+        );
+        assert_eq!(
+            bridged.get("remote_ip").map(String::as_str),
+            Some("198.51.100.7"),
+            "remote_ip is the socket peer the connection_info resolved"
+        );
+    }
+}

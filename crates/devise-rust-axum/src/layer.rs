@@ -574,7 +574,94 @@ fn build_auth_request<ReqBody>(req: &Request<ReqBody>) -> AuthRequest {
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0.ip().to_string());
 
+    // Devise's request-object methods the `request_keys` conditions read
+    // (`strategies/authenticatable.rb:151-155`): `request.host` from the Host
+    // header and `request.remote_ip` from the socket peer (D-20: the peer
+    // only, never a forwarded header).
+    let mut request_values = HashMap::new();
+    if let Some(host) = headers.get("host") {
+        request_values.insert("host".to_string(), host.clone());
+    }
+    if let Some(peer) = &peer_addr {
+        request_values.insert("remote_ip".to_string(), peer.clone());
+    }
+
     build_auth_request_with_peer(
         method, path, headers, params, cookies, query, flags, peer_addr,
     )
+    .request_values(request_values)
+}
+
+#[cfg(test)]
+mod request_values_tests {
+    use super::*;
+
+    /// A request-shaped snapshot whose `Host` header says one thing and
+    /// whose `X-Forwarded-For` header says another (the spoofed value),
+    /// resolved against no socket peer at all.
+    fn snapshot_without_peer() -> Request<()> {
+        Request::builder()
+            .method("POST")
+            .uri("/users/sign_in")
+            .header("host", "app.example.com")
+            .header("x-forwarded-for", "203.0.113.9")
+            .body(())
+            .expect("request")
+    }
+
+    /// Same request plus the `ConnectInfo<SocketAddr>` extension the layer
+    /// reads the socket peer from.
+    fn snapshot_with_peer() -> Request<()> {
+        let mut request = snapshot_without_peer();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((
+                std::net::Ipv4Addr::new(198, 51, 100, 7),
+                40_000,
+            ))));
+        request
+    }
+
+    /// The bridge fills `request_values` from the Devise request-object
+    /// equivalents (`strategies/authenticatable.rb:151-155`): `request.host`
+    /// from the Host header, `request.remote_ip` from the socket peer only.
+    /// Without a peer the key is absent, and a forged proxy header never
+    /// reaches the map (D-20).
+    #[test]
+    fn build_auth_request_carries_host_and_socket_peer_only() {
+        let snapshot = build_auth_request(&snapshot_without_peer());
+        assert_eq!(
+            snapshot.request_values.get("host").map(String::as_str),
+            Some("app.example.com"),
+            "host maps the Host header"
+        );
+        assert!(
+            !snapshot.request_values.contains_key("remote_ip"),
+            "no resolved peer, no remote_ip key: {:?}",
+            snapshot.request_values
+        );
+        for key in ["x-forwarded-for", "forwarded", "x-real-ip"] {
+            assert!(
+                !snapshot.request_values.contains_key(key),
+                "{key} must never reach the map: {:?}",
+                snapshot.request_values
+            );
+        }
+
+        let peered = build_auth_request(&snapshot_with_peer());
+        assert_eq!(
+            peered.request_values.get("host").map(String::as_str),
+            Some("app.example.com")
+        );
+        assert_eq!(
+            peered.request_values.get("remote_ip").map(String::as_str),
+            Some("198.51.100.7"),
+            "remote_ip is the ConnectInfo socket peer"
+        );
+        assert!(
+            !peered.request_values.contains_key("x-forwarded-for"),
+            "the forwarded header must never reach the map: {:?}",
+            peered.request_values
+        );
+    }
 }

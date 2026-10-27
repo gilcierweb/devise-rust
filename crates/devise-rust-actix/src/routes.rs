@@ -559,6 +559,30 @@ where
         );
         conditions.insert(key.clone(), AdapterValue::String(value));
     }
+    // Devise's second `parse_authentication_key_values` pass over the request
+    // object's values (`strategies/authenticatable.rb:147-167`): the staged
+    // snapshot the middleware built carries them, a same-named request value
+    // overwrites the param condition, and a missing or blank required key
+    // fails the parse. On failure the generic `invalid` failure is reported
+    // (not `not_found_in_database`): no lookup ran, so nothing is known
+    // about the account either way.
+    let staged_snapshot = req
+        .extensions()
+        .get::<devise_rust::request::AuthRequest>()
+        .cloned()
+        .unwrap_or_else(|| {
+            devise_rust::request::AuthRequest::new(
+                devise_rust::request::HttpMethod::Post,
+                req.path().to_string(),
+            )
+        });
+    if !devise_rust::strategy::merge_request_keys(
+        &mut conditions,
+        &staged_snapshot,
+        &state.config,
+    ) {
+        return auth_fail(&req, &session, &state.mapping, "invalid");
+    }
     let Some(mut record) =
         M::find_for_authentication(&conditions, state.adapter.as_ref(), &state.config).await
     else {

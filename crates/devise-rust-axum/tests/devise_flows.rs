@@ -266,6 +266,54 @@ async fn flow_sign_in_unknown_email_paranoid_reports_invalid() {
     );
 }
 
+/// Devise's `request_keys` second parse pass
+/// (`strategies/authenticatable.rb:147-167`, integration contract
+/// `authenticatable_test.rb:579-608`): a configured request key the layer
+/// snapshot never carries (neither `host`-mapped nor `remote_ip`-mapped) is a
+/// MISSING REQUIRED lookup condition, so the parse fails before
+/// `find_for_authentication` runs — which is why CORRECT credentials fail
+/// exactly like the wrong-password flow: the navigational 302 plus the
+/// generic `invalid` flash, and the returned cookies stay anonymous.
+#[tokio::test]
+async fn flow_sign_in_request_keys_missing_aborts_before_lookup() {
+    let mut config = common::test_config();
+    config.request_keys = vec!["subdomain".to_string()];
+    let (state, app) = common::build_app(common::test_state_with_config(default_mapping(), config));
+    seed_user(&state, "flow-rk@example.com", "secret123").await;
+
+    let resp = form_sign_in(&app, "flow-rk@example.com", "secret123").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(
+        resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+        Some("/users/sign_in"),
+        "the navigational failure path redirects back to the sign-in form"
+    );
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"invalid".to_string()),
+        "a missing required request key reports the generic invalid failure: {cookies:?}"
+    );
+
+    // The failure jar must not authenticate against a guarded route.
+    let mut jar = Jar::new();
+    jar.merge(&resp);
+    let probe = call(
+        &app,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/users_dashboard")
+            .header(header::COOKIE, jar.header())
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(
+        probe.status(),
+        StatusCode::FOUND,
+        "a failed sign-in must not mint a session"
+    );
+}
+
 /// Devise: invalid password → 302 back to `sign_in` with the `invalid`
 /// flash (HTML) and 401 + symbolic key for JSON callers (D-09 analogue).
 #[tokio::test]
