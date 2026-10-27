@@ -1329,7 +1329,19 @@ where
     let password_changed = params
         .get("password")
         .and_then(JsonValue::as_str)
-        .is_some_and(|pw| !pw.is_empty());
+        .is_some_and(|pw| !pw.trim().is_empty());
+    // Devise `sign_in_after_change_password?` (`registrations_controller.rb:131-135`):
+    // a blank submitted `:password` returns true IMMEDIATELY (the salt never
+    // moved, so re-signing in is safe), and only a real password change
+    // consults the per-model config. `update_with_password` may delete the
+    // blank password fields from the params map, so the blankness is read
+    // here from the same map the action already parsed (never re-parsed).
+    let password_blank = params
+        .get("password")
+        .and_then(JsonValue::as_str)
+        .is_none_or(|pw| pw.trim().is_empty());
+    let sign_in_after_change_password =
+        password_blank || record.sign_in_after_change_password(&st.config);
 
     if let Err(errors) = record.update_with_password(&mut params, &st.config) {
         record.clean_up_passwords();
@@ -1399,20 +1411,26 @@ where
         return internal_error();
     };
 
-    // D-03/T-08-09: account-update renewal — bypass re-sign-in with the
-    // fresh record (salt now tracks the new password).
-    if record.sign_in_after_change_password(&st.config) {
+    // D-03/T-08-09: account-update renewal: Devise runs
+    // `bypass_sign_in resource, scope: resource_name if sign_in_after_change_password?`
+    // (`registrations_controller.rb:54`), the same predicate the flash reads,
+    // so the re-sign-in and the flash can never disagree.
+    if sign_in_after_change_password {
         let (key, salt) = AnyDeviseModel::session_pair(&persisted);
         drop(bridge::bypass_sign_in_and_renew(&session, &scope, &key, &salt).await);
         rotate_csrf_token(&session, &scope, &st.config).await;
     }
-    // Devise `set_flash_message_for_update` (`registrations_controller.rb:151-162`).
-    let flash_key = if !record.active_for_authentication() {
-        "updated_but_not_signed_in"
-    } else if reconfirmation_pending {
+    // Devise `set_flash_message_for_update` (`registrations_controller.rb:151-162`):
+    // the branch order is pending reconfirmation first, then
+    // `sign_in_after_change_password?`, and NOTHING consults
+    // `active_for_authentication?`; the reference never lets account
+    // activity pick the flash key (M-4).
+    let flash_key = if reconfirmation_pending {
         "update_needs_confirmation"
-    } else {
+    } else if sign_in_after_change_password {
         "updated"
+    } else {
+        "updated_but_not_signed_in"
     };
     if wants_json(&auth_request) {
         axum::Json(serde_json::json!({ "updated": true })).into_response()

@@ -16,10 +16,12 @@ mod common;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::Query;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::response::IntoResponse;
 use common::{FixtureUser, SystemClock, default_mapping};
 use devise_rust::adapter::{Conditions, OrmAdapter, Value};
+use devise_rust::config::DeviseConfig;
 use devise_rust::failure::AnyDeviseModel;
 use devise_rust::hooks::HookRegistry;
 use devise_rust::model::{AdapterBridge, ModelFinder};
@@ -29,6 +31,7 @@ use devise_rust_axum::{DeviseLayer, devise_for_router, session_manager_layer};
 use http_body_util::BodyExt;
 use std::sync::Arc;
 use tower::ServiceExt;
+use tower_sessions::Session;
 
 type Response = axum::http::Response<axum::body::Body>;
 
@@ -2254,4 +2257,255 @@ async fn flow_reset_password_failure_sends_no_notification() {
         password_change_mails(&state).is_empty(),
         "a failed reset mails no password_change notice"
     );
+}
+
+// ============================================================================
+// Registrations update flash/bypass matrix (Devise
+// `registrations_controller.rb#update` lines 46-62, 131-135, 151-162):
+// the flash key and the bypass re-sign-in follow Devise's branch order
+// exactly - pending reconfirmation first, then `sign_in_after_change_password?`
+// (config OR a blank submitted password), and the flash NEVER consults
+// `active_for_authentication?`. M-4.
+// ============================================================================
+
+/// PATCH the account update action with the given urlencoded body and the
+/// jar's cookie replayed.
+async fn submit_account_update(app: &Router, body: &str, cookie: &str) -> Response {
+    call(
+        app,
+        Request::builder()
+            .method(Method::PATCH)
+            .uri("/users")
+            .header(header::COOKIE, cookie)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body.to_string()))
+            .expect("request"),
+    )
+    .await
+}
+
+/// The flash keys a response staged into the signed flash cookie.
+async fn update_flash_keys(response: &Response, config: &DeviseConfig) -> Vec<String> {
+    common::flash_keys_from_cookies(&set_cookie_pairs(response), config)
+}
+
+/// Devise registrations#update (M-4): a password change under the default
+/// `sign_in_after_change_password` config flashes `updated` AND runs
+/// `bypass_sign_in` (the session id is recycled, so the new salt rides a
+/// fresh session instead of the pre-update one).
+#[tokio::test]
+async fn flow_account_update_password_change_flashes_updated_and_renews() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user(&state, "upd-pw@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    jar.merge(&form_sign_in(&app, "upd-pw@example.com", "secret123").await);
+    let before = jar.value("id").expect("session");
+
+    let resp = submit_account_update(
+        &app,
+        "user[current_password]=secret123&user[password]=brand-new-pass&user[password_confirmation]=brand-new-pass",
+        &jar.header(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    jar.merge(&resp);
+    assert!(
+        update_flash_keys(&resp, &state.config)
+            .await
+            .contains(&"updated".to_string()),
+        "a password change with the config on flashes updated"
+    );
+    assert_ne!(
+        before,
+        jar.value("id").expect("session"),
+        "the updated branch performs bypass_sign_in (session renewed)"
+    );
+    // The re-signed-in session carries the NEW salt, so the next request
+    // still resolves the account (the pre-update salt would fail the
+    // warden compare and log the user out).
+    assert_eq!(
+        probe_private(&app, &jar.header()).await.status(),
+        StatusCode::OK,
+        "the bypass re-sign-in keeps the session live"
+    );
+}
+
+/// Devise `sign_in_after_change_password?` (`registrations_controller.rb:132`):
+/// a BLANK submitted password returns true immediately, so the update still
+/// flashes `updated` and still re-signs in (the salt never moved, so the
+/// existing session stays valid either way).
+#[tokio::test]
+async fn flow_account_update_blank_password_still_renews_with_updated_flash() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user(&state, "upd-blank@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    jar.merge(&form_sign_in(&app, "upd-blank@example.com", "secret123").await);
+    let before = jar.value("id").expect("session");
+
+    // Whitespace-only password: Devise's `blank?` treats it as absent.
+    let resp = submit_account_update(
+        &app,
+        "user[current_password]=secret123&user[password]=%20%20",
+        &jar.header(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    jar.merge(&resp);
+    assert!(
+        update_flash_keys(&resp, &state.config)
+            .await
+            .contains(&"updated".to_string()),
+        "a blank password keeps the updated branch"
+    );
+    assert_ne!(
+        before,
+        jar.value("id").expect("session"),
+        "a blank password still performs bypass_sign_in"
+    );
+}
+
+/// Devise `sign_in_after_change_password?` returning false (config off AND a
+/// real password change): flash `updated_but_not_signed_in` and NO session
+/// renewal, because Devise never calls `bypass_sign_in` on that branch.
+#[tokio::test]
+async fn flow_account_update_password_change_without_sign_in_keeps_session() {
+    let mut config = common::test_config();
+    config.sign_in_after_change_password = false;
+    let (state, app) = common::build_app(common::test_state_with_config(default_mapping(), config));
+    seed_user(&state, "upd-nosignin@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    jar.merge(&form_sign_in(&app, "upd-nosignin@example.com", "secret123").await);
+    let before = jar.value("id").expect("session");
+
+    let resp = submit_account_update(
+        &app,
+        "user[current_password]=secret123&user[password]=brand-new-pass&user[password_confirmation]=brand-new-pass",
+        &jar.header(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    jar.merge(&resp);
+    assert!(
+        update_flash_keys(&resp, &state.config)
+            .await
+            .contains(&"updated_but_not_signed_in".to_string()),
+        "config off plus a changed password flashes updated_but_not_signed_in"
+    );
+    assert_eq!(
+        before,
+        jar.value("id").expect("session"),
+        "the no-sign-in branch never renews the session"
+    );
+}
+
+/// Devise `set_flash_message_for_update` (M-4): the flash decision reads the
+/// reconfirmation/`sign_in_after_change_password?` branches ONLY. The port
+/// previously consulted `active_for_authentication?`, so an unconfirmed
+/// record changing its password flashed `updated_but_not_signed_in` where
+/// Devise flashes `updated`.
+///
+/// The app is wired WITHOUT the activatable fetch hook: ghb's gate deletes
+/// the scope session key before the handler runs, so the controller branch
+/// under test is reached through the hook-free wiring (the hook is an
+/// independent layer concern, not part of this decision).
+#[tokio::test]
+async fn flow_account_update_inactive_record_ignores_active_gate_for_flash() {
+    let (state, app) = update_matrix_no_gate_app(common::test_state(default_mapping()));
+    seed_user_unconfirmed(&state, "upd-unconfirmed@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/devise-test/bypass-sign-in?email=upd-unconfirmed%40example.com")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "bypass sign-in installs the session"
+    );
+    jar.merge(&resp);
+
+    let resp = submit_account_update(
+        &app,
+        "user[current_password]=secret123&user[password]=brand-new-pass&user[password_confirmation]=brand-new-pass",
+        &jar.header(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert!(
+        update_flash_keys(&resp, &state.config)
+            .await
+            .contains(&"updated".to_string()),
+        "an inactive record follows the Devise branch, not the active_for_authentication key"
+    );
+
+    // The password really moved (the branch ran, it did not bail early).
+    let mut conditions = Conditions::new();
+    conditions.insert(
+        "email",
+        Value::String("upd-unconfirmed@example.com".to_string()),
+    );
+    let after = state
+        .adapter
+        .find_first(&conditions)
+        .await
+        .expect("lookup")
+        .expect("record");
+    assert_ne!(
+        after.encrypted_password, "",
+        "the password change persisted on the inactive record too"
+    );
+}
+
+/// Hook-free wiring of the devise router plus the bypass probe (see
+/// [`flow_account_update_inactive_record_ignores_active_gate_for_flash`]).
+fn update_matrix_no_gate_app(state: common::TestState) -> (common::TestState, Router) {
+    let mapping = state.mapping.clone();
+    let scope_name = mapping.name.clone();
+    let finder: Arc<dyn ModelFinder> = Arc::new(AdapterBridge::new(state.adapter.as_ref().clone()));
+    let devise_layer = DeviseLayer::new(
+        common::registry_with(std::slice::from_ref(&mapping)),
+        state.config.clone(),
+    )
+    .with_hooks(Arc::new(HookRegistry::new()))
+    .with_finder(&scope_name, finder);
+    let session_layer = session_manager_layer(&state.config).expect("session layer builds");
+    let probe_adapter = state.adapter.clone();
+
+    let app = Router::new()
+        .merge(devise_for_router(state.clone()))
+        .route(
+            "/devise-test/bypass-sign-in",
+            axum::routing::get(
+                move |session: Session,
+                      Query(query): Query<std::collections::HashMap<String, String>>| {
+                    let adapter = probe_adapter.clone();
+                    async move {
+                        let mut conditions = Conditions::new();
+                        conditions.insert("email", Value::String(query.get("email").cloned().unwrap_or_default()));
+                        let Some(user) = OrmAdapter::find_first(adapter.as_ref(), &conditions)
+                            .await
+                            .expect("lookup")
+                        else {
+                            return StatusCode::NOT_FOUND;
+                        };
+                        devise_rust_axum::test_helpers::bypass_sign_in(&session, "user", &user)
+                            .await
+                            .expect("bypass");
+                        StatusCode::OK
+                    }
+                },
+            ),
+        )
+        .layer(devise_layer)
+        .layer(session_layer);
+    (state, app)
 }

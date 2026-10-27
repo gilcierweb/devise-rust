@@ -15,6 +15,7 @@ use actix_web::HttpResponse;
 use actix_web::dev::ServiceResponse;
 use actix_web::http::header;
 use actix_web::test;
+use actix_web::web;
 use common::{FixtureUser, SystemClock, TestState};
 use devise_rust::adapter::{Conditions, DeviseKey, OrmAdapter, Value};
 use devise_rust::failure::AnyDeviseModel;
@@ -1878,4 +1879,255 @@ async fn flow_reset_password_failure_sends_no_notification() {
         password_change_mails(&state).is_empty(),
         "a failed reset mails no password_change notice"
     );
+}
+
+// ============================================================================
+// Registrations update flash/bypass matrix (Devise
+// `registrations_controller.rb#update` lines 46-62, 131-135, 151-162):
+// the flash key and the bypass re-sign-in follow Devise's branch order
+// exactly - pending reconfirmation first, then `sign_in_after_change_password?`
+// (config OR a blank submitted password), and the flash NEVER consults
+// `active_for_authentication?`. M-4.
+// ============================================================================
+
+/// PATCH the account update action with the given urlencoded body and the
+/// jar's cookie replayed.
+async fn submit_account_update(
+    app: &impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse,
+        Error = actix_web::Error,
+    >,
+    body: &str,
+    cookie: &str,
+) -> actix_web::dev::ServiceResponse {
+    test::call_service(
+        app,
+        test::TestRequest::default()
+            .method(actix_web::http::Method::PATCH)
+            .uri("/users")
+            .insert_header(("cookie", cookie))
+            .insert_header(("content-type", "application/x-www-form-urlencoded"))
+            .set_payload(body.to_string())
+            .to_request(),
+    )
+    .await
+}
+
+/// Devise registrations#update (M-4): a password change under the default
+/// `sign_in_after_change_password` config flashes `updated` AND runs
+/// `bypass_sign_in` (the session id is recycled, so the new salt rides a
+/// fresh session instead of the pre-update one).
+#[actix_web::test]
+async fn flow_account_update_password_change_flashes_updated_and_renews() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    seed_user(&state, "upd-pw@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    jar.merge(&form_sign_in(&app, "upd-pw@example.com", "secret123").await);
+    let before = jar.value("id").expect("session");
+
+    let resp = submit_account_update(
+        &app,
+        "user[current_password]=secret123&user[password]=brand-new-pass&user[password_confirmation]=brand-new-pass",
+        &jar.header(),
+    )
+    .await;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
+        Some("updated"),
+        "a password change with the config on flashes updated"
+    );
+    jar.merge(&resp);
+    assert_ne!(
+        before,
+        jar.value("id").expect("session"),
+        "the updated branch performs bypass_sign_in (session renewed)"
+    );
+    // The re-signed-in session carries the NEW salt, so the next request
+    // still resolves the account (the pre-update salt would fail the
+    // warden compare and log the user out).
+    let probe = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/users_dashboard")
+            .insert_header(("cookie", jar.header()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        probe.status(),
+        200,
+        "the bypass re-sign-in keeps the session live"
+    );
+}
+
+/// Devise `sign_in_after_change_password?` (`registrations_controller.rb:132`):
+/// a BLANK submitted password returns true immediately, so the update still
+/// flashes `updated` and still re-signs in (the salt never moved, so the
+/// existing session stays valid either way).
+#[actix_web::test]
+async fn flow_account_update_blank_password_still_renews_with_updated_flash() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    seed_user(&state, "upd-blank@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    jar.merge(&form_sign_in(&app, "upd-blank@example.com", "secret123").await);
+    let before = jar.value("id").expect("session");
+
+    // Whitespace-only password: Devise's `blank?` treats it as absent.
+    let resp = submit_account_update(
+        &app,
+        "user[current_password]=secret123&user[password]=%20%20",
+        &jar.header(),
+    )
+    .await;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
+        Some("updated"),
+        "a blank password keeps the updated branch"
+    );
+    jar.merge(&resp);
+    assert_ne!(
+        before,
+        jar.value("id").expect("session"),
+        "a blank password still performs bypass_sign_in"
+    );
+}
+
+/// Devise `sign_in_after_change_password?` returning false (config off AND a
+/// real password change): flash `updated_but_not_signed_in` and NO session
+/// renewal, because Devise never calls `bypass_sign_in` on that branch.
+#[actix_web::test]
+async fn flow_account_update_password_change_without_sign_in_keeps_session() {
+    let mut config = common::test_config();
+    config.sign_in_after_change_password = false;
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
+    seed_user(&state, "upd-nosignin@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    jar.merge(&form_sign_in(&app, "upd-nosignin@example.com", "secret123").await);
+
+    let resp = submit_account_update(
+        &app,
+        "user[current_password]=secret123&user[password]=brand-new-pass&user[password_confirmation]=brand-new-pass",
+        &jar.header(),
+    )
+    .await;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
+        Some("updated_but_not_signed_in"),
+        "config off plus a changed password flashes updated_but_not_signed_in"
+    );
+    jar.merge(&resp);
+    // No `bypass_sign_in` ran, so the session still carries the PRE-update
+    // salt: the next request fails the warden salt compare and the visitor
+    // is anonymous again (Devise sends the user to `new_session_path`).
+    let probe = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/users_dashboard")
+            .insert_header(("cookie", jar.header()))
+            .to_request(),
+    )
+    .await;
+    assert!(
+        !probe.status().is_success(),
+        "the stale-salt session is rejected: no bypass_sign_in on this branch"
+    );
+}
+
+/// Devise `set_flash_message_for_update` (M-4): the flash decision reads the
+/// reconfirmation / `sign_in_after_change_password?` branches ONLY. The port
+/// previously consulted `active_for_authentication?`, so an unconfirmed
+/// record changing its password flashed `updated_but_not_signed_in` where
+/// Devise flashes `updated`.
+#[actix_web::test]
+async fn flow_account_update_inactive_record_ignores_active_gate_for_flash() {
+    let (state, app) = common::build_app_with(
+        common::test_state(common::default_mapping()),
+        vec![(
+            "/devise-test/bypass-sign-in",
+            web::get().to(bypass_sign_in_probe),
+        )],
+    )
+    .await;
+    seed_user_unconfirmed(&state, "upd-unconfirmed@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/devise-test/bypass-sign-in?email=upd-unconfirmed%40example.com")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "bypass sign-in installs the session");
+    jar.merge(&resp);
+
+    let resp = submit_account_update(
+        &app,
+        "user[current_password]=secret123&user[password]=brand-new-pass&user[password_confirmation]=brand-new-pass",
+        &jar.header(),
+    )
+    .await;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
+        Some("updated"),
+        "an inactive record follows the Devise branch, not the active_for_authentication key"
+    );
+
+    // The password really moved (the branch ran, it did not bail early).
+    let mut conditions = Conditions::new();
+    conditions.insert(
+        "email",
+        Value::String("upd-unconfirmed@example.com".to_string()),
+    );
+    let after = state
+        .adapter
+        .find_first(&conditions)
+        .await
+        .expect("lookup")
+        .expect("record");
+    assert_ne!(
+        after.encrypted_password, "",
+        "the password change persisted on the inactive record too"
+    );
+}
+
+/// Bypass-sign-in probe for the inactive-record fixture: install a session
+/// payload for a record the interactive sign-in refuses (the unconfirmed
+/// account the registrations#update flash matrix needs). Mirrors
+/// `test_helpers::bypass_sign_in` (IntegrationHelpers parity).
+async fn bypass_sign_in_probe(
+    session: actix_session::Session,
+    state: web::Data<TestState>,
+    query: web::Query<HashMap<String, String>>,
+) -> HttpResponse {
+    let email = query.get("email").cloned().unwrap_or_default();
+    let mut conditions = Conditions::new();
+    conditions.insert("email", Value::String(email));
+    let Some(user) = state.adapter.find_first(&conditions).await.expect("lookup") else {
+        return HttpResponse::NotFound().finish();
+    };
+    devise_rust_actix::test_helpers::bypass_sign_in(&session, "user", &user)
+        .await
+        .expect("bypass");
+    HttpResponse::Ok().finish()
 }
