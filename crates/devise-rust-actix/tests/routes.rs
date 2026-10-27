@@ -206,7 +206,7 @@ async fn sessions_controller_happy_path_and_flash_split() {
 }
 
 /// Registrations create: valid params sign up + sign in; duplicate email
-/// lands 422 in both formats.
+/// lands the configured `error_status` (200 by default) in both formats.
 #[actix_web::test]
 async fn registrations_controller_create_matrix() {
     let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
@@ -227,7 +227,8 @@ async fn registrations_controller_create_matrix() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Duplicate email → 422 with :taken key on email.
+    // Duplicate email → the configured error_status (200 by default, the
+    // Devise responder `:ok`) with :taken key on email.
     let req = test::TestRequest::post()
         .uri("/users")
         .insert_header(("content-type", "application/json"))
@@ -237,7 +238,7 @@ async fn registrations_controller_create_matrix() {
         )
         .to_request();
     let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = test::read_body_json(resp).await;
     let errors = body["errors"]["email"].as_array().expect("email errors");
     assert!(

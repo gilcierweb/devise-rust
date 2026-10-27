@@ -24,8 +24,10 @@
 //! ## Response split (D-15)
 //!
 //! Navigational (HTML-accepting) requests get Devise's 302 + flash cookie
-//! semantics; JSON callers get status codes (`200`/`201`/`204`/`401`/`422`)
-//! with symbolic error keys in the body (en.yml symbols, never values).
+//! semantics; JSON callers get status codes (`200`/`201`/`204`/`401`) plus
+//! the configured [`DeviseConfig::error_status`] (200 by default) on the
+//! validation-failure renders, with symbolic error keys unchanged in the
+//! body (en.yml symbols, never values).
 
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]
@@ -708,17 +710,34 @@ fn unauthenticated_response<M, A, L>(
     auth_fail(auth_request, st, "unauthenticated")
 }
 
-/// Validation failure: HTML re-render 422 / JSON 422 with keyed errors.
-fn invalid_response(auth_request: &AuthRequest, errors: &ValidationErrors) -> Response {
+/// The responder `error_status` (`devise/lib/devise/controllers/responder.rb:9`)
+/// for a config: [`DeviseConfig::validate`] rejects out-of-range codes at
+/// boot, and this `unwrap_or` is defense-in-depth for configs that never
+/// validated (never panic on the render path).
+fn error_status_of(config: &DeviseConfig) -> StatusCode {
+    StatusCode::from_u16(config.error_status).unwrap_or(StatusCode::OK)
+}
+
+/// Validation failure: HTML re-render and JSON both answer the configured
+/// responder `error_status`, exactly as Devise's `respond_with` error
+/// renders do for every format (`error_status` is applied to the HTML
+/// re-render AND the JSON body). The keyed error body is unchanged; only
+/// the status moves. The `confirmations#show` / `unlocks#show` call sites
+/// pass Devise's hardcoded 422 instead (their TODO carve-out).
+fn invalid_response(
+    auth_request: &AuthRequest,
+    errors: &ValidationErrors,
+    status: StatusCode,
+) -> Response {
     if wants_json(auth_request) {
         return (
-            StatusCode::UNPROCESSABLE_ENTITY,
+            status,
             axum::Json(serde_json::json!({ "errors": errors_json(errors) })),
         )
             .into_response();
     }
     (
-        StatusCode::UNPROCESSABLE_ENTITY,
+        status,
         [("content-type", "text/html; charset=utf-8")],
         format!(
             "Form errors: {}",
@@ -1225,7 +1244,7 @@ where
         .await;
     if !errors.is_empty() {
         record.clean_up_passwords();
-        return invalid_response(&auth_request, &errors);
+        return invalid_response(&auth_request, &errors, error_status_of(&st.config));
     }
     let Ok(mut saved) = st.adapter.create(record).await else {
         return internal_error();
@@ -1314,7 +1333,7 @@ where
 
     if let Err(errors) = record.update_with_password(&mut params, &st.config) {
         record.clean_up_passwords();
-        return invalid_response(&auth_request, &errors);
+        return invalid_response(&auth_request, &errors, error_status_of(&st.config));
     }
 
     let mut errors = record.validate(&st.config);
@@ -1323,7 +1342,7 @@ where
         .await;
     if !errors.is_empty() {
         record.clean_up_passwords();
-        return invalid_response(&auth_request, &errors);
+        return invalid_response(&auth_request, &errors, error_status_of(&st.config));
     }
 
     // Devise `before_update` on recoverable (`clear_reset_password_token`,
@@ -1503,7 +1522,7 @@ where
         };
         return flash_redirect(&st.config, &st.mapping.sign_in_path(), key);
     }
-    invalid_response(&auth_request, &resource.errors)
+    invalid_response(&auth_request, &resource.errors, error_status_of(&st.config))
 }
 
 async fn passwords_edit<M, A, L>(
@@ -1549,7 +1568,7 @@ where
         return internal_error();
     };
     if !resource.is_valid() {
-        return invalid_response(&auth_request, &resource.errors);
+        return invalid_response(&auth_request, &resource.errors, error_status_of(&st.config));
     }
 
     // Devise: unlock locked accounts on email-unlockable models.
@@ -1618,7 +1637,14 @@ where
         }
         return flash_redirect(&st.config, &st.mapping.sign_in_path(), "confirmed");
     }
-    invalid_response(&auth_request, &resource.errors)
+    // Devise carves `confirmations#show` out of the configurable
+    // `error_status` with a TODO to adopt it only when the default changes
+    // (`confirmations_controller.rb:30-31`); the port mirrors the hardcode.
+    invalid_response(
+        &auth_request,
+        &resource.errors,
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
 }
 
 async fn confirmations_create<M, A, L>(
@@ -1663,7 +1689,7 @@ where
         }
         return flash_redirect(&st.config, &st.mapping.sign_in_path(), key);
     }
-    invalid_response(&auth_request, &resource.errors)
+    invalid_response(&auth_request, &resource.errors, error_status_of(&st.config))
 }
 
 // ============================================================================
@@ -1697,7 +1723,14 @@ where
         }
         return flash_redirect(&st.config, &st.mapping.sign_in_path(), "unlocked");
     }
-    invalid_response(&auth_request, &resource.errors)
+    // Devise carves `unlocks#show` out of the configurable `error_status`
+    // with a TODO to adopt it only when the default changes
+    // (`unlocks_controller.rb:32-33`); the port mirrors the hardcode.
+    invalid_response(
+        &auth_request,
+        &resource.errors,
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
 }
 
 async fn unlocks_create<M, A, L>(
@@ -1742,5 +1775,5 @@ where
         }
         return flash_redirect(&st.config, &st.mapping.sign_in_path(), key);
     }
-    invalid_response(&auth_request, &resource.errors)
+    invalid_response(&auth_request, &resource.errors, error_status_of(&st.config))
 }

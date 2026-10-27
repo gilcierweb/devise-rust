@@ -351,7 +351,8 @@ async fn flow_sign_in_failure_formats() {
 }
 
 /// Devise `registerable` failure path: mismatched confirmation re-renders
-/// (422) with the virtual password fields cleared (never echoed back).
+/// (the configured `error_status`, 200 by default) with the virtual
+/// password fields cleared (never echoed back).
 #[actix_web::test]
 async fn flow_sign_up_failure_clears_passwords_and_keeps_errors() {
     let (_state, app) = common::build_app(common::test_state(common::default_mapping())).await;
@@ -367,7 +368,7 @@ async fn flow_sign_up_failure_clears_passwords_and_keeps_errors() {
             .to_request(),
     )
     .await;
-    assert_eq!(resp.status(), 422);
+    assert_eq!(resp.status(), 200);
     let body = test::read_body(resp).await;
     let text = String::from_utf8(body.to_vec()).expect("utf8");
     assert!(
@@ -381,7 +382,8 @@ async fn flow_sign_up_failure_clears_passwords_and_keeps_errors() {
 }
 
 /// Devise: the `current_password` gate — wrong current password updates
-/// nothing (`encrypted_password` byte-identical afterwards), 422 both formats.
+/// nothing (`encrypted_password` byte-identical afterwards), answering the
+/// configured `error_status` (200 by default) in both formats.
 #[actix_web::test]
 async fn flow_account_update_requires_current_password() {
     let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
@@ -405,7 +407,7 @@ async fn flow_account_update_requires_current_password() {
             .to_request(),
     )
     .await;
-    assert_eq!(resp.status(), 422);
+    assert_eq!(resp.status(), 200);
 
     let mut conditions = Conditions::new();
     conditions.insert("email", Value::String("flow4@example.com".to_string()));
@@ -589,7 +591,8 @@ async fn flow_reset_token_errors() {
         Some("no_token")
     );
 
-    // Unknown token on update → 422 with `invalid` key.
+    // Unknown token on update → the configured error_status (200 by
+    // default) with `invalid` key.
     let resp = test::call_service(
         &app,
         test::TestRequest::default()
@@ -610,7 +613,7 @@ async fn flow_reset_token_errors() {
             .to_request(),
     )
     .await;
-    assert_eq!(resp.status(), 422);
+    assert_eq!(resp.status(), 200);
     let body: serde_json::Value = test::read_body_json(resp).await;
     let rendered = body["errors"]["reset_password_token"]
         .as_array()
@@ -625,12 +628,19 @@ async fn flow_reset_token_errors() {
 /// Devise confirmable: blank confirmation token → 422 `:blank`; legacy RAW
 /// token lookup still confirms; digested lookup is the primary path via the
 /// mailed link.
+///
+/// The blank-token SHOW leg keeps asserting the hardcoded 422: Devise
+/// carves `confirmations#show` out of the configurable `error_status` with
+/// a TODO to adopt it only when the default changes
+/// (`confirmations_controller.rb:30-31`), so the port mirrors the
+/// hardcode and this test pins the carve-out.
 #[actix_web::test]
 async fn flow_confirm_by_token_blank_and_legacy_paths() {
     let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
     let user = seed_user_unconfirmed(&state, "flow6@example.com", "secret123").await;
 
-    // Blank token (missing query param) → 422 with :blank.
+    // Blank token (missing query param) → the SHOW carve-out keeps
+    // Devise's hardcoded 422 with :blank.
     let resp = test::call_service(
         &app,
         test::TestRequest::get()
@@ -1422,5 +1432,47 @@ async fn flow_blank_password_paranoid_reports_invalid() {
             .as_deref(),
         Some("invalid"),
         "unified invalid flash under paranoid"
+    );
+}
+
+/// error_status wiring: a non-default `error_status` demonstrably reaches
+/// the wire through the real app (build via `test_state_with_config`), so
+/// the duplicate-email render reads the config instead of a constant.
+/// Setting `error_status` to 422 is also the documented one-line
+/// restoration path for apps that want the generated-Devise posture.
+#[actix_web::test]
+async fn error_status_config_reaches_validation_render() {
+    let mut config = common::test_config();
+    config.error_status = 422;
+    let (state, app) = common::build_app(common::test_state_with_config(
+        common::default_mapping(),
+        config,
+    ))
+    .await;
+    let existing = FixtureUser::new_with_password("taken@example.com", "secret123", &state.config)
+        .confirmed_now(&common::SystemClock);
+    state.adapter.create(existing).await.expect("seed");
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/users")
+            .insert_header(("content-type", "application/json"))
+            .insert_header(("accept", "application/json"))
+            .set_payload(
+                r#"{"user":{"email":"taken@example.com","password":"secret123","password_confirmation":"secret123"}}"#,
+            )
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 422);
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert!(
+        body["errors"]["email"]
+            .as_array()
+            .expect("email errors")
+            .iter()
+            .any(|e| e.as_str().is_some_and(|s| s.contains("taken"))),
+        "taken key must reach the 422 render: {body}"
     );
 }
