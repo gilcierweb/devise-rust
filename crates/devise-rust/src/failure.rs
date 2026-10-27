@@ -7,6 +7,7 @@
 //! vs Recall) is added in Plan 04; this file defines the enum variants only.
 
 use crate::adapter::DeviseKey;
+use crate::config::DeviseConfig;
 use crate::request::AuthRequest;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,15 @@ pub enum Failure {
 
     /// Recall - re-dispatch to controller/action preserving params
     /// (for custom sign-in forms that need the original params)
+    ///
+    /// Deviation: Devise's failure app recall branch re-dispatches the
+    /// request to the stored controller and action WITH the original params
+    /// (`devise/lib/devise/failure_app.rb`), while both framework renderers
+    /// in this port simplify recall to a 302 redirect to the scope's
+    /// sign-in path with no param-preserving re-dispatch. The port keeps the
+    /// recall option's classification only ([`Failure::is_recall`] plus the
+    /// `build_failure` priority slot), which is the deliberate
+    /// simplification the CONCERNS.md sharp-edge row permits.
     Recall {
         /// Controller name (e.g., "sessions")
         controller: String,
@@ -106,7 +116,10 @@ impl Failure {
 
     /// Check if this failure is a recall
     ///
-    /// Mirrors the failure app's `recall`: replaying the stored location instead of redirecting to sign in.
+    /// Mirrors the failure app's `recall` classification: this port reports
+    /// which failure would have been a recall, while the framework renderers
+    /// redirect instead of re-dispatching (see the [`Failure::Recall`]
+    /// deviation note).
     #[must_use]
     pub fn is_recall(&self) -> bool {
         matches!(self, Failure::Recall { .. })
@@ -315,6 +328,24 @@ pub trait AnyDeviseModel: Send + Sync + 'static {
     /// Default no-op; override for custom logic that runs only after the
     /// user is remembered.
     fn after_remembered_hook(&self) {}
+
+    /// Whether this record extends its remember window on a hit (Devise
+    /// `extend_remember_period`).
+    ///
+    /// The model method reads the class config cascade
+    /// (`devise/lib/devise/models/rememberable.rb:69-71`) and the remember
+    /// strategy asks the RESOURCE through `extend_remember_me?`
+    /// (`devise/lib/devise/strategies/rememberable.rb:47-49`), so an app
+    /// model that overrides the typed
+    /// [`Rememberable::extend_remember_period`](crate::rememberable::Rememberable::extend_remember_period)
+    /// for per-record behavior MUST forward this seam in its `AnyDeviseModel`
+    /// impl, otherwise the erased strategy chain keeps seeing only the
+    /// config default. The typed trait is not object-safe, which is why this
+    /// seam exists - the same one-line reason the neighboring rememberable
+    /// seams carry.
+    fn extend_remember_period_hook(&self, config: &DeviseConfig) -> bool {
+        config.extend_remember_period
+    }
 
     /// Session pair for this model: `(key, salt)`.
     ///

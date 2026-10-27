@@ -574,6 +574,16 @@ pub trait Rememberable: Authenticatable {
     fn after_remembered(&self) {}
 
     /// `extend_remember_period` for this record (default: global config).
+    ///
+    /// The full Devise contract (`devise/lib/devise/models/rememberable.rb:69-71`):
+    /// the instance method reads the class config cascade, so an app model
+    /// overrides THIS method for per-record behavior. Because the typed trait
+    /// is not object-safe, an overriding model must ALSO forward
+    /// [`AnyDeviseModel::extend_remember_period_hook`](crate::failure::AnyDeviseModel::extend_remember_period_hook)
+    /// in its erased impl, otherwise the remember strategy only ever sees the
+    /// config default (the same forwarding requirement the other rememberable
+    /// seams document). Devise's strategy asks the resource through
+    /// `extend_remember_me?` (`strategies/rememberable.rb:47-49`).
     fn extend_remember_period(&self, config: &DeviseConfig) -> bool {
         config.extend_remember_period
     }
@@ -820,6 +830,7 @@ mod tests {
     use super::*;
     use crate::adapter::memory::MemoryAdapter;
     use crate::failure::AnyDeviseModel;
+    use crate::strategy::Strategy;
     use crate::time::FixedClock;
     use chrono::TimeDelta;
     use serde::{Deserialize, Serialize};
@@ -833,6 +844,8 @@ mod tests {
         remember_created_at: Option<DateTime<Utc>>,
         #[serde(skip)]
         remember_flag: Option<bool>,
+        #[serde(skip)]
+        extend_override: Option<bool>,
     }
 
     impl TestUser {
@@ -875,6 +888,10 @@ mod tests {
             self.remember_flag = Some(flag);
         }
 
+        fn extend_remember_period_hook(&self, config: &DeviseConfig) -> bool {
+            <Self as Rememberable>::extend_remember_period(self, config)
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
@@ -911,6 +928,14 @@ mod tests {
 
         fn persisted(&self) -> bool {
             self.id != 0
+        }
+
+        /// Test knob: `Some(value)` is the per-record override the
+        /// `extend_override` field carries, `None` falls back to the global
+        /// config (the shipped default).
+        fn extend_remember_period(&self, config: &DeviseConfig) -> bool {
+            self.extend_override
+                .unwrap_or(config.extend_remember_period)
         }
     }
 
@@ -1144,6 +1169,159 @@ mod tests {
 
     fn write_count(counter: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> usize {
         counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Remember-enabled mapping for the strategy-level tests.
+    fn extend_mapping() -> crate::scope::Mapping {
+        crate::scope::Mapping {
+            name: "user".to_string(),
+            class_name: "TestUser".to_string(),
+            path: "users".to_string(),
+            path_prefix: None,
+            singular: "user".to_string(),
+            path_names: crate::scope::PathNames::default(),
+            controllers: HashMap::new(),
+            modules: vec![crate::scope::Module::Rememberable],
+            only: vec![],
+            skip: vec![],
+            constraints: HashMap::new(),
+            defaults: HashMap::new(),
+            format: None,
+            router_name: None,
+            sign_out_via: crate::scope::SignOutVia::Delete,
+            failure_app: None,
+        }
+    }
+
+    /// Seed a remembered record carrying the per-model override knob, and
+    /// return the finder plus the encoded cookie for one request run.
+    ///
+    /// The remember state is stamped IN MEMORY rather than through a durable
+    /// `remember_me`: the memory oracle round-trips `update_columns` through
+    /// JSON, which drops `#[serde(skip)]` knobs, while `create` stores the
+    /// typed clone. `serialize_into_cookie` is the same mint the durable path
+    /// uses, so the cookie shape is unchanged.
+    async fn extend_seed(
+        override_value: Option<bool>,
+        clock: &mut FixedClock,
+    ) -> (
+        crate::model::AdapterBridge<MemoryAdapter<TestUser>, TestUser>,
+        String,
+        String,
+        String,
+    ) {
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mut user = TestUser::fresh(1, "extend@example.com");
+        user.extend_override = override_value;
+        user.set_remember_token(Some("extend-token".to_string()));
+        user.set_remember_created_at(Some(clock.now()));
+        adapter.create(user.clone()).await.unwrap();
+        clock.advance(TimeDelta::seconds(2));
+        let (key, value, generated) = user.serialize_into_cookie(clock).unwrap();
+        assert!(user.remember_me_valid(&value, &generated, &test_config(), clock));
+        let encoded = encode_cookie_value(&key, &value, &generated);
+        (
+            crate::model::AdapterBridge::new(adapter),
+            key,
+            value,
+            encoded,
+        )
+    }
+
+    fn extend_strategy_at(instant: DateTime<Utc>) -> crate::strategy::RememberableStrategy {
+        crate::strategy::RememberableStrategy {
+            cookie_key: "remember_user_token".to_string(),
+            clock: std::sync::Arc::new(FixedClock::new(instant)),
+        }
+    }
+
+    fn extend_request(encoded: &str) -> AuthRequest {
+        let mut request = AuthRequest::new(crate::request::HttpMethod::Get, "/");
+        request
+            .cookies
+            .insert("remember_user_token".to_string(), encoded.to_string());
+        request
+    }
+
+    /// Devise parity (`models/rememberable.rb:69-71` plus
+    /// `strategies/rememberable.rb:47-49`): the strategy asks the RESOURCE
+    /// through `extend_remember_me?`, so a per-model override forces the
+    /// re-issue the global config denied. Without the seam the strategy
+    /// would read `config.extend_remember_period = false` and return the
+    /// plain success below.
+    #[tokio::test]
+    async fn extend_override_forces_refresh_despite_config_false() {
+        let config = test_config();
+        assert!(!config.extend_remember_period);
+        let mut clock = fixed_clock();
+        let (finder, _key, _value, encoded) = extend_seed(Some(true), &mut clock).await;
+        let strategy = extend_strategy_at(clock.now());
+        let request = extend_request(&encoded);
+        assert!(strategy.valid(&request, &extend_mapping(), &config).await);
+        let outcome = strategy
+            .authenticate(&request, &extend_mapping(), &finder, &config)
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Ok(crate::failure::AuthOutcome::SuccessWithCookieRefresh { .. })
+            ),
+            "the record override must force the refresh the config denied: {outcome:?}"
+        );
+    }
+
+    /// The other direction (T-261026-ghd-01): with the config granting the
+    /// re-issue, a per-model override returning false blocks it, proving the
+    /// strategy reads the record and not the config.
+    #[tokio::test]
+    async fn extend_override_blocks_refresh_despite_config_true() {
+        let config = DeviseConfig {
+            extend_remember_period: true,
+            ..test_config()
+        };
+        let mut clock = fixed_clock();
+        let (finder, _key, _value, encoded) = extend_seed(Some(false), &mut clock).await;
+        let strategy = extend_strategy_at(clock.now());
+        let request = extend_request(&encoded);
+        assert!(strategy.valid(&request, &extend_mapping(), &config).await);
+        let outcome = strategy
+            .authenticate(&request, &extend_mapping(), &finder, &config)
+            .await;
+        assert!(
+            matches!(outcome, Ok(crate::failure::AuthOutcome::Success(_))),
+            "the record override must block the config-granted refresh: {outcome:?}"
+        );
+    }
+
+    /// The knob-None default keeps the shipped behavior in both directions,
+    /// so a model that never overrides cannot drift.
+    #[tokio::test]
+    async fn extend_default_keeps_config_behavior_both_ways() {
+        let mut granted = test_config();
+        granted.extend_remember_period = true;
+        let mut clock = fixed_clock();
+        let (finder, _key, _value, encoded) = extend_seed(None, &mut clock).await;
+        let strategy = extend_strategy_at(clock.now());
+        let request = extend_request(&encoded);
+        let refreshed = strategy
+            .authenticate(&request, &extend_mapping(), &finder, &granted)
+            .await;
+        assert!(
+            matches!(
+                refreshed,
+                Ok(crate::failure::AuthOutcome::SuccessWithCookieRefresh { .. })
+            ),
+            "no override plus config true still refreshes: {refreshed:?}"
+        );
+
+        let denied = test_config();
+        let plain = strategy
+            .authenticate(&request, &extend_mapping(), &finder, &denied)
+            .await;
+        assert!(
+            matches!(plain, Ok(crate::failure::AuthOutcome::Success(_))),
+            "no override plus config false still does not refresh: {plain:?}"
+        );
     }
 
     /// Seed a persisted user remembered at the clock instant, returning the

@@ -17,6 +17,20 @@ use serde_json::Value;
 /// bridge controls storage I/O. Malicious bridge could corrupt session data
 /// (T-03-02) - bridge MUST sign/encrypt cookies.
 ///
+/// == Deviation: the shipped bridges sign but do not encrypt
+///
+/// Transport truth: with a client-side cookie store (actix-session's
+/// `CookieSessionStore` with its default signed content security;
+/// tower-sessions `CookieStore` over `SignedCookie`) the session payload is
+/// integrity protected but client readable. The payload carries the
+/// bcrypt-derived `authenticatable_salt` (CONCERNS row 5), so that salt is
+/// exposed to the holder of the cookie; the full digest never travels and
+/// the salt alone cannot verify a password, but confidentiality is the app's
+/// store choice. The axum default is the server-side `MemoryStore`, where
+/// only a signed session id crosses the wire. The Rails reference rides an
+/// encrypted cookie store by default, so an app wanting that posture chooses
+/// an encrypted or server-side store.
+///
 /// Mirrors the warden per-scope session surface devise reads and writes (`warden.session(scope)`), including the salt-checked fetch semantics.
 #[async_trait]
 pub trait SessionStore: Send + Sync {

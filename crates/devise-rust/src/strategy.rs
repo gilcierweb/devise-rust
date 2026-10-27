@@ -593,8 +593,14 @@ impl Strategy for HttpBasicStrategy {
 /// five-condition check. Every miss shape (undecodable cookie, bad key,
 /// unknown record, valueless record, failed check) deletes the cookie and
 /// passes through, never failing. On a hit the strategy optionally re-issues
-/// the cookie when `extend_remember_period` holds, calls
-/// `after_remembered`, and succeeds.
+/// the cookie when the record's overridable `extend_remember_period` holds,
+/// calls `after_remembered`, and succeeds.
+///
+/// The re-issue decision is read from the RESOURCE exactly as Devise's
+/// `extend_remember_me?` does (`strategies/rememberable.rb:47-49`), never
+/// from the global config directly: the model method defaults to the config
+/// cascade (`models/rememberable.rb:69-71`), so an app override flips the
+/// refresh while every non-overriding model keeps the config behavior.
 pub struct RememberableStrategy {
     /// Cookie name (default `remember_{scope}_token`, override aware).
     pub cookie_key: String,
@@ -670,7 +676,10 @@ impl Strategy for RememberableStrategy {
                 message: record.unauthenticated_message(),
             });
         }
-        if config.extend_remember_period {
+        // Devise's strategy asks the record (`strategies/rememberable.rb:47-49`):
+        // the per-model `extend_remember_period` decides the re-issue, with
+        // the global config as its default.
+        if record.extend_remember_period_hook(config) {
             let (fresh_key, fresh_value, fresh_generated) =
                 crate::rememberable::build_cookie_triple(
                     &key.to_string(),

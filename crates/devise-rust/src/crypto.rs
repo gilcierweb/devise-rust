@@ -28,6 +28,17 @@ type HmacSha256 = Hmac<Sha256>;
 /// * `stretches` - bcrypt cost factor (default 12, matching Devise's
 ///   `Devise.stretches`)
 ///
+/// == Deviation: bcrypt runs synchronously
+///
+/// `digest` and `compare` run bcrypt synchronously on the calling thread;
+/// this crate performs no async offload anywhere. Devise's own
+/// `Encryptor` is synchronous (`devise/lib/devise/encryptor.rb`), so parity
+/// is unaffected. This is the deliberate decision recorded at the 10-05 gap
+/// closure: the earlier "offload" claim in this surface was deleted rather
+/// than implemented. A caller inside an async server that must not block
+/// owns the offload decision, for example by moving the whole
+/// authentication operation onto a blocking-friendly executor.
+///
 /// == Examples
 ///
 /// ```
