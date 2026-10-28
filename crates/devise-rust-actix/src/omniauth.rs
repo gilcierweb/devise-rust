@@ -220,7 +220,7 @@ fn after_sign_in_target(session: &Session, mapping: &devise_rust::scope::Mapping
 /// crate; the string-literal trackable map that used to live here was
 /// consolidated into the core `tracked_fields_changeset` builder,
 /// 261026-ghl).
-
+///
 /// Register the mapping's omniauth route pair (POST-only authorize plus
 /// GET-or-POST callback) as an actix [`Scope`] mounted at the resolved
 /// omniauth base — the same shared core spec data the axum crate
