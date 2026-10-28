@@ -69,6 +69,15 @@ pub enum DeviseError {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationErrors {
     inner: HashMap<String, Vec<String>>,
+    /// Per-entry I18n interpolation options keyed by `(field, key)`.
+    ///
+    /// Devise's `errors.add(attr, :key, period: ...)` carries the
+    /// interpolation payload beside the symbolic key
+    /// (`confirmable.rb:82-83`); this parallel map is that payload. Keys
+    /// stay the only rendered surface — options feed the renderer's
+    /// `%{placeholder}` substitution, never the wire body by themselves.
+    #[serde(skip)]
+    options: HashMap<(String, String), Vec<(String, String)>>,
 }
 
 impl ValidationErrors {
@@ -88,6 +97,42 @@ impl ValidationErrors {
             .entry(field.to_string())
             .or_default()
             .push(key.to_string());
+    }
+
+    /// Add an error key for a field with I18n interpolation options.
+    ///
+    /// Mirrors `errors.add(attr, :key, period: "3 days")`
+    /// (`devise/lib/devise/models/confirmable.rb:82-83`): the symbolic
+    /// key rides the errors map exactly like [`Self::add`], and the
+    /// named options become the renderer's `%{placeholder}`
+    /// substitutions
+    /// ([`translate`](crate::i18n::translate) consumes them through
+    /// [`Self::options_for`]). Keys-only usage is unchanged: entries
+    /// without options behave exactly like plain `add` calls.
+    pub fn add_with_options(&mut self, field: &str, key: &str, options: &[(&str, &str)]) {
+        self.add(field, key);
+        if options.is_empty() {
+            return;
+        }
+        self.options
+            .entry((field.to_string(), key.to_string()))
+            .or_default()
+            .extend(
+                options
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string())),
+            );
+    }
+
+    /// Interpolation options for one `(field, key)` entry.
+    ///
+    /// The payload a renderer pairs with the symbolic key before the
+    /// I18n lookup; empty for keys-only entries.
+    #[must_use]
+    pub fn options_for(&self, field: &str, key: &str) -> &[(String, String)] {
+        self.options
+            .get(&(field.to_string(), key.to_string()))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Get all error keys for a field
@@ -127,10 +172,14 @@ impl ValidationErrors {
 
     /// Merge another `ValidationErrors` into this one
     ///
-    /// Mirrors `ActiveModel` `errors.merge!`.
+    /// Mirrors `ActiveModel` `errors.merge!` — the interpolation options
+    /// travel with their entries.
     pub fn merge(&mut self, other: ValidationErrors) {
         for (field, keys) in other.inner {
             self.inner.entry(field).or_default().extend(keys);
+        }
+        for (entry, opts) in other.options {
+            self.options.entry(entry).or_default().extend(opts);
         }
     }
 }
@@ -301,6 +350,53 @@ pub fn errors_json(errors: &ValidationErrors) -> serde_json::Value {
         {
             list.push(serde_json::Value::String(message));
         }
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Render the per-entry I18n interpolation options as the JSON payload a
+/// renderer pairs with [`errors_json`]: one object keyed
+/// `"{field}::{key}"` mapping the option names to their values.
+///
+/// Empty (`{}`) when no entry carries options, so the plain keys-only
+/// flows add nothing to their payloads. The options are the Devise
+/// `errors.add(attr, :key, period: ...)` payload
+/// (`confirmable.rb:82-83`): the renderer feeds them into the
+/// `%{placeholder}` substitution
+/// ([`translate`](crate::i18n::translate)) of the symbolic key.
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::error::{ValidationErrors, errors_options_json};
+///
+/// let mut errors = ValidationErrors::new();
+/// assert_eq!(errors_options_json(&errors), serde_json::json!({}));
+/// errors.add_with_options("email", ":confirmation_period_expired", &[("period", "3 days")]);
+/// assert_eq!(
+///     errors_options_json(&errors),
+///     serde_json::json!({
+///         "email::confirmation_period_expired": { "period": "3 days" }
+///     })
+/// );
+/// ```
+#[must_use]
+pub fn errors_options_json(errors: &ValidationErrors) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for ((field, key), options) in &errors.options {
+        let entry: serde_json::Map<String, serde_json::Value> = options
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    serde_json::Value::String(value.clone()),
+                )
+            })
+            .collect();
+        // The stored keys carry Devise's leading colon (":blank"); the
+        // composite drops it so the idiom reads "field::key".
+        let bare = key.trim_start_matches(':');
+        map.insert(format!("{field}::{bare}"), serde_json::Value::Object(entry));
     }
     serde_json::Value::Object(map)
 }
@@ -568,6 +664,74 @@ mod tests {
         assert_eq!(
             errors_json(&errors)["email"],
             serde_json::json!([":blank", ":invalid", ":taken"])
+        );
+    }
+
+    /// The interpolation options ride the (field, key) entry exactly like
+    /// Devise's `errors.add(attr, :key, period: ...)` payload, without
+    /// changing the keys-only surface (M-8 / T-261026-ghk-01).
+    #[test]
+    fn test_add_with_options_carries_the_interpolation_payload() {
+        let mut errors = ValidationErrors::new();
+        errors.add_with_options(
+            "email",
+            ":confirmation_period_expired",
+            &[("period", "3 days")],
+        );
+        // The keys map is unchanged by the options.
+        assert_eq!(
+            errors_json(&errors),
+            serde_json::json!({ "email": [":confirmation_period_expired"] })
+        );
+        assert_eq!(
+            errors.options_for("email", ":confirmation_period_expired"),
+            &[("period".to_string(), "3 days".to_string())]
+        );
+        // A keys-only entry has no options.
+        errors.add("password", ":too_short");
+        assert!(errors.options_for("password", ":too_short").is_empty());
+
+        // Multiple options on one entry, and the rendered options JSON.
+        errors.add_with_options(
+            "email",
+            ":confirmation_period_expired",
+            &[("count", "2")],
+        );
+        assert_eq!(
+            errors.options_for("email", ":confirmation_period_expired"),
+            &[
+                ("period".to_string(), "3 days".to_string()),
+                ("count".to_string(), "2".to_string())
+            ]
+        );
+        assert_eq!(
+            errors_options_json(&errors),
+            serde_json::json!({
+                "email::confirmation_period_expired": { "period": "3 days", "count": "2" }
+            })
+        );
+        assert_eq!(errors_options_json(&ValidationErrors::new()), serde_json::json!({}));
+    }
+
+    /// `errors.merge!` carries the options with their entries.
+    #[test]
+    fn test_merge_carries_options() {
+        let mut errors = ValidationErrors::new();
+        errors.add("email", ":invalid");
+        let mut incoming = ValidationErrors::new();
+        incoming.add_with_options(
+            "email",
+            ":confirmation_period_expired",
+            &[("period", "3 days")],
+        );
+        errors.merge(incoming);
+        assert_eq!(
+            errors.get("email").map(Vec::as_slice),
+            Some(&[":invalid".to_string(), ":confirmation_period_expired".to_string()][..])
+        );
+        assert_eq!(
+            errors.options_for("email", ":confirmation_period_expired"),
+            &[("period".to_string(), "3 days".to_string())]
         );
     }
 }

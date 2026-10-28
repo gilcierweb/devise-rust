@@ -381,7 +381,16 @@ pub trait Confirmable: Authenticatable + HasEmail {
         }
         if self.confirmation_period_expired(config, clock) {
             let mut errors = ValidationErrors::new();
-            errors.add("email", ":confirmation_period_expired");
+            // Devise interpolates the humanized `confirm_within` window
+            // into the message (`confirmable.rb:82-83`:
+            // `errors.add(:email, :confirmation_period_expired, period:
+            // TimeInflector.time_ago_in_words(self.class.confirm_within.ago))`),
+            // so the period rides the error entry for the renderer's
+            // `%{period}` substitution (M-8).
+            let period = config
+                .confirm_within
+                .map_or_else(|| humanize_period(TimeDelta::zero()), humanize_period);
+            errors.add_with_options("email", ":confirmation_period_expired", &[("period", &period)]);
             return Ok(Err(errors));
         }
         let now = clock.now();
@@ -1502,6 +1511,31 @@ mod tests {
             Some(&vec![":confirmation_period_expired".to_string()])
         );
         assert_eq!(humanize_period(config.confirm_within.unwrap()), "3 days");
+        // M-8 (T-261026-ghk-01): the humanized period rides the error
+        // entry exactly like Devise's `errors.add(:email,
+        // :confirmation_period_expired, period: ...)`, and the vendored
+        // en.yml message interpolates it - the full sentence, never a raw
+        // %{period} placeholder.
+        let options = outcome
+            .errors
+            .options_for("email", ":confirmation_period_expired");
+        let interpolations: Vec<(&str, &str)> = options
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            interpolations,
+            vec![("period", "3 days")],
+            "the humanized confirm_within window rides the error entry"
+        );
+        let rendered = crate::i18n::translate(
+            "errors.messages.confirmation_period_expired",
+            &interpolations,
+        );
+        assert_eq!(
+            rendered,
+            "needs to be confirmed within 3 days, please request a new one"
+        );
     }
 
     #[tokio::test]

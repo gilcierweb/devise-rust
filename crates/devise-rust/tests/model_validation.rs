@@ -179,6 +179,52 @@ fn blank_values_use_blank_error_keys() {
     assert_eq!(errors.get("password_confirmation"), None);
 }
 
+/// M-8 (T-261026-ghk-01): the `errors.add(attr, :key, period: ...)`
+/// payload rides the public error surface end to end. The keyed body
+/// stays symbolic-only (the shape both framework controllers render),
+/// the options travel beside it as the renderer's interpolation input,
+/// and the vendored Devise message interpolates the humanized period
+/// into the full sentence - never a raw `%{period}` placeholder.
+#[test]
+fn error_options_render_the_devise_interpolated_sentence() {
+    let mut errors = ValidationErrors::new();
+    errors.add_with_options(
+        "email",
+        ":confirmation_period_expired",
+        &[("period", "3 days")],
+    );
+
+    // The keyed payload keeps its pinned symbolic shape; the options
+    // render as the sibling map the framework response builders attach.
+    assert_eq!(
+        devise_rust::error::errors_json(&errors),
+        serde_json::json!({ "email": [":confirmation_period_expired"] })
+    );
+    assert_eq!(
+        devise_rust::error::errors_options_json(&errors),
+        serde_json::json!({
+            "email::confirmation_period_expired": { "period": "3 days" }
+        })
+    );
+
+    // The vendored en.yml message interpolates the period from the
+    // entry's options: the full Devise sentence.
+    let options = errors.options_for("email", ":confirmation_period_expired");
+    let interpolations: Vec<(&str, &str)> = options
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let message = devise_rust::i18n::translate(
+        "errors.messages.confirmation_period_expired",
+        &interpolations,
+    );
+    assert_eq!(
+        message,
+        "needs to be confirmed within 3 days, please request a new one"
+    );
+    assert!(!message.contains("%{period}"));
+}
+
 #[tokio::test]
 async fn email_uniqueness_is_case_sensitive_at_db() {
     let config = test_config();
