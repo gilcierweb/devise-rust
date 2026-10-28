@@ -765,19 +765,27 @@ where
     proxy.user::<M>(scope).cloned()
 }
 
-/// Durable sign-in bookkeeping shared by the password sign-in and the
-/// omniauth callback sign-in paths: the trackable shift
-/// (current→last, now + socket peer) persisted through `update_columns`.
+/// Durable sign-in bookkeeping shared by the password sign-in, the
+/// sign-up pipeline, and the omniauth callback sign-in paths: the trackable
+/// shift (current→last, now + socket peer) persisted through
+/// `update_columns`, built from the single core definition
+/// ([`tracked_fields_changeset`](devise_rust::trackable::tracked_fields_changeset)
+/// with the named column constants).
 ///
 /// The warden `after_set_user` Authentication hooks are memo-only by the
-/// Phase 5 hook design, so the controllers own the durable write (the
-/// lockable failed-attempt reset is a single call left at the call
-/// sites, where its ordering around the active-for-authentication gate
-/// differs per controller).
+/// Phase 5 hook design, and `AuthProxy::set_user` dispatches them
+/// request-less so the trackable hook body cannot run there — the
+/// controller therefore owns BOTH the durable write AND the single
+/// in-memory shift below (verified: exactly one application per sign-in;
+/// the flow tests pin the record copy and the DB row at one increment).
+///
+/// The #4673 new-record guard (D-21) is restored on this path: the
+/// adapter is probed first and an absent record performs zero writes and
+/// no in-memory shift.
 pub(crate) async fn sign_in_bookkeeping<M, A>(
     record: &mut M,
     adapter: &A,
-    peer_addr: &str,
+    peer_addr: Option<&str>,
     clock: &dyn Clock,
 ) where
     M: FullDeviseModel,
@@ -785,41 +793,15 @@ pub(crate) async fn sign_in_bookkeeping<M, A>(
 {
     // Trackable: shift current→last, stamp now + socket peer (D-11), and
     // persist durably (the hook owns only the memo copy).
-    record.update_tracked_fields(clock.now(), Some(peer_addr));
-    let fields = HashMap::from([
-        (
-            "sign_in_count".to_string(),
-            AdapterValue::Integer(i64::try_from(record.sign_in_count()).unwrap_or(i64::MAX)),
-        ),
-        (
-            "current_sign_in_at".to_string(),
-            record
-                .current_sign_in_at()
-                .map_or(AdapterValue::Null, |at| {
-                    AdapterValue::String(at.to_rfc3339())
-                }),
-        ),
-        (
-            "last_sign_in_at".to_string(),
-            record.last_sign_in_at().map_or(AdapterValue::Null, |at| {
-                AdapterValue::String(at.to_rfc3339())
-            }),
-        ),
-        (
-            "current_sign_in_ip".to_string(),
-            record
-                .current_sign_in_ip()
-                .map_or(AdapterValue::Null, |ip| {
-                    AdapterValue::String(ip.to_string())
-                }),
-        ),
-        (
-            "last_sign_in_ip".to_string(),
-            record.last_sign_in_ip().map_or(AdapterValue::Null, |ip| {
-                AdapterValue::String(ip.to_string())
-            }),
-        ),
-    ]);
+    if adapter.get(&record.to_key()).await.ok().flatten().is_none() {
+        return;
+    }
+    let now = clock.now();
+    // The durable map comes from the PRE-shift state through the one
+    // core builder; the shift below then applies the same values to the
+    // in-memory record copy.
+    let fields = devise_rust::trackable::tracked_fields_changeset(record, now, peer_addr);
+    record.update_tracked_fields(now, peer_addr);
     drop(adapter.update_columns(&record.to_key(), &fields).await);
 }
 
@@ -1125,7 +1107,7 @@ where
     sign_in_bookkeeping(
         &mut record,
         st.adapter.as_ref(),
-        &auth_request.peer_addr.clone().unwrap_or_default(),
+        auth_request.peer_addr.as_deref(),
         st.clock.as_ref(),
     )
     .await;
@@ -1374,7 +1356,7 @@ where
         sign_in_bookkeeping(
             &mut saved,
             st.adapter.as_ref(),
-            &auth_request.peer_addr.clone().unwrap_or_default(),
+            auth_request.peer_addr.as_deref(),
             st.clock.as_ref(),
         )
         .await;

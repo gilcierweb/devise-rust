@@ -86,6 +86,77 @@ pub fn required_fields() -> Vec<&'static str> {
     ]
 }
 
+/// Build the five-field durable sign-in changeset from the record's
+/// PRE-shift state, without mutating the record.
+///
+/// This is the single trackable definition of the sign-in bookkeeping
+/// write (261026-ghl): the framework controllers persist this map and the
+/// `Event::Authentication` memo hook (axum) or the caller itself (actix)
+/// owns the single in-memory shift, so a sign-in increments
+/// `sign_in_count` exactly once in the record copy and once in the DB.
+/// The framework string-literal copies this replaces had drifted from
+/// the core column constants and lost the new-record guard.
+///
+/// The map mirrors what [`Trackable::update_tracked_fields`] would leave
+/// on the record: count + 1, `current_*` stamped with `now` and
+/// `peer_ip`, the previous `current_*` shifted into `last_*` (first
+/// sign-in sets last equal to current; a missing peer leaves the IP
+/// columns NULL, never an empty string).
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::time::FixedClock;
+/// use chrono::DateTime;
+/// // The builder is pure: it reads the pre-shift state and never writes.
+/// // Compiled call shapes live in the crate tests and the framework
+/// // sign-in bookkeeping (tests compare the map field by field).
+/// let clock = FixedClock::new(DateTime::from_timestamp(1_700_000_000, 0).unwrap());
+/// let _now = clock.now();
+/// ```
+#[must_use]
+pub fn tracked_fields_changeset<T>(
+    record: &T,
+    now: DateTime<Utc>,
+    peer_ip: Option<&str>,
+) -> HashMap<String, Value>
+where
+    T: Trackable + ?Sized,
+{
+    // The same shift `update_tracked_fields` applies, computed instead of
+    // applied: last receives the previous current (first sign-in falls
+    // back to now), and a missing peer stays NULL (never "").
+    let last_at = record.current_sign_in_at().unwrap_or(now);
+    let last_ip = record
+        .current_sign_in_ip()
+        .map(str::to_string)
+        .or_else(|| peer_ip.map(str::to_string));
+    HashMap::from([
+        (
+            SIGN_IN_COUNT_COLUMN.to_string(),
+            Value::Integer(
+                i64::try_from(record.sign_in_count().saturating_add(1)).unwrap_or(i64::MAX),
+            ),
+        ),
+        (
+            CURRENT_SIGN_IN_AT_COLUMN.to_string(),
+            Value::String(now.to_rfc3339()),
+        ),
+        (
+            LAST_SIGN_IN_AT_COLUMN.to_string(),
+            Value::String(last_at.to_rfc3339()),
+        ),
+        (
+            CURRENT_SIGN_IN_IP_COLUMN.to_string(),
+            peer_ip.map_or(Value::Null, |ip| Value::String(ip.to_string())),
+        ),
+        (
+            LAST_SIGN_IN_IP_COLUMN.to_string(),
+            last_ip.map_or(Value::Null, Value::String),
+        ),
+    ])
+}
+
 /// `Trackable` module - sign-in auditing over the five Devise columns.
 ///
 /// The shift itself ([`update_tracked_fields`](Self::update_tracked_fields))
@@ -172,8 +243,10 @@ pub trait Trackable: Authenticatable {
 
     /// Devise `update_tracked_fields!` (TRK-01, D-21): probe the adapter for
     /// the record key first and return `Ok(false)` without writing when the
-    /// record is absent (the #4673 new-record guard); otherwise shift and
-    /// persist validation-free through `update_columns`.
+    /// record is absent (the #4673 new-record guard); otherwise build the
+    /// tracked-fields changeset through the single core definition
+    /// ([`tracked_fields_changeset`]) and persist validation-free through
+    /// `update_columns`, replacing `self` with the stored row.
     ///
     /// Returns `Ok(true)` when the shift was persisted.
     ///
@@ -193,33 +266,8 @@ pub trait Trackable: Authenticatable {
         if adapter.get(&self.to_key()).await?.is_none() {
             return Ok(false);
         }
-        self.update_tracked_fields_from_peer(peer_addr, clock);
-        let fields = HashMap::from([
-            (
-                SIGN_IN_COUNT_COLUMN.to_string(),
-                Value::Integer(i64::try_from(self.sign_in_count()).unwrap_or(i64::MAX)),
-            ),
-            (
-                CURRENT_SIGN_IN_AT_COLUMN.to_string(),
-                self.current_sign_in_at()
-                    .map_or(Value::Null, |at| Value::String(at.to_rfc3339())),
-            ),
-            (
-                LAST_SIGN_IN_AT_COLUMN.to_string(),
-                self.last_sign_in_at()
-                    .map_or(Value::Null, |at| Value::String(at.to_rfc3339())),
-            ),
-            (
-                CURRENT_SIGN_IN_IP_COLUMN.to_string(),
-                self.current_sign_in_ip()
-                    .map_or(Value::Null, |ip| Value::String(ip.to_string())),
-            ),
-            (
-                LAST_SIGN_IN_IP_COLUMN.to_string(),
-                self.last_sign_in_ip()
-                    .map_or(Value::Null, |ip| Value::String(ip.to_string())),
-            ),
-        ]);
+        let peer_ip = self.extract_ip_from(peer_addr);
+        let fields = tracked_fields_changeset(self, clock.now(), peer_ip);
         let updated = adapter.update_columns(&self.to_key(), &fields).await?;
         *self = updated;
         Ok(true)
@@ -587,6 +635,89 @@ mod tests {
         fn extract_ip_from<'a>(&self, _peer_addr: Option<&'a str>) -> Option<&'a str> {
             Some("127.0.0.2")
         }
+    }
+
+    /// 261026-ghl parity pin: the core changeset builder must produce the
+    /// byte-identical five-field map the framework sign-in bookkeeping
+    /// blocks used to build (shift a copy in memory, then read the five
+    /// fields), computed instead from the record's PRE-shift state so the
+    /// controller write never needs to mutate the record.
+    #[test]
+    fn tracked_fields_changeset_pins_the_framework_block_parity() {
+        let clock = fixed_clock();
+        let now = clock.now();
+
+        // A record with one prior sign-in so the current-to-last shift has
+        // real values to move (count 1, current IP 127.0.0.1).
+        let mut seeded = TestUser::fresh(1);
+        seeded.update_tracked_fields(now, Some("127.0.0.1"));
+
+        // The deleted framework shape: shift a copy, then read the five
+        // fields into the map with the same value rendering.
+        let mut shifted = seeded.clone();
+        shifted.update_tracked_fields(now, Some("10.0.0.4"));
+        let expected = HashMap::from([
+            (
+                SIGN_IN_COUNT_COLUMN.to_string(),
+                Value::Integer(i64::try_from(shifted.sign_in_count()).unwrap_or(i64::MAX)),
+            ),
+            (
+                CURRENT_SIGN_IN_AT_COLUMN.to_string(),
+                shifted
+                    .current_sign_in_at()
+                    .map_or(Value::Null, |at| Value::String(at.to_rfc3339())),
+            ),
+            (
+                LAST_SIGN_IN_AT_COLUMN.to_string(),
+                shifted
+                    .last_sign_in_at()
+                    .map_or(Value::Null, |at| Value::String(at.to_rfc3339())),
+            ),
+            (
+                CURRENT_SIGN_IN_IP_COLUMN.to_string(),
+                shifted
+                    .current_sign_in_ip()
+                    .map_or(Value::Null, |ip| Value::String(ip.to_string())),
+            ),
+            (
+                LAST_SIGN_IN_IP_COLUMN.to_string(),
+                shifted
+                    .last_sign_in_ip()
+                    .map_or(Value::Null, |ip| Value::String(ip.to_string())),
+            ),
+        ]);
+
+        // The core builder produces the identical map from the PRE-shift
+        // state, without mutating the source record.
+        let built = tracked_fields_changeset(&seeded, now, Some("10.0.0.4"));
+        assert_eq!(built, expected);
+        assert_eq!(
+            seeded.sign_in_count(),
+            1,
+            "the builder is pure: the source record keeps its pre-shift state"
+        );
+        assert_eq!(seeded.current_sign_in_ip(), Some("127.0.0.1"));
+
+        // A pristine record (no prior sign-in, no peer) shifts to
+        // last == current == now with NULL IPs and count 1.
+        let fresh = TestUser::fresh(2);
+        let built = tracked_fields_changeset(&fresh, now, None);
+        assert_eq!(
+            built.get(SIGN_IN_COUNT_COLUMN),
+            Some(&Value::Integer(1)),
+            "a pristine record shifts to count 1"
+        );
+        assert_eq!(
+            built.get(CURRENT_SIGN_IN_IP_COLUMN),
+            Some(&Value::Null),
+            "a missing peer leaves the IP columns NULL (D-20)"
+        );
+        assert_eq!(built.get(LAST_SIGN_IN_IP_COLUMN), Some(&Value::Null));
+        assert_eq!(
+            built.get(LAST_SIGN_IN_AT_COLUMN),
+            built.get(CURRENT_SIGN_IN_AT_COLUMN),
+            "the first sign-in sets last equal to current"
+        );
     }
 
     #[test]

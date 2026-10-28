@@ -538,7 +538,7 @@ where
     sign_in_bookkeeping(
         &mut record,
         devise.adapter.as_ref(),
-        &auth_request.peer_addr.clone().unwrap_or_default(),
+        auth_request.peer_addr.as_deref(),
         devise.clock.as_ref(),
     )
     .await;

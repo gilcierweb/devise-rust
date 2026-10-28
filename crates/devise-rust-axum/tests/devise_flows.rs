@@ -229,6 +229,52 @@ async fn flow_sign_in_and_sign_out_with_flashes() {
     assert_eq!(resp.status(), StatusCode::FOUND);
 }
 
+/// 261026-ghl: the sign-in bookkeeping shifts trackable EXACTLY once —
+/// the DB row and the request-resolved record copy both show a single
+/// `sign_in_count` increment. The durable map is built from the record's
+/// pre-shift state by the one core `tracked_fields_changeset` definition,
+/// so a double application (pre-shifted record fed to the builder, or a
+/// second in-memory shift before the write) would surface here as a count
+/// of two.
+#[tokio::test]
+async fn flow_sign_in_shifts_trackable_exactly_once() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user(&state, "track-once@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    let resp = form_sign_in(&app, "track-once@example.com", "secret123").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    jar.merge(&resp);
+
+    let mut conditions = Conditions::new();
+    conditions.insert("email", Value::String("track-once@example.com".to_string()));
+    let row = state
+        .adapter
+        .find_first(&conditions)
+        .await
+        .expect("lookup")
+        .expect("row");
+    assert_eq!(
+        row.sign_in_count, 1,
+        "exactly one durable shift reaches the DB row"
+    );
+    assert!(
+        row.current_sign_in_at.is_some(),
+        "the shift stamped the current sign-in time"
+    );
+
+    // The record copy the framework serves on the next request (the
+    // layer memo, resolved from the session) matches the single shift.
+    let probe = probe_private(&app, &jar.header()).await;
+    assert_eq!(probe.status(), StatusCode::OK);
+    let body = body_json(probe).await;
+    assert_eq!(
+        body["sign_in_count"].as_u64(),
+        Some(1),
+        "the resolved record copy shows the same single increment"
+    );
+}
+
 /// Devise parity (`strategies/database_authenticatable.rb:24-25`): an unknown
 /// account fails with `not_found_in_database` outside paranoid mode.
 #[tokio::test]

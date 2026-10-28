@@ -55,7 +55,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use actix_session::Session;
 use actix_web::{HttpRequest, HttpResponse, Scope, web};
-use devise_rust::adapter::{OrmAdapter, Value as AdapterValue};
+use devise_rust::adapter::OrmAdapter;
 use devise_rust::error::DeviseError;
 use devise_rust::omniauthable::{
     OAuthProviderConfig, Omniauthable, ProviderProfile, authorize_start, basic_client, http_client,
@@ -215,59 +215,11 @@ fn after_sign_in_target(session: &Session, mapping: &devise_rust::scope::Mapping
     crate::routes::after_sign_in_target(session, mapping)
 }
 
-/// Durable sign-in bookkeeping on the omniauth callback path (twin of
-/// the axum crate's shared helper; actix `routes.rs` keeps its own inline
-/// block and stays outside this plan's file set): the trackable shift
-/// (current to last, now + peer) persisted through `update_columns`.
-async fn sign_in_bookkeeping<M, A, L>(
-    record: &mut M,
-    state: &DeviseWebState<M, A, L>,
-    peer_addr: &str,
-) where
-    M: FullDeviseModel,
-    A: OrmAdapter<M> + Send + Sync,
-{
-    let now = state.clock.now();
-    record.update_tracked_fields(now, Some(peer_addr));
-    let fields = HashMap::from([
-        (
-            "sign_in_count".to_string(),
-            AdapterValue::Integer(i64::try_from(record.sign_in_count()).unwrap_or(i64::MAX)),
-        ),
-        (
-            "current_sign_in_at".to_string(),
-            record
-                .current_sign_in_at()
-                .map_or(AdapterValue::Null, |t| AdapterValue::String(t.to_rfc3339())),
-        ),
-        (
-            "last_sign_in_at".to_string(),
-            record
-                .last_sign_in_at()
-                .map_or(AdapterValue::Null, |t| AdapterValue::String(t.to_rfc3339())),
-        ),
-        (
-            "current_sign_in_ip".to_string(),
-            record
-                .current_sign_in_ip()
-                .map_or(AdapterValue::Null, |ip| {
-                    AdapterValue::String(ip.to_string())
-                }),
-        ),
-        (
-            "last_sign_in_ip".to_string(),
-            record.last_sign_in_ip().map_or(AdapterValue::Null, |ip| {
-                AdapterValue::String(ip.to_string())
-            }),
-        ),
-    ]);
-    drop(
-        state
-            .adapter
-            .update_columns(&record.to_key(), &fields)
-            .await,
-    );
-}
+/// Durable sign-in bookkeeping on the omniauth callback path: the shared
+/// `crate::routes::sign_in_bookkeeping` (framework parity with the axum
+/// crate; the string-literal trackable map that used to live here was
+/// consolidated into the core `tracked_fields_changeset` builder,
+/// 261026-ghl).
 
 /// Register the mapping's omniauth route pair (POST-only authorize plus
 /// GET-or-POST callback) as an actix [`Scope`] mounted at the resolved
@@ -570,12 +522,14 @@ where
     // failed-attempt reset + trackable durable shift (the same
     // bookkeeping the actix sessions controller runs).
     drop(record.reset_failed_attempts(devise.adapter.as_ref()).await);
-    let peer = req
-        .connection_info()
-        .peer_addr()
-        .map(str::to_string)
-        .unwrap_or_default();
-    sign_in_bookkeeping(&mut record, devise, &peer).await;
+    let peer = req.connection_info().peer_addr().map(str::to_string);
+    crate::routes::sign_in_bookkeeping(
+        &mut record,
+        devise.adapter.as_ref(),
+        peer.as_deref(),
+        devise.clock.as_ref(),
+    )
+    .await;
 
     let (key, salt) = record.session_pair();
     if insert_session_and_renew_sync(&session, &scope, &key, &salt).is_err() {

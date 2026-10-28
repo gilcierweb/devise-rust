@@ -324,6 +324,13 @@ async fn callback_round_trip_signs_in_with_success_flash() {
         .await
         .expect("identity row created");
     assert_eq!(row.email, "fresh@example.com");
+    // 261026-ghl: the omniauth sign-in path keeps running the trackable
+    // bookkeeping through the core changeset — exactly one shift.
+    assert_eq!(
+        row.sign_in_count, 1,
+        "the omniauth sign-in shifted trackable exactly once"
+    );
+    assert!(row.current_sign_in_at.is_some());
 
     // REAL jar replay into the protected probe: the sign-in session
     // resolves (the Lax cookie survived the cross-site-shaped round

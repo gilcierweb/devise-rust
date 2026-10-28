@@ -744,8 +744,11 @@ pub fn test_state_with_config(mapping: Mapping, config: DeviseConfig) -> TestSta
 /// email; unauthenticated requests fail through `RequireAuth` (-> 302 + flash
 /// for navigational, 401 for API) with stored-location support on GET.
 async fn private_probe(user: devise_rust_actix::RequireAuth<FixtureUser>) -> HttpResponse {
-    let email = user.user().map(|u| u.email.clone()).unwrap_or_default();
-    HttpResponse::Ok().json(serde_json::json!({ "email": email }))
+    let (email, sign_in_count) = user
+        .user()
+        .map(|u| (u.email.clone(), u.sign_in_count))
+        .unwrap_or_default();
+    HttpResponse::Ok().json(serde_json::json!({ "email": email, "sign_in_count": sign_in_count }))
 }
 
 /// Flash probe: takes the session-backed devise flash (read-once) and

@@ -957,12 +957,22 @@ fn scope_session_present(session: &Session, scope: &str) -> bool {
 /// five column writes; the `Authentication` hooks own only the memo copy by
 /// the Phase 5 hook design).
 ///
-/// The single home `sessions#create` and `registrations#create` share, so
-/// the sign-up path writes the same five columns the interactive sign-in
-/// does (IN-03: Devise's `sign_up` delegates to `sign_in`, and
-/// `hooks/trackable.rb` runs on that `after_set_user`). Mirrors the
-/// same-named helper in the axum crate (framework parity, D-19).
-async fn sign_in_bookkeeping<M, A>(
+/// The durable map is built by the single core definition
+/// ([`tracked_fields_changeset`](devise_rust::trackable::tracked_fields_changeset),
+/// named column constants) from the record's PRE-shift state, then the one
+/// in-memory shift applies the same values to the record copy: exactly one
+/// increment in memory and one in the DB per sign-in.
+///
+/// The #4673 new-record guard (D-21) is restored on this path: the adapter
+/// is probed first and an absent record performs zero writes and no
+/// in-memory shift.
+///
+/// The single home `sessions#create`, `registrations#create`, and the
+/// omniauth callback share (IN-03: Devise's `sign_up` delegates to
+/// `sign_in`, and `hooks/trackable.rb` runs on that `after_set_user`).
+/// Mirrors the same-named helper in the axum crate (framework parity,
+/// D-19).
+pub(crate) async fn sign_in_bookkeeping<M, A>(
     record: &mut M,
     adapter: &A,
     peer_addr: Option<&str>,
@@ -971,39 +981,12 @@ async fn sign_in_bookkeeping<M, A>(
     M: FullDeviseModel,
     A: OrmAdapter<M> + Send + Sync,
 {
-    record.update_tracked_fields(clock.now(), peer_addr);
-    let fields = HashMap::from([
-        (
-            "sign_in_count".to_string(),
-            AdapterValue::Integer(i64::try_from(record.sign_in_count()).unwrap_or(i64::MAX)),
-        ),
-        (
-            "current_sign_in_at".to_string(),
-            record
-                .current_sign_in_at()
-                .map_or(AdapterValue::Null, |t| AdapterValue::String(t.to_rfc3339())),
-        ),
-        (
-            "last_sign_in_at".to_string(),
-            record
-                .last_sign_in_at()
-                .map_or(AdapterValue::Null, |t| AdapterValue::String(t.to_rfc3339())),
-        ),
-        (
-            "current_sign_in_ip".to_string(),
-            record
-                .current_sign_in_ip()
-                .map_or(AdapterValue::Null, |ip| {
-                    AdapterValue::String(ip.to_string())
-                }),
-        ),
-        (
-            "last_sign_in_ip".to_string(),
-            record.last_sign_in_ip().map_or(AdapterValue::Null, |ip| {
-                AdapterValue::String(ip.to_string())
-            }),
-        ),
-    ]);
+    if adapter.get(&record.to_key()).await.ok().flatten().is_none() {
+        return;
+    }
+    let now = clock.now();
+    let fields = devise_rust::trackable::tracked_fields_changeset(record, now, peer_addr);
+    record.update_tracked_fields(now, peer_addr);
     drop(adapter.update_columns(&record.to_key(), &fields).await);
 }
 
