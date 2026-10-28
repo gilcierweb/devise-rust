@@ -1248,3 +1248,60 @@ async fn renewal_handle_unverified_request_clears_every_scope() {
     assert!(session.get_value(&admin_key).await.expect("read").is_none());
     assert!(session.get_value(&tick_key).await.expect("read").is_none());
 }
+
+/// IN-07: concurrent index mutations preserve all tracked keys (no lost updates).
+#[tokio::test]
+async fn session_key_index_concurrent_insert_remove_preserves_keys() {
+    use devise_rust_axum::bridge::KEY_INDEX;
+
+    let session = fresh_session();
+    let store = devise_rust_axum::TowerSessionStore::new(session.clone());
+
+    let mut inserts = Vec::new();
+    for i in 0..32 {
+        let store = store.clone();
+        let key = format!("warden.user.{i}.session");
+        inserts.push(tokio::spawn(async move {
+            store
+                .insert_value(&key, serde_json::json!(["1", "salt"]))
+                .await;
+        }));
+    }
+    for insert in inserts {
+        let _ = insert.await;
+    }
+
+    let mut removes = Vec::new();
+    for i in 0..16 {
+        let store = store.clone();
+        let key = format!("warden.user.{i}.session");
+        removes.push(tokio::spawn(async move {
+            store.remove(&key).await;
+        }));
+    }
+    for remove in removes {
+        let _ = remove.await;
+    }
+
+    let indexed: Vec<String> = session
+        .get_value(KEY_INDEX)
+        .await
+        .expect("read")
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+
+    for i in 16..32 {
+        let key = format!("warden.user.{i}.session");
+        assert!(
+            indexed.contains(&key),
+            "missing key {key} after concurrent ops"
+        );
+    }
+    for i in 0..16 {
+        let key = format!("warden.user.{i}.session");
+        assert!(
+            !indexed.contains(&key),
+            "unexpected key {key} after removal"
+        );
+    }
+}
