@@ -838,13 +838,17 @@ pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
                 conditions.insert((*key).to_string(), Value::String(value.to_string()));
             }
         }
-        // Missing all lookup keys must take Devise's :not_found path directly:
-        // an empty condition set would match an ARBITRARY record in adapters
-        // where "empty conditions match any record" holds.
+        // Devise's `find_or_initialize_with_errors` blank mapping
+        // (`authenticatable.rb:287-291`): MISSING lookup keys report
+        // `:blank` per key — never `:not_found`, which a PRESENT value that
+        // matches nothing earns (T-261026-ghk-03). The short-circuit also
+        // keeps an empty condition set away from adapters where "empty
+        // conditions match any record" holds; the generic path's
+        // completeness check guards the partial case.
         let mut resource = if conditions.iter().next().is_none() {
             let mut errors = ValidationErrors::new();
             for key in &keys {
-                errors.add(key, ":not_found");
+                errors.add(key, ":blank");
             }
             ResourceWithErrors::new(Self::default(), errors)
         } else {
@@ -3807,8 +3811,11 @@ mod tests {
         );
         assert_eq!(mailer.sent_mails().len(), 1, "no email for unknown record");
 
-        // No lookup keys at all: :not_found on every configured key, nothing
-        // sent (regression: empty conditions must not match an arbitrary record).
+        // No lookup keys at all: `:blank` on every configured key
+        // (authenticatable.rb:287-291: a MISSING key is blank; only a
+        // present value that matches nothing earns `:not_found`),
+        // nothing sent (regression: empty conditions must not match an
+        // arbitrary record). T-261026-ghk-03.
         let empty_attributes = serde_json::Map::new();
         let outcome = TestUser::send_reset_password_instructions_for(
             &empty_attributes,
@@ -3822,13 +3829,34 @@ mod tests {
         assert!(!outcome.is_valid());
         assert_eq!(
             outcome.errors.get("email").map(Vec::as_slice),
-            Some(&[":not_found".to_string()][..])
+            Some(&[":blank".to_string()][..]),
+            "a missing lookup key reports :blank, never :not_found"
         );
         assert_eq!(
             mailer.sent_mails().len(),
             1,
             "no email for empty attributes"
         );
+
+        // A BLANK string value is equally missing.
+        let mut blank_attributes = serde_json::Map::new();
+        blank_attributes.insert("email".to_string(), JsonValue::String(String::new()));
+        let outcome = TestUser::send_reset_password_instructions_for(
+            &blank_attributes,
+            &adapter,
+            &mailer,
+            &config,
+            &clock,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_valid());
+        assert_eq!(
+            outcome.errors.get("email").map(Vec::as_slice),
+            Some(&[":blank".to_string()][..]),
+            "a blank lookup value reports :blank"
+        );
+        assert_eq!(mailer.sent_mails().len(), 1, "no email for a blank key");
     }
 
     #[tokio::test]

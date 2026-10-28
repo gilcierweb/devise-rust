@@ -397,16 +397,24 @@ fn error_status_of(config: &DeviseConfig) -> StatusCode {
 /// responder `error_status`, exactly as Devise's `respond_with` error
 /// renders do for every format (`error_status` is applied to the HTML
 /// re-render AND the JSON body). The keyed error body is unchanged; only
-/// the status moves. The `confirmations#show` / `unlocks#show` call sites
-/// pass Devise's hardcoded 422 instead (their TODO carve-out).
+/// the status moves. The JSON body carries the entries' interpolation
+/// options as a sibling `options` map
+/// ([`errors_options_json`](devise_rust::error::errors_options_json),
+/// M-8: Devise's `errors.add(attr, :key, period: ...)` payload) so the
+/// renderer can interpolate `%{period}` and friends from the symbolic
+/// keys; empty when no entry carries options. The
+/// `confirmations#show` / `unlocks#show` call sites pass Devise's
+/// hardcoded 422 instead (their TODO carve-out).
 fn invalid_response(
     req: &HttpRequest,
     errors: &ValidationErrors,
     status: StatusCode,
 ) -> HttpResponse {
     if wants_json(req) {
-        return HttpResponse::build(status)
-            .json(serde_json::json!({ "errors": errors_json(errors) }));
+        return HttpResponse::build(status).json(serde_json::json!({
+            "errors": errors_json(errors),
+            "options": devise_rust::error::errors_options_json(errors),
+        }));
     }
     HttpResponse::build(status)
         .content_type("text/html; charset=utf-8")
@@ -1072,23 +1080,25 @@ where
         return HttpResponse::InternalServerError().finish();
     };
     // Devise confirmable `after_commit :send_on_create_confirmation_instructions`.
-    // Devise propagates a failed delivery (Rails renders the raised
-    // delivery error as 500) — the user MUST learn the instructions never
-    // went out; swallowing it behind an eprintln turns a broken mailer
-    // into silent "check your inbox" dead air.
-    if saved.confirmation_required() {
-        if let Err(error) = saved
-            .send_confirmation_instructions(
-                state.adapter.as_ref(),
-                state.mailer.as_ref(),
-                &state.config,
-                state.clock.as_ref(),
-            )
-            .await
-        {
-            let _ = error;
-            return HttpResponse::InternalServerError().finish();
-        }
+    // The GATED core path owns the decision (CNF-01:
+    // `send_confirmation_notification?`, confirmable.rb:286-288) — the
+    // `skip_confirmation_notification!` flag is honored and a blank
+    // address sends nothing (T-261026-ghk-02). Devise propagates a failed
+    // delivery (Rails renders the raised delivery error as 500) — the user
+    // MUST learn the instructions never went out; swallowing it behind an
+    // eprintln turns a broken mailer into silent "check your inbox" dead
+    // air.
+    if let Err(error) = saved
+        .send_on_create_confirmation_instructions(
+            state.adapter.as_ref(),
+            state.mailer.as_ref(),
+            &state.config,
+            state.clock.as_ref(),
+        )
+        .await
+    {
+        let _ = error;
+        return HttpResponse::InternalServerError().finish();
     }
     if let Some(message) = saved.post_sign_up_message() {
         let key = format!("signed_up_but_{message}");

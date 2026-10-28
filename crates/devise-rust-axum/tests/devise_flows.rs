@@ -3125,3 +3125,84 @@ async fn flow_timeout_failure_carries_timeout_flash_and_marker() {
         "the timedout marker rides the SAME redirect (failure_app.rb:137): {cookies:?}"
     );
 }
+
+/// T-261026-ghk-02 (M-7): registrations#create sends the confirmation
+/// through the GATED core path (`send_on_create_confirmation_instructions`,
+/// confirmable.rb:286-288), so the app model's
+/// `skip_confirmation_notification!` opt-out is honored: a record whose
+/// model code skips the notification (the fixture's address-marker seam)
+/// signs up with the `signed_up_but_unconfirmed` flash and NO mail, while
+/// a normal record still gets exactly one confirmation mail.
+#[tokio::test]
+async fn flow_sign_up_honors_skip_confirmation_notification() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+
+    // Normal record: exactly one confirmation mail, unconfirmed flash.
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/users")
+            .header(
+                header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(Body::from(
+                "user[email]=flow-gate@example.com&user[password]=gated-secret-1&user[password_confirmation]=gated-secret-1",
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"signed_up_but_unconfirmed".to_string()),
+        "normal sign-up flashes signed_up_but_unconfirmed: {cookies:?}"
+    );
+    assert_eq!(state.mailer.sent_mails().len(), 1);
+    assert_eq!(
+        state.mailer.sent_mails()[0].subject,
+        "Confirmation instructions"
+    );
+
+    // Skipped record: the same unconfirmed flash, NO mail.
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/users")
+            .header(
+                header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(Body::from(
+                "user[email]=skip-notify@example.com&user[password]=gated-secret-1&user[password_confirmation]=gated-secret-1",
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config)
+            .contains(&"signed_up_but_unconfirmed".to_string()),
+        "skipped sign-up still flashes signed_up_but_unconfirmed: {cookies:?}"
+    );
+    assert_eq!(
+        state.mailer.sent_mails().len(),
+        1,
+        "the skip flag must suppress the sign-up confirmation mail"
+    );
+
+    // The skipped account still exists (only the mail is suppressed).
+    let mut conditions = Conditions::new();
+    conditions.insert(
+        "email",
+        Value::String("skip-notify@example.com".to_string()),
+    );
+    assert!(
+        state.adapter.find_first(&conditions).await.expect("lookup").is_some(),
+        "the skipped record is persisted"
+    );
+}

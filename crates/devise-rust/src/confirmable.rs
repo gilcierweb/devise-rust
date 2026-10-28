@@ -711,7 +711,9 @@ pub trait Confirmable: Authenticatable + HasEmail {
     /// With `reconfirmable` on, an `unconfirmed_email` match wins first (so a
     /// pending address resolves to its record); otherwise the lookup falls
     /// back to `find_or_initialize_with_errors` over `confirmation_keys`.
-    /// Unknown addresses fail with `:not_found`, except in paranoid mode,
+    /// MISSING lookup keys fail with `:blank` per key while unknown
+    /// (present) addresses fail with `:not_found`
+    /// (`authenticatable.rb:287-291`), except in paranoid mode,
     /// which returns uniform success with nothing sent. Persisted matches are
     /// resent (already-confirmed accounts surface the `:already_confirmed`
     /// notice through the returned errors).
@@ -757,10 +759,15 @@ pub trait Confirmable: Authenticatable + HasEmail {
                 conditions.insert((*key).to_string(), Value::String(value.to_string()));
             }
         }
+        // Devise's `find_or_initialize_with_errors` blank mapping
+        // (`authenticatable.rb:287-291`): a MISSING lookup key reports
+        // `:blank` per key, never `:not_found` — only a PRESENT value that
+        // matches nothing earns `:not_found` (T-261026-ghk-03; the same
+        // per-key split lockable's send already ships).
         let mut resource = if conditions.iter().next().is_none() {
             let mut errors = ValidationErrors::new();
             for key in &keys {
-                errors.add(key, ":not_found");
+                errors.add(key, ":blank");
             }
             ResourceWithErrors::new(Self::default(), errors)
         } else {
@@ -817,9 +824,12 @@ pub trait Confirmable: Authenticatable + HasEmail {
             }
         }
         if conditions.iter().next().is_none() {
+            // Missing lookup keys report `:blank` per key
+            // (`authenticatable.rb:287-291`), matching the generic
+            // find_or_initialize path (T-261026-ghk-03).
             let mut errors = ValidationErrors::new();
             for key in &key_refs {
-                errors.add(key, ":not_found");
+                errors.add(key, ":blank");
             }
             return ResourceWithErrors::new(Self::default(), errors);
         }
@@ -1447,6 +1457,71 @@ mod tests {
         .unwrap();
         assert!(outcome.is_valid());
         assert_eq!(mailer.sent_mails().len(), 2);
+    }
+
+    /// T-261026-ghk-03 (M-13): the send paths map MISSING lookup keys to
+    /// `:blank` per key (`authenticatable.rb:287-291`), the same split
+    /// lockable's send already ships — only a PRESENT value that matches
+    /// nothing earns `:not_found`.
+    #[tokio::test]
+    async fn confirmable_send_maps_missing_keys_to_blank() {
+        let config = test_config();
+        let clock = FixedClock::now();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mailer = crate::mailer::TestMailer::default();
+
+        // No attributes at all: every confirmation key is blank.
+        let empty = serde_json::Map::new();
+        let outcome = TestUser::send_confirmation_instructions_for(
+            &empty, &adapter, &mailer, &config, &clock,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_valid());
+        assert_eq!(
+            outcome.errors.get("email"),
+            Some(&vec![":blank".to_string()]),
+            "a missing lookup key is :blank, never :not_found"
+        );
+        assert!(mailer.sent_mails().is_empty());
+
+        // A BLANK string value is equally missing.
+        let mut blank = serde_json::Map::new();
+        blank.insert(
+            "email".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        let outcome = TestUser::send_confirmation_instructions_for(
+            &blank, &adapter, &mailer, &config, &clock,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_valid());
+        assert_eq!(
+            outcome.errors.get("email"),
+            Some(&vec![":blank".to_string()]),
+            "a blank lookup value is :blank"
+        );
+        assert!(mailer.sent_mails().is_empty());
+
+        // A PRESENT value that matches nothing keeps `:not_found`.
+        let mut unknown = serde_json::Map::new();
+        unknown.insert(
+            "email".to_string(),
+            serde_json::Value::String("ghost@example.com".to_string()),
+        );
+        let outcome = TestUser::send_confirmation_instructions_for(
+            &unknown, &adapter, &mailer, &config, &clock,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_valid());
+        assert_eq!(
+            outcome.errors.get("email"),
+            Some(&vec![":not_found".to_string()]),
+            "a present-but-unmatched value keeps :not_found"
+        );
+        assert!(mailer.sent_mails().is_empty());
     }
 
     #[tokio::test]

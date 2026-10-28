@@ -197,6 +197,12 @@ pub struct FixtureUser {
     pub raw_unlock_token: Option<String>,
     #[serde(skip)]
     pub remember_me_flag: Option<bool>,
+    /// Devise `skip_confirmation_notification!` fixture seam: the app
+    /// model's create-time opt-out (confirmable.rb:286-288). The flow
+    /// suite opts in through an address marker in `new_with_session`
+    /// because no request param may carry it (S7 sanitizer).
+    #[serde(skip)]
+    pub skip_confirmation_notification: bool,
     /// Window stamp: the app config this record was BUILT under never expires
     /// unconfirmed access (`allow_unconfirmed_access_for: nil`, Devise's
     /// "unconfirmed access never expires"). `new_with_session` stamps it from
@@ -411,6 +417,12 @@ impl Registerable for FixtureUser {
         {
             record.set_password_confirmation(Some(confirmation.to_string()));
         }
+        // Fixture seam for the confirmable create-time gate
+        // (confirmable.rb:286-288): an app model may suppress the sign-up
+        // confirmation mail from its own code (Devise
+        // `skip_confirmation_notification!`); the fixture opts in by
+        // address marker because no request param may carry it (S7).
+        record.skip_confirmation_notification = record.email.contains("skip-notify");
         record.unconfirmed_access_never_expires = config.allow_unconfirmed_access_for.is_none();
         record
     }
@@ -499,6 +511,14 @@ impl devise_rust::confirmable::Confirmable for FixtureUser {
 
     fn set_raw_confirmation_token(&mut self, raw: Option<String>) {
         self.raw_confirmation_token = raw;
+    }
+
+    fn confirmation_notification_skipped(&self) -> bool {
+        self.skip_confirmation_notification
+    }
+
+    fn skip_confirmation_notification(&mut self) {
+        self.skip_confirmation_notification = true;
     }
 }
 
