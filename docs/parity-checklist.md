@@ -102,12 +102,12 @@ Evidence paths: core model suites live in `#[cfg(test)]` modules inside `crates/
 
 | # | devise source | test block | status | Rust test evidence | reason / v1 impact |
 |---|---|---|---|---|---|
-| 1 | `test/models/authenticatable_test.rb:6` | required_fields should be an empty array | ported | `crates/devise-rust/src/model.rs tests (test_authenticatable_trait)` plus per-module `required_fields` in confirmable, lockable, rememberable, timeoutable, trackable, omniauthable | |
-| 2 | `test/models/authenticatable_test.rb:10` | find_first_by_auth_conditions allows custom filtering parameters | ported | `crates/devise-rust/src/model.rs tests (test_normalize_auth_conditions)` | |
-| 3 | `test/models/authenticatable_test.rb:19` | find_or_initialize_with_errors uses parameter filter on find | ported | `crates/devise-rust/src/model.rs tests (find_or_initialize_with_errors paths)` | |
-| 4 | `test/models/authenticatable_test.rb:27` | find_or_initialize_with_errors uses parameter filter on initialize | ported | `crates/devise-rust/src/model.rs tests (find_or_initialize_with_errors paths)` | |
-| 5 | `test/models/authenticatable_test.rb:31` | find_or_initialize_with_errors adds blank error | ported | `crates/devise-rust/src/model.rs tests (find_or_initialize_with_error_by paths)` | |
-| 6 | `test/models/authenticatable_test.rb:36` | find_or_initialize_with_errors adds invalid error | ported | `crates/devise-rust/src/model.rs tests (find_or_initialize_with_error_by paths)` | |
+| 1 | `test/models/authenticatable_test.rb:6` | required_fields should be an empty array | ported | `crates/devise-rust/src/model/authenticatable.rs tests (test_authenticatable_trait)` plus per-module `required_fields` in confirmable, lockable, rememberable, timeoutable, trackable, omniauthable | |
+| 2 | `test/models/authenticatable_test.rb:10` | find_first_by_auth_conditions allows custom filtering parameters | ported | `crates/devise-rust/src/model/authenticatable.rs tests (test_normalize_auth_conditions)` | |
+| 3 | `test/models/authenticatable_test.rb:19` | find_or_initialize_with_errors uses parameter filter on find | ported | `crates/devise-rust/src/model/validatable.rs tests (find_or_initialize_with_errors paths)` | |
+| 4 | `test/models/authenticatable_test.rb:27` | find_or_initialize_with_errors uses parameter filter on initialize | ported | `crates/devise-rust/src/model/validatable.rs tests (find_or_initialize_with_errors paths)` | |
+| 5 | `test/models/authenticatable_test.rb:31` | find_or_initialize_with_errors adds blank error | ported | `crates/devise-rust/src/model/validatable.rs tests (find_or_initialize_with_error_by paths)` | |
+| 6 | `test/models/authenticatable_test.rb:36` | find_or_initialize_with_errors adds invalid error | ported | `crates/devise-rust/src/model/validatable.rs tests (find_or_initialize_with_error_by paths)` | |
 | 7 | `test/models/authenticatable_test.rb:42` | does not passes an ActionController::Parameters to find_first_by_auth_conditions through find_or_initialize_with_errors | waived | `crates/devise-rust/src/parameter.rs tests (test_parameter_filter_nested)` | reason: ActionController::Parameters is the Rails strong-parameters wrapper class; devise-rust passes plain serde JSON maps through `ParameterFilter`, so there is no wrapper object that could leak past the filter. v1 impact: none, the same normalization is asserted on nested maps. |
 
 ### models/confirmable_test.rb (67 blocks)
@@ -186,7 +186,7 @@ Evidence paths: core model suites live in `#[cfg(test)]` modules inside `crates/
 
 | # | devise source | test block | status | Rust test evidence | reason / v1 impact |
 |---|---|---|---|---|---|
-| 1 | `test/models/database_authenticatable_test.rb:12` | should downcase case insensitive keys when saving | ported | `crates/devise-rust/src/parameter.rs tests (test_parameter_filter_downcase)` plus `crates/devise-rust/src/model.rs tests (normalize paths)` | |
+| 1 | `test/models/database_authenticatable_test.rb:12` | should downcase case insensitive keys when saving | ported | `crates/devise-rust/src/parameter.rs tests (test_parameter_filter_downcase)` plus `crates/devise-rust/src/model/database_authenticatable.rs tests (normalize paths)` | |
 | 2 | `test/models/database_authenticatable_test.rb:22` | should downcase case insensitive keys that refer to virtual attributes when saving | ported | `crates/devise-rust/src/parameter.rs tests (test_parameter_filter_downcase)` | filter applies to the auth hash including virtual keys |
 | 3 | `test/models/database_authenticatable_test.rb:33` | should not mutate value assigned to case insensitive key | ported | `crates/devise-rust/src/parameter.rs tests (filter returns a new map)` | |
 | 4 | `test/models/database_authenticatable_test.rb:42` | should remove whitespace from strip whitespace keys when saving | ported | `crates/devise-rust/src/parameter.rs tests (test_parameter_filter_strip_whitespace)` | |
@@ -197,33 +197,33 @@ Evidence paths: core model suites live in `#[cfg(test)]` modules inside `crates/
 | 9 | `test/models/database_authenticatable_test.rb:79` | param filter should filter case_insensitive_keys as insensitive | ported | `crates/devise-rust/src/parameter.rs tests (test_parameter_filter_downcase)` | |
 | 10 | `test/models/database_authenticatable_test.rb:85` | param filter should filter strip_whitespace_keys stripping whitespaces | ported | `crates/devise-rust/src/parameter.rs tests (test_parameter_filter_strip_whitespace)` | |
 | 11 | `test/models/database_authenticatable_test.rb:91` | param filter should not add keys to filtered hash | ported | `crates/devise-rust/src/parameter.rs tests (key set preserved)` | |
-| 12 | `test/models/database_authenticatable_test.rb:98` | should respond to password and password confirmation | ported | `crates/devise-rust/src/model.rs tests (virtual password fields)` | |
-| 13 | `test/models/database_authenticatable_test.rb:104` | should generate a hashed password while setting password | ported | `crates/devise-rust/src/model.rs tests (set_password writes digest)` | |
+| 12 | `test/models/database_authenticatable_test.rb:98` | should respond to password and password confirmation | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (virtual password fields)` | |
+| 13 | `test/models/database_authenticatable_test.rb:104` | should generate a hashed password while setting password | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (set_password writes digest)` | |
 | 14 | `test/models/database_authenticatable_test.rb:109` | should support custom hashing methods | waived | `crates/devise-rust/src/crypto.rs tests (test_encryptor_digest_compare)` | reason: the block swaps `Devise::Encryptor` for a custom digest module, which is Devise's global module-replace extensibility; devise-rust v1 ships bcrypt as the single digest implementation behind `stretches` and `pepper`. v1 impact: apps cannot plug a different password hash function in v1; bcrypt (the Devise default) is the only option. |
-| 15 | `test/models/database_authenticatable_test.rb:114` | allow authenticatable_salt to work even with nil hashed password | ported | `crates/devise-rust/src/model.rs tests (database_authenticatable_salt on blank digest)` | |
-| 16 | `test/models/database_authenticatable_test.rb:120` | should not generate a hashed password if password is blank | ported | `crates/devise-rust/src/model.rs tests (set_password skips blank)` | |
-| 17 | `test/models/database_authenticatable_test.rb:125` | should hash password again if password has changed | ported | `crates/devise-rust/src/model.rs tests (re-hash on change)` | |
+| 15 | `test/models/database_authenticatable_test.rb:114` | allow authenticatable_salt to work even with nil hashed password | ported | `crates/devise-rust/src/model/authenticatable.rs tests (serialize_from_session_accepts_saltless_records) plus crates/devise-rust/src/proxy.rs tests (fetch_gate_saltless_record_fetches_from_empty_salt_payload)` | |
+| 16 | `test/models/database_authenticatable_test.rb:120` | should not generate a hashed password if password is blank | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (set_password skips blank)` | |
+| 17 | `test/models/database_authenticatable_test.rb:125` | should hash password again if password has changed | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (re-hash on change)` | |
 | 18 | `test/models/database_authenticatable_test.rb:133` | should test for a valid password | ported | `crates/devise-rust/src/crypto.rs tests (test_encryptor_digest_compare)` | |
 | 19 | `test/models/database_authenticatable_test.rb:139` | should not raise error with an empty password | ported | `crates/devise-rust/src/crypto.rs tests (compare on empty digest)` | |
 | 20 | `test/models/database_authenticatable_test.rb:145` | should be an invalid password if the user has an empty password | ported | `crates/devise-rust/src/crypto.rs tests (compare on empty digest)` | |
-| 21 | `test/models/database_authenticatable_test.rb:151` | should respond to current password | ported | `crates/devise-rust/src/model.rs tests (update_with_password reads current_password)` | |
-| 22 | `test/models/database_authenticatable_test.rb:155` | should update password with valid current password | ported | `crates/devise-rust/src/model.rs tests (database_authenticatable_methods update_with_password)` | |
+| 21 | `test/models/database_authenticatable_test.rb:151` | should respond to current password | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (update_with_password reads current_password)` | |
+| 22 | `test/models/database_authenticatable_test.rb:155` | should update password with valid current password | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (database_authenticatable_methods update_with_password)` | |
 | 23 | `test/models/database_authenticatable_test.rb:162` | should add an error to current password when it is invalid | ported | `crates/devise-rust-axum/tests/devise_flows.rs (flow_account_update_requires_current_password)` | |
-| 24 | `test/models/database_authenticatable_test.rb:170` | should add an error to current password when it is blank | ported | `crates/devise-rust/src/model.rs tests (update_with_password blank current_password)` | |
-| 25 | `test/models/database_authenticatable_test.rb:178` | should run validations even when current password is invalid or blank | ported | `crates/devise-rust/src/model.rs tests (update_with_password validation ordering)` | |
-| 26 | `test/models/database_authenticatable_test.rb:187` | should ignore password and its confirmation if they are blank | ported | `crates/devise-rust/src/model.rs tests (blank password fields dropped from update)` | |
+| 24 | `test/models/database_authenticatable_test.rb:170` | should add an error to current password when it is blank | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (update_with_password blank current_password)` | |
+| 25 | `test/models/database_authenticatable_test.rb:178` | should run validations even when current password is invalid or blank | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (update_with_password validation ordering)` | |
+| 26 | `test/models/database_authenticatable_test.rb:187` | should ignore password and its confirmation if they are blank | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (blank password fields dropped from update)` | |
 | 27 | `test/models/database_authenticatable_test.rb:193` | should not update password with invalid confirmation | ported | `crates/devise-rust/tests/model_validation.rs (password_confirmation_must_match)` | |
 | 28 | `test/models/database_authenticatable_test.rb:200` | should clean up password fields on failure | ported | `crates/devise-rust-axum/tests/devise_flows.rs (flow_sign_up_failure_clears_passwords_and_keeps_errors)` | never persists on failure (TEST-03 item 5) |
-| 29 | `test/models/database_authenticatable_test.rb:208` | should update the user without password | ported | `crates/devise-rust/src/model.rs tests (update_without_password)` | |
-| 30 | `test/models/database_authenticatable_test.rb:214` | should not update password without password | ported | `crates/devise-rust/src/model.rs tests (update_without_password never touches password)` | |
-| 31 | `test/models/database_authenticatable_test.rb:221` | should destroy user if current password is valid | ported | `crates/devise-rust/src/model.rs tests (destroy_with_password)` | |
-| 32 | `test/models/database_authenticatable_test.rb:227` | should not destroy user with invalid password | ported | `crates/devise-rust/src/model.rs tests (destroy_with_password)` | |
-| 33 | `test/models/database_authenticatable_test.rb:234` | should not destroy user with blank password | ported | `crates/devise-rust/src/model.rs tests (destroy_with_password)` | |
+| 29 | `test/models/database_authenticatable_test.rb:208` | should update the user without password | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (update_without_password)` | |
+| 30 | `test/models/database_authenticatable_test.rb:214` | should not update password without password | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (update_without_password never touches password)` | |
+| 31 | `test/models/database_authenticatable_test.rb:221` | should destroy user if current password is valid | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (destroy_with_password)` | |
+| 32 | `test/models/database_authenticatable_test.rb:227` | should not destroy user with invalid password | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (destroy_with_password)` | |
+| 33 | `test/models/database_authenticatable_test.rb:234` | should not destroy user with blank password | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (destroy_with_password)` | |
 | 34 | `test/models/database_authenticatable_test.rb:241` | should not email on password change | ported | `crates/devise-rust/tests/notifications.rs (steady ChangeSet sends nothing)` | |
 | 35 | `test/models/database_authenticatable_test.rb:248` | should notify previous email on email change when configured | ported | `crates/devise-rust/tests/notifications.rs (email_change_notification_goes_to_original_address)` | |
 | 36 | `test/models/database_authenticatable_test.rb:259` | should notify email on password change when configured | ported | `crates/devise-rust/tests/notifications.rs (password_change_notification_goes_to_current_address)` | |
-| 37 | `test/models/database_authenticatable_test.rb:269` | should not notify email on password change even when configured if skip_password_change_notification! is invoked | ported | `crates/devise-rust/src/model.rs tests (database_authenticatable_notifications skip flags)` | |
-| 38 | `test/models/database_authenticatable_test.rb:279` | should not notify email on email change even when configured if skip_email_changed_notification! is invoked | ported | `crates/devise-rust/src/model.rs tests (database_authenticatable_notifications skip flags)` | |
+| 37 | `test/models/database_authenticatable_test.rb:269` | should not notify email on password change even when configured if skip_password_change_notification! is invoked | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (database_authenticatable_notifications skip flags)` | |
+| 38 | `test/models/database_authenticatable_test.rb:279` | should not notify email on email change even when configured if skip_email_changed_notification! is invoked | ported | `crates/devise-rust/src/model/database_authenticatable.rs tests (database_authenticatable_notifications skip flags)` | |
 | 39 | `test/models/database_authenticatable_test.rb:289` | downcase_keys with validation | ported | `crates/devise-rust/src/parameter.rs tests (downcase before validation)` | |
 | 40 | `test/models/database_authenticatable_test.rb:295` | required_fields should be encryptable_password and the email field by default | ported | `crates/devise-rust-migrations/tests/snapshots.rs (matrix_full_create)` | |
 | 41 | `test/models/database_authenticatable_test.rb:302` | required_fields should be encryptable_password and the login when the login is on authentication_keys | ported | `crates/devise-rust/src/config.rs tests (authentication_keys override flows through the filter)` | |
@@ -279,41 +279,41 @@ Evidence paths: core model suites live in `#[cfg(test)]` modules inside `crates/
 
 | # | devise source | test block | status | Rust test evidence | reason / v1 impact |
 |---|---|---|---|---|---|
-| 1 | `test/models/recoverable_test.rb:11` | should not generate reset password token after creating a record | ported | `crates/devise-rust/src/model.rs tests (token issued only on request)` | |
+| 1 | `test/models/recoverable_test.rb:11` | should not generate reset password token after creating a record | ported | `crates/devise-rust/src/model/recoverable.rs tests (token issued only on request)` | |
 | 2 | `test/models/recoverable_test.rb:15` | should never generate the same reset password token for different users | ported | `crates/devise-rust/src/crypto.rs tests (token generator uniqueness loop)` | |
-| 3 | `test/models/recoverable_test.rb:26` | should reset password and password confirmation from params | ported | `crates/devise-rust/src/model.rs tests (reset_password)` | |
-| 4 | `test/models/recoverable_test.rb:33` | should reset password and save the record | ported | `crates/devise-rust/src/model.rs tests (reset_password)` | |
-| 5 | `test/models/recoverable_test.rb:37` | should clear reset password token while resetting the password | ported | `crates/devise-rust/src/model.rs tests (clear_reset_password_token on password change)` | |
-| 6 | `test/models/recoverable_test.rb:47` | should not clear reset password token for new user | ported | `crates/devise-rust/src/model.rs tests (clear gated on persisted changes)` | |
-| 7 | `test/models/recoverable_test.rb:58` | should clear reset password token if changing password | ported | `crates/devise-rust/src/model.rs tests (pending_reset_token_clear)` | |
-| 8 | `test/models/recoverable_test.rb:70` | should clear reset password token if changing email | ported | `crates/devise-rust/src/model.rs tests (pending_reset_token_clear on authentication key change)` | |
-| 9 | `test/models/recoverable_test.rb:81` | should clear reset password successfully even if there is no email | ported | `crates/devise-rust/src/model.rs tests (reset without email field change)` | |
-| 10 | `test/models/recoverable_test.rb:93` | should not clear reset password token if record is invalid | ported | `crates/devise-rust/src/model.rs tests (reset_password validation failure keeps token)` | |
-| 11 | `test/models/recoverable_test.rb:101` | should not reset password with invalid data | ported | `crates/devise-rust/src/model.rs tests (reset_password blank password errors)` | |
-| 12 | `test/models/recoverable_test.rb:107` | should reset reset password token and send instructions by email | ported | `crates/devise-rust/src/model.rs tests (send_reset_password_instructions)` | |
-| 13 | `test/models/recoverable_test.rb:116` | should find a user to send instructions by email | ported | `crates/devise-rust/src/model.rs tests (send_reset_password_instructions_for)` | |
-| 14 | `test/models/recoverable_test.rb:122` | should return a new record with errors if user was not found by e-mail | ported | `crates/devise-rust/src/model.rs tests (send_reset_password_instructions_for not-found record with errors)` | |
-| 15 | `test/models/recoverable_test.rb:128` | should find a user to send instructions by authentication_keys | ported | `crates/devise-rust/src/model.rs tests (send honoring reset_password_keys)` | |
-| 16 | `test/models/recoverable_test.rb:136` | should require all reset_password_keys | ported | `crates/devise-rust/src/model.rs tests (send requires all keys)` | |
-| 17 | `test/models/recoverable_test.rb:145` | should reset reset_password_token before send the reset instructions email | ported | `crates/devise-rust/src/model.rs tests (send_reset_password_instructions regenerates and clears)` | |
-| 18 | `test/models/recoverable_test.rb:152` | should send email instructions to the user reset their password | ported | `crates/devise-rust/src/model.rs tests (send_reset_password_instructions)` plus `crates/devise-rust/tests/notifications.rs` | |
-| 19 | `test/models/recoverable_test.rb:159` | should find a user to reset their password based on the raw token | ported | `crates/devise-rust/src/model.rs tests (with_reset_password_token digest lookup)` | |
-| 20 | `test/models/recoverable_test.rb:167` | should return a new record with errors if no reset_password_token is found | ported | `crates/devise-rust/src/model.rs tests (reset_password_by_token_guards)` | |
-| 21 | `test/models/recoverable_test.rb:173` | should return a new record with errors if reset_password_token is blank | ported | `crates/devise-rust/src/model.rs tests (reset_password_by_token_guards)` | TEST-03 item 4, blank token guard |
-| 22 | `test/models/recoverable_test.rb:179` | should return a new record with errors if password is blank | ported | `crates/devise-rust/src/model.rs tests (reset_password blank password)` | |
-| 23 | `test/models/recoverable_test.rb:189` | should return a new record with errors if password is not provided | ported | `crates/devise-rust/src/model.rs tests (reset_password missing password)` | |
-| 24 | `test/models/recoverable_test.rb:199` | should reset successfully user password given the new password and confirmation | ported | `crates/devise-rust/src/model.rs tests (reset_password_by_token round trip)` | |
-| 25 | `test/models/recoverable_test.rb:217` | should not reset password after reset_password_within time | ported | `crates/devise-rust/src/model.rs tests (reset_password_by_token_window)` | |
+| 3 | `test/models/recoverable_test.rb:26` | should reset password and password confirmation from params | ported | `crates/devise-rust/src/model/recoverable.rs tests (reset_password)` | |
+| 4 | `test/models/recoverable_test.rb:33` | should reset password and save the record | ported | `crates/devise-rust/src/model/recoverable.rs tests (reset_password)` | |
+| 5 | `test/models/recoverable_test.rb:37` | should clear reset password token while resetting the password | ported | `crates/devise-rust/src/model/recoverable.rs tests (clear_reset_password_token on password change)` | |
+| 6 | `test/models/recoverable_test.rb:47` | should not clear reset password token for new user | ported | `crates/devise-rust/src/model/recoverable.rs tests (clear gated on persisted changes)` | |
+| 7 | `test/models/recoverable_test.rb:58` | should clear reset password token if changing password | ported | `crates/devise-rust/src/model/recoverable.rs tests (pending_reset_token_clear)` | |
+| 8 | `test/models/recoverable_test.rb:70` | should clear reset password token if changing email | ported | `crates/devise-rust/src/model/recoverable.rs tests (pending_reset_token_clear on authentication key change)` | |
+| 9 | `test/models/recoverable_test.rb:81` | should clear reset password successfully even if there is no email | ported | `crates/devise-rust/src/model/recoverable.rs tests (reset without email field change)` | |
+| 10 | `test/models/recoverable_test.rb:93` | should not clear reset password token if record is invalid | ported | `crates/devise-rust/src/model/recoverable.rs tests (reset_password validation failure keeps token)` | |
+| 11 | `test/models/recoverable_test.rb:101` | should not reset password with invalid data | ported | `crates/devise-rust/src/model/recoverable.rs tests (reset_password blank password errors)` | |
+| 12 | `test/models/recoverable_test.rb:107` | should reset reset password token and send instructions by email | ported | `crates/devise-rust/src/model/recoverable.rs tests (send_reset_password_instructions)` | |
+| 13 | `test/models/recoverable_test.rb:116` | should find a user to send instructions by email | ported | `crates/devise-rust/src/model/recoverable.rs tests (send_reset_password_instructions_for)` | |
+| 14 | `test/models/recoverable_test.rb:122` | should return a new record with errors if user was not found by e-mail | ported | `crates/devise-rust/src/model/recoverable.rs tests (send_reset_password_instructions_for not-found record with errors)` | |
+| 15 | `test/models/recoverable_test.rb:128` | should find a user to send instructions by authentication_keys | ported | `crates/devise-rust/src/model/recoverable.rs tests (send honoring reset_password_keys)` | |
+| 16 | `test/models/recoverable_test.rb:136` | should require all reset_password_keys | ported | `crates/devise-rust/src/model/recoverable.rs tests (send requires all keys)` | |
+| 17 | `test/models/recoverable_test.rb:145` | should reset reset_password_token before send the reset instructions email | ported | `crates/devise-rust/src/model/recoverable.rs tests (send_reset_password_instructions regenerates and clears)` | |
+| 18 | `test/models/recoverable_test.rb:152` | should send email instructions to the user reset their password | ported | `crates/devise-rust/src/model/recoverable.rs tests (send_reset_password_instructions)` plus `crates/devise-rust/tests/notifications.rs` | |
+| 19 | `test/models/recoverable_test.rb:159` | should find a user to reset their password based on the raw token | ported | `crates/devise-rust/src/model/recoverable.rs tests (with_reset_password_token digest lookup)` | |
+| 20 | `test/models/recoverable_test.rb:167` | should return a new record with errors if no reset_password_token is found | ported | `crates/devise-rust/src/model/recoverable.rs tests (reset_password_by_token_guards)` | |
+| 21 | `test/models/recoverable_test.rb:173` | should return a new record with errors if reset_password_token is blank | ported | `crates/devise-rust/src/model/recoverable.rs tests (reset_password_by_token_guards)` | TEST-03 item 4, blank token guard |
+| 22 | `test/models/recoverable_test.rb:179` | should return a new record with errors if password is blank | ported | `crates/devise-rust/src/model/recoverable.rs tests (reset_password blank password)` | |
+| 23 | `test/models/recoverable_test.rb:189` | should return a new record with errors if password is not provided | ported | `crates/devise-rust/src/model/recoverable.rs tests (reset_password missing password)` | |
+| 24 | `test/models/recoverable_test.rb:199` | should reset successfully user password given the new password and confirmation | ported | `crates/devise-rust/src/model/recoverable.rs tests (reset_password_by_token round trip)` | |
+| 25 | `test/models/recoverable_test.rb:217` | should not reset password after reset_password_within time | ported | `crates/devise-rust/src/model/recoverable.rs tests (reset_password_by_token_window)` | |
 | 26 | `test/models/recoverable_test.rb:239` | required_fields should contain the fields that Devise uses | ported | `crates/devise-rust-migrations/tests/snapshots.rs (recoverable_adds_its_index_without_confirmation_index)` | |
-| 27 | `test/models/recoverable_test.rb:246` | should return a user based on the raw token | ported | `crates/devise-rust/src/model.rs tests (issue_reset_token)` | |
-| 28 | `test/models/recoverable_test.rb:253` | should return the same reset password token as generated | ported | `crates/devise-rust/src/model.rs tests (raw token restored on the returned record)` | |
-| 29 | `test/models/recoverable_test.rb:259` | should return nil if a user based on the raw token is not found | ported | `crates/devise-rust/src/model.rs tests (with_reset_password_token miss)` | |
+| 27 | `test/models/recoverable_test.rb:246` | should return a user based on the raw token | ported | `crates/devise-rust/src/model/recoverable.rs tests (issue_reset_token)` | |
+| 28 | `test/models/recoverable_test.rb:253` | should return the same reset password token as generated | ported | `crates/devise-rust/src/model/recoverable.rs tests (raw token restored on the returned record)` | |
+| 29 | `test/models/recoverable_test.rb:259` | should return nil if a user based on the raw token is not found | ported | `crates/devise-rust/src/model/recoverable.rs tests (with_reset_password_token miss)` | |
 
 ### models/registerable_test.rb (1 block)
 
 | # | devise source | test block | status | Rust test evidence | reason / v1 impact |
 |---|---|---|---|---|---|
-| 1 | `test/models/registerable_test.rb:6` | required_fields should contain the fields that Devise uses | ported | `crates/devise-rust/src/model.rs tests (registerable_tests: no columns, new_with_session plus sign_up path)` | |
+| 1 | `test/models/registerable_test.rb:6` | required_fields should contain the fields that Devise uses | ported | `crates/devise-rust/src/model/authenticatable.rs tests (registerable_tests: no columns, new_with_session plus sign_up path)` | |
 
 ### models/rememberable_test.rb (21 blocks)
 
@@ -345,11 +345,11 @@ Evidence paths: core model suites live in `#[cfg(test)]` modules inside `crates/
 
 | # | devise source | test block | status | Rust test evidence | reason / v1 impact |
 |---|---|---|---|---|---|
-| 1 | `test/models/serializable_test.rb:10` | should not include unsafe keys on JSON | ported | `crates/devise-rust/src/model.rs tests (test_serializable_hash_excludes_password)` plus `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | |
+| 1 | `test/models/serializable_test.rb:10` | should not include unsafe keys on JSON | ported | `crates/devise-rust/src/model/authenticatable.rs tests (test_serializable_hash_excludes_password)` plus `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | |
 | 2 | `test/models/serializable_test.rb:15` | should not include unsafe keys on JSON even if a new except is provided | ported | `crates/devise-rust/src/error.rs tests (unsafe list always concatenated)` | |
 | 3 | `test/models/serializable_test.rb:20` | should include unsafe keys on JSON if a force_except is provided | waived | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | reason: `force_except` is an ActiveRecord serializable_options escape hatch that re-enables leaking secret columns; the port intentionally provides no escape hatch for the 18 unsafe attributes. v1 impact: none for correct consumers; code that relied on serializing secret columns must read them from the model directly. |
 | 4 | `test/models/serializable_test.rb:25` | should not include unsafe keys in inspect | deviated | `crates/devise-rust/src/error.rs tests (test_unsafe_attributes)` | reason: Ruby overrides `Object#inspect` globally; Rust has no equivalent hook, so the guard is enforced on `serializable_hash` and the `UNSAFE_ATTRIBUTES` seam, with app-owned `Debug` impls out of library control. v1 impact: none for the library surface; apps that derive `Debug` on models see their own fields (documented in SECURITY.md). |
-| 5 | `test/models/serializable_test.rb:30` | should accept frozen options | waived | `crates/devise-rust/src/model.rs tests (serializable_hash no-options surface)` | reason: Ruby frozen-string immutability edge; Rust values are moved or borrowed by the type system, so there is no frozen-options case. v1 impact: none. |
+| 5 | `test/models/serializable_test.rb:30` | should accept frozen options | waived | `crates/devise-rust/src/model/authenticatable.rs tests (serializable_hash no-options surface)` | reason: Ruby frozen-string immutability edge; Rust values are moved or borrowed by the type system, so there is no frozen-options case. v1 impact: none. |
 
 ### models/timeoutable_test.rb (8 blocks)
 
@@ -384,14 +384,14 @@ Evidence paths: core model suites live in `#[cfg(test)]` modules inside `crates/
 | 4 | `test/models/validatable_test.rb:44` | should accept valid emails | ported | `crates/devise-rust/tests/model_validation.rs (email_format_validation_uses_devise_regexp)` | |
 | 5 | `test/models/validatable_test.rb:52` | should require password to be set when creating a new record | ported | `crates/devise-rust/tests/model_validation.rs (blank_values_use_blank_error_keys)` | |
 | 6 | `test/models/validatable_test.rb:58` | should require confirmation to be set when creating a new record | ported | `crates/devise-rust/tests/model_validation.rs (password_confirmation_must_match)` | |
-| 7 | `test/models/validatable_test.rb:65` | should require password when updating/resetting password | ported | `crates/devise-rust/tests/model_validation.rs plus crates/devise-rust/src/model.rs tests (password_required)` | |
+| 7 | `test/models/validatable_test.rb:65` | should require password when updating/resetting password | ported | `crates/devise-rust/tests/model_validation.rs plus crates/devise-rust/src/model/validatable.rs tests (password_required)` | |
 | 8 | `test/models/validatable_test.rb:75` | should require confirmation when updating/resetting password | ported | `crates/devise-rust/tests/model_validation.rs (password_confirmation_must_match)` | |
-| 9 | `test/models/validatable_test.rb:83` | should require a password with minimum of 7 characters | ported | `crates/devise-rust/tests/model_validation.rs (password_length_bounds_6_to_128_inclusive with configured bounds)` | configured `password_length` honored |
-| 10 | `test/models/validatable_test.rb:89` | should require a password with maximum of 72 characters long | ported | `crates/devise-rust/tests/model_validation.rs (password_length_bounds_6_to_128_inclusive with configured bounds)` | |
-| 11 | `test/models/validatable_test.rb:95` | should not require password length when it's blank and not required | ported | `crates/devise-rust/src/model.rs tests (password_required gating)` | |
+| 9 | `test/models/validatable_test.rb:83` | should require a password with minimum of 7 characters | ported | `crates/devise-rust/src/model/validatable.rs tests (validatable_custom_password_length_bounds over the 7..72 range)` | configured `password_length` honored |
+| 10 | `test/models/validatable_test.rb:89` | should require a password with maximum of 72 characters long | ported | `crates/devise-rust/src/model/validatable.rs tests (validatable_custom_password_length_bounds over the 7..72 range)` | |
+| 11 | `test/models/validatable_test.rb:95` | should not require password length when it's blank and not required | ported | `crates/devise-rust/src/model/validatable.rs tests (password_required gating)` | |
 | 12 | `test/models/validatable_test.rb:105` | should complain about length even if password is not required | ported | `crates/devise-rust/tests/model_validation.rs (length check when password present)` | |
 | 13 | `test/models/validatable_test.rb:112` | should not be included in objects with invalid API | waived | `crates/devise-rust/tests/model_validation.rs` | reason: the block asserts Devise raises when the host class lacks the ActiveModel validations API; Rust replaces the runtime assertion with compile-time trait bounds, so an invalid host cannot compile. v1 impact: none, the failure moves from runtime to compile time. |
-| 14 | `test/models/validatable_test.rb:121` | required_fields should be an empty array | ported | `crates/devise-rust/src/model.rs tests (Validatable adds no columns)` | |
+| 14 | `test/models/validatable_test.rb:121` | required_fields should be an empty array | ported | `crates/devise-rust/src/model/validatable.rs tests (Validatable adds no columns)` | |
 
 ### models/omniauthable_test.rb (1 block)
 
@@ -606,7 +606,7 @@ Framework legs: both the Phase 8 actix harness (`actix_web::test`, `crates/devis
 
 | # | devise source | test block | status | Rust test evidence | reason / v1 impact |
 |---|---|---|---|---|---|
-| 1 | `test/integration/recoverable_test.rb:36` | reset password should send to user record email and avoid case mapping collisions | ported | `crates/devise-rust/src/model.rs tests (send_reset_password_instructions_for)` | |
+| 1 | `test/integration/recoverable_test.rb:36` | reset password should send to user record email and avoid case mapping collisions | ported | `crates/devise-rust/src/model/recoverable.rs tests (send_reset_password_instructions_for)` | |
 | 2 | `test/integration/recoverable_test.rb:47` | reset password with email of different case should succeed when email is in the list of case insensitive keys | ported | `crates/devise-rust/src/parameter.rs tests (test_parameter_filter_downcase)` plus framework flow | |
 | 3 | `test/integration/recoverable_test.rb:58` | reset password with email should send an email from a custom mailer | ported | `crates/devise-rust/src/mailer.rs tests (app-supplied Mailer)` | |
 | 4 | `test/integration/recoverable_test.rb:71` | reset password with email of different case should fail when email is NOT the list of case insensitive keys | ported | `crates/devise-rust/src/parameter.rs tests (keys not configured stay untouched)` | |
@@ -620,22 +620,22 @@ Framework legs: both the Phase 8 actix harness (`actix_web::test`, `crates/devis
 | 12 | `test/integration/recoverable_test.rb:155` | not authenticated user with invalid reset password token should not be able to change their password | ported | `crates/devise-rust-axum/tests/devise_flows.rs (flow_reset_token_errors)` | |
 | 13 | `test/integration/recoverable_test.rb:166` | not authenticated user with valid reset password token but invalid password should not be able to change their password | ported | `crates/devise-rust-axum/tests/devise_flows.rs (flow_reset_token_errors)` | |
 | 14 | `test/integration/recoverable_test.rb:180` | not authenticated user with valid data should be able to change their password | ported | `crates/devise-rust-axum/tests/devise_flows.rs (journey reset step)` | |
-| 15 | `test/integration/recoverable_test.rb:190` | after entering invalid data user should still be able to change their password | ported | `crates/devise-rust/src/model.rs tests (token kept on invalid reset)` | |
+| 15 | `test/integration/recoverable_test.rb:190` | after entering invalid data user should still be able to change their password | ported | `crates/devise-rust/src/model/recoverable.rs tests (token kept on invalid reset)` | |
 | 16 | `test/integration/recoverable_test.rb:204` | sign in user automatically after changing its password | ported | `crates/devise-rust-axum/tests/devise_flows.rs (reset signs in per config)` | |
-| 17 | `test/integration/recoverable_test.rb:212` | does not sign in user automatically after changing its password if config.sign_in_after_reset_password is false | ported | `crates/devise-rust/src/model.rs tests (sign_in_after_reset_password config gate)` | |
+| 17 | `test/integration/recoverable_test.rb:212` | does not sign in user automatically after changing its password if config.sign_in_after_reset_password is false | ported | `crates/devise-rust/src/model/recoverable.rs tests (sign_in_after_reset_password config gate)` | |
 | 18 | `test/integration/recoverable_test.rb:225` | does not sign in user automatically after changing its password if resource_class.sign_in_after_reset_password is false | ported | `crates/devise-rust/src/config.rs tests (per-scope override cascade)` | |
 | 19 | `test/integration/recoverable_test.rb:238` | sign in user automatically after changing its password if resource_class.sign_in_after_reset_password is true | ported | `crates/devise-rust/src/config.rs tests (per-scope override cascade)` | |
-| 20 | `test/integration/recoverable_test.rb:250` | does not sign in user automatically after changing its password if it's an inactive record | ported | `crates/devise-rust/src/model.rs tests (updated_not_active path)` | |
+| 20 | `test/integration/recoverable_test.rb:250` | does not sign in user automatically after changing its password if it's an inactive record | ported | `crates/devise-rust/src/model/authenticatable.rs tests (updated_not_active path)` | |
 | 21 | `test/integration/recoverable_test.rb:265` | unlocks and signs in locked user automatically after changing it's password (email unlock strategy) | ported | `crates/devise-rust-axum/src/routes.rs (password update unlocks when unlockable)` | |
 | 22 | `test/integration/recoverable_test.rb:277` | unlocks and signs in locked user automatically after changing it's password (both unlock strategy) | ported | `crates/devise-rust-axum/src/routes.rs (password update unlocks when unlockable)` | |
 | 23 | `test/integration/recoverable_test.rb:289` | reset password request with valid e-mail in JSON format should return empty and valid response | ported | `crates/devise-rust-axum/src/routes.rs (password create JSON arm)` | |
 | 24 | `test/integration/recoverable_test.rb:296` | reset password request with invalid e-mail in JSON format should return valid response | ported | `crates/devise-rust-axum/src/routes.rs (password create JSON arm)` | |
-| 25 | `test/integration/recoverable_test.rb:303` | reset password request with invalid e-mail in JSON format should return empty and valid response in paranoid mode | ported | `crates/devise-rust/src/model.rs tests (paranoid reset send stays silent)` | |
+| 25 | `test/integration/recoverable_test.rb:303` | reset password request with invalid e-mail in JSON format should return empty and valid response in paranoid mode | ported | `crates/devise-rust/src/model/recoverable.rs tests (paranoid reset send stays silent)` | |
 | 26 | `test/integration/recoverable_test.rb:312` | change password with valid parameters in JSON format should return valid response | ported | `crates/devise-rust-axum/src/routes.rs (password update JSON arm)` | |
 | 27 | `test/integration/recoverable_test.rb:322` | change password with invalid token in JSON format should return invalid response | ported | `crates/devise-rust-axum/tests/devise_flows.rs (flow_reset_token_errors)` | |
 | 28 | `test/integration/recoverable_test.rb:330` | change password with invalid new password in JSON format should return invalid response | ported | `crates/devise-rust-axum/src/routes.rs (password update JSON arm)` | |
-| 29 | `test/integration/recoverable_test.rb:338` | when in paranoid mode and with an invalid e-mail, asking to reset a password should display a message that does not indicates that the e-mail does not exists in the database | ported | `crates/devise-rust/src/model.rs tests (paranoid reset send stays silent)` | |
-| 30 | `test/integration/recoverable_test.rb:351` | when in paranoid mode and with a valid e-mail, asking to reset password should display a message that does not indicates that the email exists in the database and redirect to the failure route | ported | `crates/devise-rust/src/model.rs tests (paranoid reset send stays silent)` | |
+| 29 | `test/integration/recoverable_test.rb:338` | when in paranoid mode and with an invalid e-mail, asking to reset a password should display a message that does not indicates that the e-mail does not exists in the database | ported | `crates/devise-rust/src/model/recoverable.rs tests (paranoid reset send stays silent)` | |
+| 30 | `test/integration/recoverable_test.rb:351` | when in paranoid mode and with a valid e-mail, asking to reset password should display a message that does not indicates that the email exists in the database and redirect to the failure route | ported | `crates/devise-rust/src/model/recoverable.rs tests (paranoid reset send stays silent)` | |
 | 31 | `test/integration/recoverable_test.rb:363` | after recovering a password, should set failed attempts to 0 | ported | `crates/devise-rust/src/lockable.rs tests (reset_failed_attempts on password update path)` plus framework reset flow | |
 
 ### integration/registerable_test.rb (33 blocks)
@@ -656,9 +656,9 @@ Framework legs: both the Phase 8 actix harness (`actix_web::test`, `crates/devis
 | 12 | `test/integration/registerable_test.rb:140` | a signed in user should not be able to access sign up | ported | `crates/devise-rust-axum/tests/devise_flows.rs (require_no_authentication)` | |
 | 13 | `test/integration/registerable_test.rb:146` | a signed in user should be able to edit their account | ported | `crates/devise-rust-axum/tests/devise_flows.rs (journey edit step)` | |
 | 14 | `test/integration/registerable_test.rb:160` | a signed in user should still be able to use the website after changing their password | ported | `crates/devise-rust-axum/tests/devise_flows.rs (journey edit step, sign_in_after_change_password bypass)` | |
-| 15 | `test/integration/registerable_test.rb:174` | a signed in user should not be able to use the website after changing their password if config.sign_in_after_change_password is false | ported | `crates/devise-rust/src/model.rs tests (registerable_tests: config gate)` plus `crates/devise-rust-axum/tests/devise_flows.rs (flow_two_cookie_jar_password_change_kills_session_and_remember)` | the two cookie jar regression (salt plus remember_created_at) |
+| 15 | `test/integration/registerable_test.rb:174` | a signed in user should not be able to use the website after changing their password if config.sign_in_after_change_password is false | ported | `crates/devise-rust/src/model/registerable.rs tests (registerable_tests: config gate)` plus `crates/devise-rust-axum/tests/devise_flows.rs (flow_two_cookie_jar_password_change_kills_session_and_remember)` | the two cookie jar regression (salt plus remember_created_at) |
 | 16 | `test/integration/registerable_test.rb:190` | a signed in user should not be able to use the website after changing their password if resource_class.sign_in_after_change_password is false | ported | `crates/devise-rust/src/config.rs tests (per-scope override cascade)` | |
-| 17 | `test/integration/registerable_test.rb:206` | a signed in user should be able to use the website after changing its email with config.sign_in_after_change_password is false | ported | `crates/devise-rust/src/model.rs tests (password-only gate: email change keeps session)` | |
+| 17 | `test/integration/registerable_test.rb:206` | a signed in user should be able to use the website after changing its email with config.sign_in_after_change_password is false | ported | `crates/devise-rust/src/model/authenticatable.rs tests (password-only gate: email change keeps session)` | |
 | 18 | `test/integration/registerable_test.rb:223` | a signed in user should not change their current user with invalid password | ported | `crates/devise-rust-axum/tests/devise_flows.rs (flow_account_update_requires_current_password)` | |
 | 19 | `test/integration/registerable_test.rb:238` | a signed in user should be able to edit their password | ported | `crates/devise-rust-axum/tests/devise_flows.rs (journey edit step)` | |
 | 20 | `test/integration/registerable_test.rb:253` | a signed in user should not be able to edit their password with invalid confirmation | ported | `crates/devise-rust/tests/model_validation.rs (password_confirmation_must_match)` plus framework flow | |
@@ -939,7 +939,7 @@ The five Devise notifications map to the `Mailer` trait (`crates/devise-rust/src
 
 | # | devise source | test block | status | Rust test evidence | reason / v1 impact |
 |---|---|---|---|---|---|
-| 1 | `test/mailers/reset_password_instructions_test.rb:32` | email sent after resetting the user password | ported | `crates/devise-rust/src/model.rs tests (send_reset_password_instructions)` plus `crates/devise-rust/tests/notifications.rs (mailer_context_carries_template_vars)` | |
+| 1 | `test/mailers/reset_password_instructions_test.rb:32` | email sent after resetting the user password | ported | `crates/devise-rust/src/model/recoverable.rs tests (send_reset_password_instructions)` plus `crates/devise-rust/tests/notifications.rs (mailer_context_carries_template_vars)` | |
 | 2 | `test/mailers/reset_password_instructions_test.rb:36` | content type should be set to html | deviated | see confirmation row 2 | reason: transport-owned header. v1 impact: none. |
 | 3 | `test/mailers/reset_password_instructions_test.rb:40` | send confirmation instructions to the user email | ported | `crates/devise-rust/tests/notifications.rs (recipient from the record)` | |
 | 4 | `test/mailers/reset_password_instructions_test.rb:44` | set up sender from configuration | ported | `crates/devise-rust/src/mailer.rs tests (from header)` | |
@@ -1251,8 +1251,8 @@ Blocks that exercise Ruby or Rails runtime machinery (concern inclusion, load ho
 | # | devise source | test block | status | Rust test evidence | reason / v1 impact |
 |---|---|---|---|---|---|
 | 1 | `test/models_test.rb:22` | can cherry pick modules | ported | `crates/devise-rust/src/scope.rs tests (Mapping module list per scope)` | |
-| 2 | `test/models_test.rb:26` | validations options are not applied too late | ported | `crates/devise-rust/src/model.rs tests (Validatable is explicit, no ordering hazard)` | |
-| 3 | `test/models_test.rb:33` | validations are applied just once | ported | `crates/devise-rust/src/model.rs tests (validate called explicitly once)` | |
+| 2 | `test/models_test.rb:26` | validations options are not applied too late | ported | `crates/devise-rust/src/model/validatable.rs tests (Validatable is explicit, no ordering hazard)` | |
+| 3 | `test/models_test.rb:33` | validations are applied just once | ported | `crates/devise-rust/src/model/validatable.rs tests (validate called explicitly once)` | |
 | 4 | `test/models_test.rb:38` | chosen modules are inheritable | waived | `crates/devise-rust/src/scope.rs tests (module list is data on the Mapping)` | reason: Ruby class inheritance of devise module lists; the Rust module set is Mapping data, not a class hierarchy. v1 impact: none, scopes declare their own lists. |
 | 5 | `test/models_test.rb:42` | order of module inclusion | ported | `crates/devise-rust/src/scope.rs tests (test_module_order)` | super-chain order preserved |
 | 6 | `test/models_test.rb:56` | raise error on invalid module | ported | `crates/devise-rust-migrations/tests/snapshots.rs (cli_unknown_module_exits_two)` | |
