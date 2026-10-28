@@ -77,9 +77,7 @@ use crate::routes::{DeviseWebState, FullDeviseModel};
 /// carried these key constructors verbatim; they re-export the one core
 /// definition now (actix and axum sessions never interoperate, but the key
 /// grammar stays identical for auditability).
-pub(crate) use devise_rust::session::keys::{
-    omniauth_state_key, omniauth_verifier_key,
-};
+pub(crate) use devise_rust::session::keys::{omniauth_state_key, omniauth_verifier_key};
 
 // `OmniAuth::Utils.camelize` was used to interpolate the provider kind into
 // the RENDERED flash sentences; the flash now carries the bare I18n key

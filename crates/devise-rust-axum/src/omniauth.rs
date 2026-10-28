@@ -86,9 +86,7 @@ use crate::routes::{DeviseParams, DeviseWebState, FullDeviseModel, sign_in_bookk
 /// single-use, removed on callback read). Both framework omniauth modules
 /// previously carried these key constructors verbatim; they re-export the
 /// one core definition now.
-pub(crate) use devise_rust::session::keys::{
-    omniauth_state_key, omniauth_verifier_key,
-};
+pub(crate) use devise_rust::session::keys::{omniauth_state_key, omniauth_verifier_key};
 
 /// `OmniAuth::Utils.camelize` for the flash `kind`: "stub" -> "Stub",
 /// `google_oauth2` -> `GoogleOauth2`.

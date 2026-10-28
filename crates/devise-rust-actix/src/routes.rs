@@ -359,7 +359,12 @@ pub(crate) fn flash_redirect(session: &Session, location: &str, flash_key: &str)
 /// directly because the lockable `last_attempt` warning lives outside
 /// the [`devise_rust::failure::FailureReason`] vocabulary; the staged
 /// key reaches the session unchanged either way.
-fn auth_fail(req: &HttpRequest, session: &Session, mapping: &Mapping, key: &'static str) -> HttpResponse {
+fn auth_fail(
+    req: &HttpRequest,
+    session: &Session,
+    mapping: &Mapping,
+    key: &'static str,
+) -> HttpResponse {
     if wants_json(req) {
         return HttpResponse::Unauthorized().json(serde_json::json!({ "error": key }));
     }
@@ -481,8 +486,8 @@ fn redirect_to(location: &str) -> HttpResponse {
 /// `return unless is_navigational_format?`.
 ///
 /// Devise's guard consults `warden.authenticate?` with the mapping's
-/// NO-INPUT strategies — the rememberable strategy runs
-/// (`strategies/rememberable.rb`) — so a remembered visitor (session
+/// NO-INPUT strategies (the rememberable strategy runs,
+/// `strategies/rememberable.rb`) so a remembered visitor (session
 /// dropped, remember cookie kept) is authenticated; the core
 /// [`no_authentication_guard_passes`](devise_rust::helpers::no_authentication_guard_passes)
 /// decision owns the rule and the five-condition cookie validation.
@@ -535,7 +540,7 @@ where
 
 /// Read the signed remember cookie through the actix remember helper
 /// (`read_cookie` over a `SignedJar` keyed by the Devise secret): yields
-/// the verified `[key, value, generated_at]` triple only — a missing,
+/// the verified `[key, value, generated_at]` triple only: a missing,
 /// tampered, or stale cookie reads as `None` (anonymous, never a
 /// failure). The cookie name is the `rememberable_options`-override-aware
 /// [`remember_cookie_key`].
@@ -562,7 +567,7 @@ fn remember_triple_from(
 /// The generic `new`-form handler: sessions#new, passwords#new, and
 /// unlocks#new all render through here, and Devise guards ALL of them
 /// (`sessions_controller.rb:4`, `passwords_controller.rb:4`,
-/// `unlocks_controller.rb:4`) — the guard runs before the form renders
+/// `unlocks_controller.rb:4`): the guard runs before the form renders
 /// (registrations#new carries it inside its own handler).
 async fn new_handler<M, A, L>(
     req: HttpRequest,
@@ -636,17 +641,16 @@ where
     if let Some(response) = require_no_authentication_response(&req, &session, &state).await {
         return response;
     }
-    // S7: `sign_in_params` — the `:sign_in` sanitizer decides what the
+    // S7: `sign_in_params`: the `:sign_in` sanitizer decides what the
     // controller may read (`sessions_controller.rb:34-36`); the raw body
     // map stays available for the authentication-key lookup below (the
     // bridge flat spelling of the SAME permitted keys).
     // Devise's `unknown_action!` raise renders as the framework's 500.
     let raw_params = body_map(body, &singular);
-    let params = match devise_rust::parameter::ParameterSanitizer::new(&state.config)
+    let Ok(params) = devise_rust::parameter::ParameterSanitizer::new(&state.config)
         .sanitize("sign_in", &raw_params)
-    {
-        Ok(params) => params,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+    else {
+        return HttpResponse::InternalServerError().finish();
     };
     let password = param_str(&params, "password").to_string();
     // Devise's sign-in form posts "1" (`TRUE_VALUES`); JSON clients send a
@@ -1081,10 +1085,10 @@ where
     };
     // Devise confirmable `after_commit :send_on_create_confirmation_instructions`.
     // The GATED core path owns the decision (CNF-01:
-    // `send_confirmation_notification?`, confirmable.rb:286-288) — the
+    // `send_confirmation_notification?`, confirmable.rb:286-288): the
     // `skip_confirmation_notification!` flag is honored and a blank
     // address sends nothing (T-261026-ghk-02). Devise propagates a failed
-    // delivery (Rails renders the raised delivery error as 500) — the user
+    // delivery (Rails renders the raised delivery error as 500): the user
     // MUST learn the instructions never went out; swallowing it behind an
     // eprintln turns a broken mailer into silent "check your inbox" dead
     // air.
@@ -1602,7 +1606,11 @@ where
         if wants_json(&req) {
             return HttpResponse::Ok().json(serde_json::json!({ "confirmed": true }));
         }
-        return flash_redirect(&session, &state.mapping.sign_in_path(), flash_keys::CONFIRMED);
+        return flash_redirect(
+            &session,
+            &state.mapping.sign_in_path(),
+            flash_keys::CONFIRMED,
+        );
     }
     // Devise carves `confirmations#show` out of the configurable
     // `error_status` with a TODO to adopt it only when the default changes
@@ -1678,7 +1686,11 @@ where
         if wants_json(&req) {
             return HttpResponse::Ok().json(serde_json::json!({ "unlocked": true }));
         }
-        return flash_redirect(&session, &state.mapping.sign_in_path(), flash_keys::UNLOCKED);
+        return flash_redirect(
+            &session,
+            &state.mapping.sign_in_path(),
+            flash_keys::UNLOCKED,
+        );
     }
     // Devise carves `unlocks#show` out of the configurable `error_status`
     // with a TODO to adopt it only when the default changes

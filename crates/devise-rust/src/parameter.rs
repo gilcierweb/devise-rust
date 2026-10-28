@@ -83,11 +83,7 @@ impl ParameterFilter {
 /// assert_eq!(param_for(&bare_only, "user", "name"), "");
 /// ```
 #[must_use]
-pub fn param_for(
-    params: &Map<String, Value>,
-    singular: &str,
-    key: &str,
-) -> String {
+pub fn param_for(params: &Map<String, Value>, singular: &str, key: &str) -> String {
     let scoped = format!("{singular}[{key}]");
     let flat = format!("{singular}_{key}");
     params

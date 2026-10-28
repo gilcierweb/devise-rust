@@ -840,8 +840,8 @@ pub trait Recoverable: DatabaseAuthenticatable + crate::mailer::HasEmail {
         }
         // Devise's `find_or_initialize_with_errors` blank mapping
         // (`authenticatable.rb:287-291`): MISSING lookup keys report
-        // `:blank` per key — never `:not_found`, which a PRESENT value that
-        // matches nothing earns (T-261026-ghk-03). The short-circuit also
+        // `:blank` per key; only a PRESENT value that matches nothing
+        // earns `:not_found` (T-261026-ghk-03). The short-circuit also
         // keeps an empty condition set away from adapters where "empty
         // conditions match any record" holds; the generic path's
         // completeness check guards the partial case.

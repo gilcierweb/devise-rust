@@ -1376,7 +1376,7 @@ mod tests {
     /// INTEGER EPOCH SECONDS. A mint landing strictly LATER within the
     /// same second as `remember_created_at` (created at .23s, minted at
     /// .73s) still truncates to the same epoch second on the wire, so
-    /// the mint must nudge to created+1s — the old `generated <= created`
+    /// the mint must nudge to created+1s; the old `generated <= created`
     /// comparison kept the truncated timestamp and the cookie died on
     /// condition 4 right after sign-in.
     #[tokio::test]

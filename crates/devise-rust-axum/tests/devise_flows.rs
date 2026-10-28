@@ -909,10 +909,7 @@ async fn flow_sign_in_accepts_the_bridge_flat_email_key() {
         Request::builder()
             .method(Method::POST)
             .uri("/users/sign_in")
-            .header(
-                header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(Body::from(
                 "user_email=flow-flat%40example.com&password=secret123",
             ))
@@ -929,8 +926,8 @@ async fn flow_sign_in_accepts_the_bridge_flat_email_key() {
 
 /// T-261026-ghj (M-5): `require_no_authentication` matches Devise's
 /// coverage and remember-cookie awareness in both frameworks. A user
-/// signed in with remember_me (session dropped, remember cookie kept) is
-/// redirected with `already_authenticated` from every guarded route —
+/// signed in with `remember_me` (session dropped, remember cookie kept) is
+/// redirected with `already_authenticated` from every guarded route:
 /// the guard consults the remember cookie exactly like Devise's
 /// `warden.authenticate?` over the no-input strategies
 /// (`devise_controller.rb:116-132`); anonymous visitors reach the same
@@ -3202,7 +3199,12 @@ async fn flow_sign_up_honors_skip_confirmation_notification() {
         Value::String("skip-notify@example.com".to_string()),
     );
     assert!(
-        state.adapter.find_first(&conditions).await.expect("lookup").is_some(),
+        state
+            .adapter
+            .find_first(&conditions)
+            .await
+            .expect("lookup")
+            .is_some(),
         "the skipped record is persisted"
     );
 }

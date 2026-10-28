@@ -210,7 +210,8 @@ pub struct Group {
     pub name: String,
     /// Scopes tried in order.
     pub scopes: Vec<String>,
-}impl Group {
+}
+impl Group {
     /// Create a group from a name and scope list.
     ///
     /// Constructs a group, mirroring `devise_group`'s scope list.
@@ -570,11 +571,8 @@ mod tests {
             DeviseConfig::default()
         }
 
-        fn facts(
-            stored: &str,
-            created_at: Option<DateTime<Utc>>,
-        ) -> Option<RememberedRecordFacts> {
-            Some((stored.to_string(), created_at))
+        fn facts(stored: &str, created_at: Option<DateTime<Utc>>) -> RememberedRecordFacts {
+            (stored.to_string(), created_at)
         }
 
         #[tokio::test]
@@ -594,13 +592,9 @@ mod tests {
             );
             // A live session with NO cookie at all.
             assert!(
-                no_authentication_guard_passes(
-                    true,
-                    None,
-                    &config(),
-                    &clock,
-                    |_: String| async { None },
-                )
+                no_authentication_guard_passes(true, None, &config(), &clock, |_: String| async {
+                    None
+                },)
                 .await
             );
         }
@@ -624,9 +618,7 @@ mod tests {
                     &config(),
                     &clock,
                     |key: String| async move {
-                        (key == "7")
-                            .then(|| facts("tok", Some(now - TimeDelta::hours(1))))
-                            .flatten()
+                        (key == "7").then(|| facts("tok", Some(now - TimeDelta::hours(1))))
                     },
                 )
                 .await,
@@ -653,9 +645,13 @@ mod tests {
 
             // No cookie, no session: anonymous.
             assert!(
-                !no_authentication_guard_passes(false, None, &config(), &clock, |_: String| async {
-                    facts("tok", Some(now - TimeDelta::hours(1)))
-                })
+                !no_authentication_guard_passes(
+                    false,
+                    None,
+                    &config(),
+                    &clock,
+                    |_: String| async { Some(facts("tok", Some(now - TimeDelta::hours(1)))) }
+                )
                 .await
             );
 
@@ -666,7 +662,7 @@ mod tests {
                     Some(("1".to_string(), "tok".to_string(), "not-a-time".to_string())),
                     &config(),
                     &clock,
-                    |_: String| async { facts("tok", Some(now)) },
+                    |_: String| async { Some(facts("tok", Some(now))) },
                 )
                 .await
             );
@@ -684,7 +680,7 @@ mod tests {
                     )),
                     &config(),
                     &clock,
-                    |_: String| async { facts("tok", Some(now)) },
+                    |_: String| async { Some(facts("tok", Some(now))) },
                 )
                 .await
             );
@@ -701,7 +697,7 @@ mod tests {
                     )),
                     &config(),
                     &clock,
-                    |_: String| async { facts("tok", Some(now - TimeDelta::weeks(4))) },
+                    |_: String| async { Some(facts("tok", Some(now - TimeDelta::weeks(4)))) },
                 )
                 .await,
                 "an expired remember cookie is anonymous"
@@ -718,7 +714,7 @@ mod tests {
                     )),
                     &config(),
                     &clock,
-                    |_: String| async { facts("other", Some(now - TimeDelta::hours(1))) },
+                    |_: String| async { Some(facts("other", Some(now - TimeDelta::hours(1)))) },
                 )
                 .await,
                 "a token mismatch is anonymous"
@@ -736,7 +732,7 @@ mod tests {
                     )),
                     &config(),
                     &clock,
-                    |_: String| async { facts("tok", None) },
+                    |_: String| async { Some(facts("tok", None)) },
                 )
                 .await
             );
@@ -753,7 +749,7 @@ mod tests {
                     )),
                     &config(),
                     &clock,
-                    |_: String| async { facts("tok", Some(now)) },
+                    |_: String| async { Some(facts("tok", Some(now))) },
                 )
                 .await
             );

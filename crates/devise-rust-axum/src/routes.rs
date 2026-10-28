@@ -858,7 +858,7 @@ where
 /// authenticated by SESSION OR by a live remember cookie is redirected
 /// home with the `already_authenticated` flash instead of reaching the
 /// guarded action. Devise's guard consults `warden.authenticate?` with
-/// the mapping's NO-INPUT strategies — the rememberable strategy runs —
+/// the mapping's NO-INPUT strategies (the rememberable strategy runs),
 /// so a remembered visitor (session dropped, remember cookie kept) is
 /// authenticated; the core
 /// [`no_authentication_guard_passes`](devise_rust::helpers::no_authentication_guard_passes)
@@ -892,14 +892,13 @@ where
     // The remember cookie: the layer already signature-verified the
     // inbound cookie into `auth_request.cookies` for the resolved scope,
     // so the decode here reads the verified triple (a failed verify kept
-    // the raw value, which decodes to nothing — anonymous, never a
+    // the raw value, which decodes to nothing: anonymous, never a
     // failure).
     let remember_triple = auth_request
         .cookies
         .get(&remember_cookie_key(scope, &st.config))
         .and_then(|raw| {
-            let (key, value, generated_at) =
-                devise_rust::rememberable::decode_cookie_value(raw)?;
+            let (key, value, generated_at) = devise_rust::rememberable::decode_cookie_value(raw)?;
             devise_rust::rememberable::parse_generated_at(&generated_at)
                 .map(|_| (key, value, generated_at))
         });
@@ -1330,7 +1329,7 @@ where
     };
     // Devise confirmable `after_commit :send_on_create_confirmation_instructions`.
     // The GATED core path owns the decision (CNF-01:
-    // `send_confirmation_notification?`, confirmable.rb:286-288) — the
+    // `send_confirmation_notification?`, confirmable.rb:286-288): the
     // `skip_confirmation_notification!` flag is honored and a blank
     // address sends nothing (T-261026-ghk-02). Devise propagates a failed
     // delivery (Rails renders the raised delivery error as 500): the user
@@ -1697,11 +1696,7 @@ where
     // root: the user must land on the sign-in form to start over.
     let token = query.get("reset_password_token").map_or("", String::as_str);
     if token.trim().is_empty() {
-        return flash_redirect(
-            &st.config,
-            &st.mapping.sign_in_path(),
-            flash_keys::NO_TOKEN,
-        );
+        return flash_redirect(&st.config, &st.mapping.sign_in_path(), flash_keys::NO_TOKEN);
     }
     (
         StatusCode::OK,
@@ -1888,7 +1883,11 @@ where
             )
                 .into_response();
         }
-        return flash_redirect(&st.config, &st.mapping.sign_in_path(), flash_keys::CONFIRMED);
+        return flash_redirect(
+            &st.config,
+            &st.mapping.sign_in_path(),
+            flash_keys::CONFIRMED,
+        );
     }
     // Devise carves `confirmations#show` out of the configurable
     // `error_status` with a TODO to adopt it only when the default changes

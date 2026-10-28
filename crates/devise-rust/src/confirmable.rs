@@ -390,7 +390,11 @@ pub trait Confirmable: Authenticatable + HasEmail {
             let period = config
                 .confirm_within
                 .map_or_else(|| humanize_period(TimeDelta::zero()), humanize_period);
-            errors.add_with_options("email", ":confirmation_period_expired", &[("period", &period)]);
+            errors.add_with_options(
+                "email",
+                ":confirmation_period_expired",
+                &[("period", &period)],
+            );
             return Ok(Err(errors));
         }
         let now = clock.now();
@@ -761,7 +765,7 @@ pub trait Confirmable: Authenticatable + HasEmail {
         }
         // Devise's `find_or_initialize_with_errors` blank mapping
         // (`authenticatable.rb:287-291`): a MISSING lookup key reports
-        // `:blank` per key, never `:not_found` — only a PRESENT value that
+        // `:blank` per key, never `:not_found`; only a PRESENT value that
         // matches nothing earns `:not_found` (T-261026-ghk-03; the same
         // per-key split lockable's send already ships).
         let mut resource = if conditions.iter().next().is_none() {
@@ -1461,7 +1465,7 @@ mod tests {
 
     /// T-261026-ghk-03 (M-13): the send paths map MISSING lookup keys to
     /// `:blank` per key (`authenticatable.rb:287-291`), the same split
-    /// lockable's send already ships — only a PRESENT value that matches
+    /// lockable's send already ships; only a PRESENT value that matches
     /// nothing earns `:not_found`.
     #[tokio::test]
     async fn confirmable_send_maps_missing_keys_to_blank() {

@@ -904,8 +904,8 @@ async fn flow_sign_in_accepts_the_bridge_flat_email_key() {
 
 /// T-261026-ghj (M-5): `require_no_authentication` matches Devise's
 /// coverage and remember-cookie awareness in both frameworks. A user
-/// signed in with remember_me (session dropped, remember cookie kept) is
-/// redirected with `already_authenticated` from every guarded route —
+/// signed in with `remember_me` (session dropped, remember cookie kept) is
+/// redirected with `already_authenticated` from every guarded route:
 /// the guard consults the remember cookie exactly like Devise's
 /// `warden.authenticate?` over the no-input strategies
 /// (`devise_controller.rb:116-132`); anonymous visitors reach the same
@@ -982,11 +982,7 @@ async fn flow_remembered_user_redirected_from_all_no_auth_routes() {
         "/users/password/edit?reset_password_token=tok",
         "/users/unlock/new",
     ] {
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::get().uri(uri).to_request(),
-        )
-        .await;
+        let resp = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
         assert_eq!(resp.status(), 200, "anonymous {uri} stays 200");
     }
 

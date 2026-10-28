@@ -74,7 +74,7 @@ pub struct ValidationErrors {
     /// Devise's `errors.add(attr, :key, period: ...)` carries the
     /// interpolation payload beside the symbolic key
     /// (`confirmable.rb:82-83`); this parallel map is that payload. Keys
-    /// stay the only rendered surface — options feed the renderer's
+    /// stay the only rendered surface; options feed the renderer's
     /// `%{placeholder}` substitution, never the wire body by themselves.
     #[serde(skip)]
     options: HashMap<(String, String), Vec<(String, String)>>,
@@ -172,7 +172,7 @@ impl ValidationErrors {
 
     /// Merge another `ValidationErrors` into this one
     ///
-    /// Mirrors `ActiveModel` `errors.merge!` — the interpolation options
+    /// Mirrors `ActiveModel` `errors.merge!`; the interpolation options
     /// travel with their entries.
     pub fn merge(&mut self, other: ValidationErrors) {
         for (field, keys) in other.inner {
@@ -386,12 +386,7 @@ pub fn errors_options_json(errors: &ValidationErrors) -> serde_json::Value {
     for ((field, key), options) in &errors.options {
         let entry: serde_json::Map<String, serde_json::Value> = options
             .iter()
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    serde_json::Value::String(value.clone()),
-                )
-            })
+            .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
             .collect();
         // The stored keys carry Devise's leading colon (":blank"); the
         // composite drops it so the idiom reads "field::key".
@@ -689,14 +684,10 @@ mod tests {
         );
         // A keys-only entry has no options.
         errors.add("password", ":too_short");
-        assert!(errors.options_for("password", ":too_short").is_empty());
+        assert_eq!(errors.options_for("password", ":too_short"), []);
 
         // Multiple options on one entry, and the rendered options JSON.
-        errors.add_with_options(
-            "email",
-            ":confirmation_period_expired",
-            &[("count", "2")],
-        );
+        errors.add_with_options("email", ":confirmation_period_expired", &[("count", "2")]);
         assert_eq!(
             errors.options_for("email", ":confirmation_period_expired"),
             &[
@@ -710,7 +701,10 @@ mod tests {
                 "email::confirmation_period_expired": { "period": "3 days", "count": "2" }
             })
         );
-        assert_eq!(errors_options_json(&ValidationErrors::new()), serde_json::json!({}));
+        assert_eq!(
+            errors_options_json(&ValidationErrors::new()),
+            serde_json::json!({})
+        );
     }
 
     /// `errors.merge!` carries the options with their entries.
@@ -727,7 +721,12 @@ mod tests {
         errors.merge(incoming);
         assert_eq!(
             errors.get("email").map(Vec::as_slice),
-            Some(&[":invalid".to_string(), ":confirmation_period_expired".to_string()][..])
+            Some(
+                &[
+                    ":invalid".to_string(),
+                    ":confirmation_period_expired".to_string()
+                ][..]
+            )
         );
         assert_eq!(
             errors.options_for("email", ":confirmation_period_expired"),
