@@ -564,9 +564,16 @@ impl AuthProxy {
         let Ok(Some(record)) = finder.get_boxed(&key).await else {
             return Ok(None);
         };
-        let Some(current_salt) = record.as_ref().authenticatable_salt() else {
-            return Ok(None);
-        };
+        // WR-06 closure (261026-ghl): a record without an authenticatable
+        // salt (omniauth-only models) fetches normally. `None` compares as
+        // the empty string under the constant-time compare — byte-identical
+        // to the audited framework S6 behavior
+        // (`saltless_record_session_fetch_stays_signed_in` in both
+        // framework suites is the behavioral contract) — because
+        // `session_pair` persisted `""` for the saltless record. A
+        // PRESENT salt on either side still must match, and mismatches
+        // still delete the session key below.
+        let current_salt = record.as_ref().authenticatable_salt().unwrap_or_default();
         if !crate::crypto::secure_compare(&current_salt, stored_salt) {
             self.session_store.remove(&session_key).await;
             return Ok(None);
@@ -1673,5 +1680,75 @@ mod tests {
             "the session key survives for an exempt record"
         );
         assert!(proxy.fetch_gate_failures.is_empty(), "no failure staged");
+    }
+
+    /// WR-06 closure (261026-ghl): a record whose `authenticatable_salt` is
+    /// `None` (omniauth-only models without `encrypted_password`) fetches
+    /// normally — the core proxy now matches the framework S6 semantics
+    /// pinned by `saltless_record_session_fetch_stays_signed_in` in both
+    /// framework suites. `None` compares as the empty string under the
+    /// constant-time compare (the payload's stored salt is the `""` that
+    /// `session_pair` persisted), so an omniauth-only user stays signed in
+    /// on every request instead of being logged out by the core fetch.
+    #[tokio::test]
+    async fn fetch_gate_saltless_record_fetches_from_empty_salt_payload() {
+        let mut record = FetchGateUser::new("saltless@example.com", "secret123", true, true);
+        record.encrypted_password = String::new();
+        let (mut proxy, store, _adapter) = fetch_gate_proxy(record).await;
+
+        let request = fetch_gate_request();
+        let user = proxy
+            .authenticate("user", &request)
+            .await
+            .expect("a saltless record fetches (WR-06)");
+        assert_eq!(user.to_key(), DeviseKey::from_i64(1));
+        let session_key = session::keys::scope_session_key("user");
+        assert!(
+            store.get_value(&session_key).await.is_some(),
+            "the saltless session survives the fetch"
+        );
+        assert!(proxy.fetch_gate_failures.is_empty(), "no failure staged");
+    }
+
+    /// WR-06 companion: the empty-string convention is acceptance for
+    /// None-vs-None ONLY. A PRESENT salt on either side still mismatches
+    /// under the constant-time compare, and every mismatch still deletes
+    /// the scope session key (warden fetch semantics unchanged).
+    #[tokio::test]
+    async fn fetch_gate_salt_mismatch_deletes_the_key_in_both_directions() {
+        // A saltless record against a NON-empty stored salt: mismatch.
+        let mut saltless = FetchGateUser::new("saltless@example.com", "secret123", true, true);
+        saltless.encrypted_password = String::new();
+        let (mut proxy, store, _adapter) = fetch_gate_proxy(saltless).await;
+        let session_key = session::keys::scope_session_key("user");
+        store
+            .insert_value(&session_key, serde_json::json!(["1", "stored-salt"]))
+            .await;
+        let request = fetch_gate_request();
+        assert!(
+            proxy.authenticate("user", &request).await.is_none(),
+            "a saltless record fails against a present stored salt"
+        );
+        assert!(
+            store.get_value(&session_key).await.is_none(),
+            "the mismatch deletes the scope session key"
+        );
+
+        // A salted record against an EMPTY stored salt: mismatch.
+        let record = FetchGateUser::new("salted@example.com", "secret123", true, true);
+        let (mut proxy, store, _adapter) = fetch_gate_proxy(record).await;
+        let session_key = session::keys::scope_session_key("user");
+        store
+            .insert_value(&session_key, serde_json::json!(["1", ""]))
+            .await;
+        let request = fetch_gate_request();
+        assert!(
+            proxy.authenticate("user", &request).await.is_none(),
+            "a salted record fails against an empty stored salt"
+        );
+        assert!(
+            store.get_value(&session_key).await.is_none(),
+            "the mismatch deletes the scope session key"
+        );
     }
 }

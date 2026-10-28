@@ -103,15 +103,16 @@ pub fn required_fields() -> Vec<&'static str> {
 /// sign-in sets last equal to current; a missing peer leaves the IP
 /// columns NULL, never an empty string).
 ///
-/// == Examples
+/// ## Examples
 ///
 /// ```
+/// use devise_rust::adapter::Clock;
 /// use devise_rust::time::FixedClock;
-/// use chrono::DateTime;
+/// use chrono::Utc;
 /// // The builder is pure: it reads the pre-shift state and never writes.
 /// // Compiled call shapes live in the crate tests and the framework
 /// // sign-in bookkeeping (tests compare the map field by field).
-/// let clock = FixedClock::new(DateTime::from_timestamp(1_700_000_000, 0).unwrap());
+/// let clock = FixedClock::new(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
 /// let _now = clock.now();
 /// ```
 #[must_use]

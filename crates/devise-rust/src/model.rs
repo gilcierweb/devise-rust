@@ -1271,6 +1271,12 @@ pub trait Authenticatable: AnyDeviseModel {
     /// logged in": a backend outage on the fetch path used to read as a
     /// valid "no user", logging every signed-in visitor out at once.
     ///
+    /// WR-06 closure (261026-ghl): a record without an authenticatable salt
+    /// (omniauth-only models) deserializes normally - `None` compares as the
+    /// empty string under the constant-time compare, matching the core
+    /// proxy, the session helpers, and the framework S6 semantics. A PRESENT
+    /// salt still must match in both directions.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::adapter::OrmError`] when the backend fails.
@@ -1286,9 +1292,7 @@ pub trait Authenticatable: AnyDeviseModel {
         let Some(record) = adapter.get(key).await? else {
             return Ok(None);
         };
-        let Some(current_salt) = record.authenticatable_salt() else {
-            return Ok(None);
-        };
+        let current_salt = record.authenticatable_salt().unwrap_or_default();
         if !crate::crypto::secure_compare(&current_salt, salt) {
             return Ok(None);
         }
@@ -2338,6 +2342,57 @@ mod tests {
             .await
             .expect("a missing record is not a backend failure");
         assert!(missing.is_none());
+    }
+
+    /// WR-06 closure (261026-ghl): a record without an authenticatable salt
+    /// (omniauth-only models) deserializes normally from the `""` salt its
+    /// `serialize_into_session` persisted — the typed path mirrors the core
+    /// proxy and the framework S6 semantics, so None compares as the empty
+    /// string under the constant-time compare. A present salt still has to
+    /// match in BOTH directions.
+    #[tokio::test]
+    async fn serialize_from_session_accepts_saltless_records() {
+        let config = test_config();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mut saltless = TestUser::testing("secret123", &config);
+        saltless.encrypted_password = String::new();
+        adapter.create(saltless.clone()).await.unwrap();
+
+        // The stored payload carries the empty salt (session_pair's
+        // unwrap_or_default) and fetches back.
+        let (key, salt) = saltless.serialize_into_session();
+        assert_eq!(salt, "", "a saltless record serializes an empty salt");
+        let fetched = TestUser::serialize_from_session(&key, &salt, &adapter)
+            .await
+            .expect("fetch succeeds");
+        assert!(
+            fetched.is_some(),
+            "a saltless record fetches from the empty-salt payload (WR-06)"
+        );
+
+        // None on the record side is NOT acceptance of a present salt.
+        let mismatch = TestUser::serialize_from_session(&key, "stored-salt", &adapter)
+            .await
+            .expect("salt mismatch is not a backend failure");
+        assert!(
+            mismatch.is_none(),
+            "a saltless record fails against a present stored salt"
+        );
+
+        // A salted record fails against the empty stored salt (both
+        // directions mismatch).
+        let mut salted = TestUser::testing("secret123", &config);
+        salted.id = 2;
+        adapter.create(salted.clone()).await.unwrap();
+        let (salted_key, _salted_salt) = salted.serialize_into_session();
+        assert_ne!(salted_key, key, "the two fixtures must be distinct rows");
+        let mismatch = TestUser::serialize_from_session(&salted_key, "", &adapter)
+            .await
+            .expect("salt mismatch is not a backend failure");
+        assert!(
+            mismatch.is_none(),
+            "a salted record fails against an empty stored salt"
+        );
     }
 
     /// A backend outage on the session fetch surfaces as an error, never as a

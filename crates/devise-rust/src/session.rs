@@ -181,7 +181,13 @@ pub mod serializer {
 
         // Fetch record and validate salt
         let record = adapter.get(&key).await.ok()??;
-        let current_salt = record.authenticatable_salt()?;
+        // WR-06 closure (261026-ghl): `None` compares as the empty string
+        // under the constant-time compare, so a saltless record
+        // (omniauth-only models) fetches from the `""`-salt payload this
+        // module's `serialize_into_session` persisted - matching the
+        // core proxy, the typed model path, and the framework S6
+        // semantics. A PRESENT salt on either side still mismatches.
+        let current_salt = record.authenticatable_salt().unwrap_or_default();
 
         // Constant-time salt comparison (security critical)
         if !crate::crypto::secure_compare(&current_salt, stored_salt) {
@@ -392,6 +398,52 @@ mod tests {
         // Key should be deleted
         let session_value = store.get_value(&session_key).await;
         assert!(session_value.is_none());
+    }
+
+    /// WR-06 closure (261026-ghl): a record whose salt is `None`
+    /// (omniauth-only models) fetches from the `""`-salt payload the session
+    /// helpers persist — `None` compares as the empty string under the
+    /// constant-time compare, matching the core proxy and the framework
+    /// S6 semantics. A present salt on either side still mismatches and
+    /// deletes the session key.
+    #[tokio::test]
+    async fn test_session_serializer_accepts_saltless_records() {
+        let store = TestSessionStore::new();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let saltless = TestUser::new(1, "saltless@example.com", "");
+        adapter.create(saltless.clone()).await.unwrap();
+
+        let (key, salt) = serializer::serialize_into_session(&saltless);
+        assert_eq!(salt, "", "a saltless record serializes an empty salt");
+        let session_key = keys::scope_session_key("user");
+        store
+            .insert_value(&session_key, serde_json::json!([key.to_string(), salt]))
+            .await;
+
+        let fetched =
+            serializer::serialize_from_session::<_, TestUser>(&store, "user", &adapter).await;
+        assert_eq!(
+            fetched,
+            Some(DeviseKey::from_i64(1)),
+            "a saltless record fetches from the empty-salt payload (WR-06)"
+        );
+        assert!(
+            store.get_value(&session_key).await.is_some(),
+            "the saltless session survives the fetch"
+        );
+
+        // A present stored salt against the saltless record: mismatch,
+        // key deleted.
+        store
+            .insert_value(&session_key, serde_json::json!(["1", "stored-salt"]))
+            .await;
+        let fetched =
+            serializer::serialize_from_session::<_, TestUser>(&store, "user", &adapter).await;
+        assert_eq!(fetched, None, "a present salt mismatches a saltless record");
+        assert!(
+            store.get_value(&session_key).await.is_none(),
+            "the mismatch deletes the session key"
+        );
     }
 
     /// The `[key, value, timestamp]` remember-cookie triple lives in exactly
