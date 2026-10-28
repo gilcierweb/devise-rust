@@ -448,6 +448,10 @@ pub trait Omniauthable: Authenticatable {
     /// set means the record is ready to sign in, a populated one means the
     /// caller renders the failure path.
     ///
+    /// Adapter lookup/persist errors propagate as [`DeviseError`] (WR-05) so
+    /// transient backend failures surface as 500 instead of minting duplicate
+    /// identities.
+    ///
     /// == Token contract (D-12)
     ///
     /// This method NEVER receives access or refresh tokens: they live in
@@ -458,7 +462,7 @@ pub trait Omniauthable: Authenticatable {
         profile: ProviderProfile,
         adapter: &A,
         clock: &dyn Clock,
-    ) -> ResourceWithErrors<Self>
+    ) -> Result<ResourceWithErrors<Self>, DeviseError>
     where
         Self: Sized,
         A: OrmAdapter<Self, New = Self::New> + Send + Sync;
@@ -494,17 +498,22 @@ pub trait Omniauthable: Authenticatable {
 /// 3. When no email row exists, create a new row with provider, uid,
 ///    email, and name via [`Omniauthable::new_from_profile`].
 ///
-/// Lookup failures surface as a blank record carrying errors (the same flow
-/// as `find_or_initialize_with_errors`); persist failures return the best
-/// available record with errors, so callers render the failure path instead
-/// of signing in - nothing fails silently.
+/// Adapter lookup failures propagate as [`DeviseError`] (WR-05) so callers
+/// never swallow transient backend errors as "not found" and mint duplicate
+/// identities. Persist failures return the best available record with errors,
+/// so callers render the failure path instead of signing in.
+///
+/// # Errors
+///
+/// Returns [`DeviseError::Adapter`] when the identity lookup or the
+/// verified-email lookup fails; the create/update persist path keeps
+/// returning the record-with-errors shape instead of an error.
 ///
 /// == Examples
 ///
 /// ```ignore
 /// // Ignored doctest: requires a live adapter and an async runtime; the compiled equivalent lives in the crate tests and the example apps.
-/// let outcome: ResourceWithErrors<User> =
-///     default_from_omniauth(&adapter, &profile, &clock).await;
+/// let outcome = default_from_omniauth(&adapter, &profile, &config, &clock).await?;
 /// if outcome.is_valid() {
 ///     proxy.set_user("user", Some(Box::new(outcome.record)), SetUserOpts {
 ///         event: SetUserEvent::Authentication, ..SetUserOpts::default()
@@ -516,7 +525,7 @@ pub async fn default_from_omniauth<M, A>(
     profile: &ProviderProfile,
     config: &crate::config::DeviseConfig,
     clock: &dyn Clock,
-) -> ResourceWithErrors<M>
+) -> Result<ResourceWithErrors<M>, DeviseError>
 where
     M: Omniauthable + Default + Sized + Send + Sync + 'static,
     A: OrmAdapter<M, New = <M as Omniauthable>::New> + Send + Sync,
@@ -540,15 +549,23 @@ where
     let mut identity = Conditions::new();
     identity.insert(PROVIDER_COLUMN, profile.provider.as_str());
     identity.insert(UID_COLUMN, profile.uid.as_str());
-    if let Ok(Some(record)) = adapter.find_first(&identity).await {
-        return ResourceWithErrors::new(record, ValidationErrors::new());
+    if let Some(record) = adapter
+        .find_first(&identity)
+        .await
+        .map_err(DeviseError::Adapter)?
+    {
+        return Ok(ResourceWithErrors::new(record, ValidationErrors::new()));
     }
 
     // 2. Email collision: link ONLY on a provider-asserted verified email.
     if let Some(email) = profile.email.as_deref() {
         let mut by_email = Conditions::new();
         by_email.insert("email", email);
-        if let Ok(Some(existing)) = adapter.find_first(&by_email).await {
+        if let Some(existing) = adapter
+            .find_first(&by_email)
+            .await
+            .map_err(DeviseError::Adapter)?
+        {
             if profile.email_verified {
                 let mut fields = HashMap::new();
                 fields.insert(
@@ -557,12 +574,12 @@ where
                 );
                 fields.insert(UID_COLUMN.to_string(), Value::from(profile.uid.as_str()));
                 if let Ok(linked) = adapter.update_columns(&existing.to_key(), &fields).await {
-                    return ResourceWithErrors::new(linked, ValidationErrors::new());
+                    return Ok(ResourceWithErrors::new(linked, ValidationErrors::new()));
                 }
                 // The row stays unlinked; the caller sees the errors.
                 let mut errors = ValidationErrors::new();
                 errors.add(PROVIDER_COLUMN, ":invalid");
-                return ResourceWithErrors::new(existing, errors);
+                return Ok(ResourceWithErrors::new(existing, errors));
             }
             // Unverified: fall through to create-new. NEVER link (T-09-08).
         }
@@ -571,7 +588,7 @@ where
     // 3. Create the new identity row.
     let new = M::new_from_profile(&profile, clock.now());
     match adapter.create(new).await {
-        Ok(created) => ResourceWithErrors::new(created, ValidationErrors::new()),
+        Ok(created) => Ok(ResourceWithErrors::new(created, ValidationErrors::new())),
         Err(orm_error) => {
             let mut errors = ValidationErrors::new();
             if matches!(orm_error, OrmError::UniqueViolation { .. }) {
@@ -579,7 +596,7 @@ where
             } else {
                 errors.add(PROVIDER_COLUMN, ":invalid");
             }
-            ResourceWithErrors::new(M::default(), errors)
+            Ok(ResourceWithErrors::new(M::default(), errors))
         }
     }
 }
@@ -847,7 +864,7 @@ mod tests {
             profile: ProviderProfile,
             adapter: &A,
             clock: &dyn Clock,
-        ) -> ResourceWithErrors<Self>
+        ) -> Result<ResourceWithErrors<Self>, DeviseError>
         where
             Self: Sized,
             A: OrmAdapter<Self, New = Self::New> + Send + Sync,
@@ -935,7 +952,8 @@ mod tests {
             &test_config(),
             &clock,
         )
-        .await;
+        .await
+        .expect("from_omniauth");
 
         assert!(outcome.is_valid());
         assert_eq!(outcome.record.email, "known@example.com");
@@ -967,7 +985,8 @@ mod tests {
             &test_config(),
             &clock,
         )
-        .await;
+        .await
+        .expect("from_omniauth");
 
         assert!(outcome.is_valid());
         // The pre-existing row now carries the identity pair.
@@ -1010,7 +1029,8 @@ mod tests {
             &test_config(),
             &clock,
         )
-        .await;
+        .await
+        .expect("from_omniauth");
 
         assert!(
             outcome.is_valid(),
@@ -1052,7 +1072,8 @@ mod tests {
             &test_config(),
             &clock,
         )
-        .await;
+        .await
+        .expect("from_omniauth");
 
         // The fallthrough is create-new - a valid outcome, never a silent error.
         assert!(outcome.is_valid());
@@ -1085,7 +1106,8 @@ mod tests {
             &test_config(),
             &clock,
         )
-        .await;
+        .await
+        .expect("from_omniauth");
 
         assert!(outcome.is_valid());
         assert_eq!(outcome.record.email, "fresh@example.com");
@@ -1107,7 +1129,8 @@ mod tests {
         // default policy cannot look up by a nonexistent column value.
         let outcome: ResourceWithErrors<OmniUser> =
             default_from_omniauth(&adapter, &omni_profile(None, false), &test_config(), &clock)
-                .await;
+                .await
+                .expect("from_omniauth");
 
         assert!(outcome.is_valid());
         assert_eq!(outcome.record.provider.as_deref(), Some("stub"));
@@ -1228,7 +1251,8 @@ mod tests {
             &test_config(),
             &clock,
         )
-        .await;
+        .await
+        .expect("from_omniauth");
         assert!(outcome.is_valid());
 
         let (mut proxy, store) = omniauth_test_proxy();
@@ -1257,6 +1281,109 @@ mod tests {
                 .expect("typed user")
                 .provider
                 .is_some()
+        );
+    }
+
+    /// WR-05: an adapter lookup failure propagates as [`DeviseError`]
+    /// instead of the old "treat the error as not-found" swallow, which
+    /// let a transient backend outage mint a SECOND identity row on the
+    /// next attempt. The framework callbacks map this error onto their
+    /// internal-error (500) path, so the user sees a failure, never a
+    /// silently duplicated account.
+    #[tokio::test]
+    async fn default_from_omniauth_propagates_adapter_lookup_failures() {
+        use crate::adapter::{ChangeSet, Conditions, DeviseKey, OrmError};
+
+        struct FailingAdapter;
+
+        #[async_trait]
+        impl OrmAdapter<OmniUser> for FailingAdapter {
+            type New = OmniUser;
+
+            async fn get(&self, _id: &DeviseKey) -> Result<Option<OmniUser>, OrmError> {
+                Err(OrmError::Connection {
+                    message: "pool exhausted".to_string(),
+                    source: None,
+                })
+            }
+
+            async fn find_first(
+                &self,
+                _conditions: &Conditions,
+            ) -> Result<Option<OmniUser>, OrmError> {
+                Err(OrmError::Connection {
+                    message: "pool exhausted".to_string(),
+                    source: None,
+                })
+            }
+
+            async fn create(&self, _model: OmniUser) -> Result<OmniUser, OrmError> {
+                Err(OrmError::Connection {
+                    message: "pool exhausted".to_string(),
+                    source: None,
+                })
+            }
+
+            async fn update(
+                &self,
+                _key: &DeviseKey,
+                _changes: &ChangeSet,
+            ) -> Result<OmniUser, OrmError> {
+                Err(OrmError::Connection {
+                    message: "pool exhausted".to_string(),
+                    source: None,
+                })
+            }
+
+            async fn update_columns(
+                &self,
+                _key: &DeviseKey,
+                _fields: &std::collections::HashMap<String, crate::adapter::Value>,
+            ) -> Result<OmniUser, OrmError> {
+                Err(OrmError::Connection {
+                    message: "pool exhausted".to_string(),
+                    source: None,
+                })
+            }
+
+            async fn increment_counter(
+                &self,
+                _key: &DeviseKey,
+                _column: &'static str,
+            ) -> Result<OmniUser, OrmError> {
+                Err(OrmError::Connection {
+                    message: "pool exhausted".to_string(),
+                    source: None,
+                })
+            }
+
+            async fn delete(&self, _id: &DeviseKey) -> Result<(), OrmError> {
+                Err(OrmError::Connection {
+                    message: "pool exhausted".to_string(),
+                    source: None,
+                })
+            }
+        }
+
+        let adapter = FailingAdapter;
+        let clock = FixedClock::new(
+            chrono::Utc
+                .with_ymd_and_hms(2026, 10, 28, 12, 0, 0)
+                .single()
+                .expect("fixed time"),
+        );
+        let outcome = default_from_omniauth(
+            &adapter,
+            &omni_profile(Some("new@example.com"), true),
+            &crate::config::DeviseConfig::default(),
+            &clock,
+        )
+        .await;
+
+        let err = outcome.expect_err("a failed lookup is an error, not a miss");
+        assert!(
+            matches!(err, DeviseError::Adapter(_)),
+            "the adapter error propagates verbatim: {err:?}"
         );
     }
 }
