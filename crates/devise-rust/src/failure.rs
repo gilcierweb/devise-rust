@@ -483,6 +483,78 @@ pub fn is_navigational_format(
     request.is_navigational_format(config)
 }
 
+/// Devise's success/notice flash keys - the `devise.*` message stems the
+/// controllers stage after a successful action.
+///
+/// One typed home beside [`FailureReason::flash_key`] for the literal
+/// string keys both framework routers previously repeated inline (the
+/// DRY audit's duplicated-flash-key finding). The values are the exact
+/// en.yml stems Devise's controllers pass to `set_flash_message`; the
+/// per-action composed keys (like `signed_up_but_unconfirmed`, built
+/// from the record's `inactive_message`) stay at their call sites.
+pub mod flash_keys {
+    /// `devise.sessions.signed_in`
+    pub const SIGNED_IN: &str = "signed_in";
+    /// `devise.registrations.signed_up`
+    pub const SIGNED_UP: &str = "signed_up";
+    /// `devise.failure.already_authenticated`
+    pub const ALREADY_AUTHENTICATED: &str = "already_authenticated";
+    /// `devise.passwords.send_instructions` (also confirmations/unlocks)
+    pub const SEND_INSTRUCTIONS: &str = "send_instructions";
+    /// The paranoid uniform notice for every send-instructions action.
+    pub const SEND_PARANOID_INSTRUCTIONS: &str = "send_paranoid_instructions";
+    /// `devise.registrations.updated`
+    pub const UPDATED: &str = "updated";
+    /// `devise.registrations.update_needs_confirmation`
+    pub const UPDATE_NEEDS_CONFIRMATION: &str = "update_needs_confirmation";
+    /// `devise.registrations.updated_but_not_signed_in`
+    pub const UPDATED_BUT_NOT_SIGNED_IN: &str = "updated_but_not_signed_in";
+    /// `devise.passwords.updated_not_active`
+    pub const UPDATED_NOT_ACTIVE: &str = "updated_not_active";
+    /// `devise.sessions.signed_out`
+    pub const SIGNED_OUT: &str = "signed_out";
+    /// `devise.registrations.destroyed`
+    pub const DESTROYED: &str = "destroyed";
+    /// `devise.confirmations.confirmed`
+    pub const CONFIRMED: &str = "confirmed";
+    /// `devise.unlocks.unlocked`
+    pub const UNLOCKED: &str = "unlocked";
+    /// `devise.failure.locked`
+    pub const LOCKED: &str = "locked";
+    /// `devise.passwords.no_token`
+    pub const NO_TOKEN: &str = "no_token";
+}
+
+/// The flash key Devise's `successfully_sent?` picks for a
+/// send-instructions action (`devise_controller.rb:135-147`).
+///
+/// Paranoid mode reports the uniform `send_paranoid_instructions`
+/// notice for a record that did not resolve; a resolved record (or a
+/// non-paranoid config) reports `send_instructions`. Byte-identical to
+/// the three-times-per-framework branch both routers previously inline
+/// (`passwords#create`, `confirmations#create`, `unlocks#create`).
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::failure::successfully_sent_key;
+///
+/// assert_eq!(successfully_sent_key(true, false), "send_instructions");
+/// assert_eq!(successfully_sent_key(false, false), "send_instructions");
+/// assert_eq!(successfully_sent_key(false, true), "send_paranoid_instructions");
+/// assert_eq!(successfully_sent_key(true, true), "send_instructions");
+/// ```
+///
+/// Mirrors `DeviseController#successfully_sent?` (`devise/lib/devise/devise_controller.rb`): the paranoid uniform notice versus the plain one.
+#[must_use]
+pub fn successfully_sent_key(record_is_valid: bool, paranoid: bool) -> &'static str {
+    if paranoid && !record_is_valid {
+        flash_keys::SEND_PARANOID_INSTRUCTIONS
+    } else {
+        flash_keys::SEND_INSTRUCTIONS
+    }
+}
+
 /// Whether the request uses HTTP Basic auth that Devise should answer.
 ///
 /// Detects the HTTP Basic request arm, mirroring the env check in `Devise::Strategies::Authenticatable`.
@@ -729,6 +801,45 @@ mod tests {
         let f3 = Failure::InvalidCredentials { message: "invalid" };
         let f4 = Failure::InvalidCredentials { message: "invalid" };
         assert_eq!(f3, f4);
+    }
+
+    /// The success flash keys render the exact literal stems Devise's
+    /// controllers stage (the routers previously repeated these inline).
+    #[test]
+    fn test_success_flash_keys_render_the_devise_stems() {
+        use flash_keys as keys;
+        assert_eq!(keys::SIGNED_IN, "signed_in");
+        assert_eq!(keys::SIGNED_UP, "signed_up");
+        assert_eq!(keys::ALREADY_AUTHENTICATED, "already_authenticated");
+        assert_eq!(keys::SEND_INSTRUCTIONS, "send_instructions");
+        assert_eq!(
+            keys::SEND_PARANOID_INSTRUCTIONS,
+            "send_paranoid_instructions"
+        );
+        assert_eq!(keys::UPDATED, "updated");
+        assert_eq!(keys::UPDATE_NEEDS_CONFIRMATION, "update_needs_confirmation");
+        assert_eq!(keys::UPDATED_BUT_NOT_SIGNED_IN, "updated_but_not_signed_in");
+        assert_eq!(keys::UPDATED_NOT_ACTIVE, "updated_not_active");
+        assert_eq!(keys::SIGNED_OUT, "signed_out");
+        assert_eq!(keys::DESTROYED, "destroyed");
+        assert_eq!(keys::CONFIRMED, "confirmed");
+        assert_eq!(keys::UNLOCKED, "unlocked");
+        assert_eq!(keys::LOCKED, "locked");
+        assert_eq!(keys::NO_TOKEN, "no_token");
+    }
+
+    /// `successfully_sent?` (`devise_controller.rb:135-147`): the paranoid
+    /// key only for an unresolved record under paranoid mode; the plain
+    /// key otherwise - byte-identical to the routers' old inline branch.
+    #[test]
+    fn test_successfully_sent_key_matches_devise_controller() {
+        assert_eq!(successfully_sent_key(true, false), "send_instructions");
+        assert_eq!(successfully_sent_key(false, false), "send_instructions");
+        assert_eq!(
+            successfully_sent_key(false, true),
+            "send_paranoid_instructions"
+        );
+        assert_eq!(successfully_sent_key(true, true), "send_instructions");
     }
 
     #[derive(Debug, Default)]

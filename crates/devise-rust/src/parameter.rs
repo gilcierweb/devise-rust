@@ -52,6 +52,85 @@ impl ParameterFilter {
     }
 }
 
+/// Read one credential param value honoring Devise's param shapes.
+///
+/// Precedence: the scoped `{singular}[{key}]` bracket form, the bridge
+/// flat `{singular}_{key}` form, then the bare `{key}` (the framework
+/// body maps usually already collapse the bracket form to the bare key;
+/// the lookup keeps working over raw maps too). Mirrors the params
+/// parsing of Devise's authenticatable strategy: `params[scope]` plus
+/// `parse_authentication_key_values`
+/// (`devise/lib/devise/strategies/authenticatable.rb`).
+///
+/// Missing or non-string values read as the empty string, exactly like
+/// the per-framework lookups this replaces (the bridge flat key
+/// previously reached only the axum controller).
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::parameter::param_for;
+/// use serde_json::json;
+///
+/// let params = json!({
+///     "user_email": "bridge@example.com",
+///     "email": "bare@example.com",
+/// }).as_object().unwrap().clone();
+/// assert_eq!(param_for(&params, "user", "email"), "bridge@example.com");
+///
+/// let bare_only = json!({ "email": "bare@example.com" }).as_object().unwrap().clone();
+/// assert_eq!(param_for(&bare_only, "user", "email"), "bare@example.com");
+/// assert_eq!(param_for(&bare_only, "user", "name"), "");
+/// ```
+#[must_use]
+pub fn param_for(
+    params: &Map<String, Value>,
+    singular: &str,
+    key: &str,
+) -> String {
+    let scoped = format!("{singular}[{key}]");
+    let flat = format!("{singular}_{key}");
+    params
+        .get(&scoped)
+        .or_else(|| params.get(&flat))
+        .or_else(|| params.get(key))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Whether the parsed params request a persistent sign-in (Devise
+/// `remember_me`).
+///
+/// Devise's sign-in form posts the string `"1"` (`TRUE_VALUES`
+/// membership, `devise/lib/devise/strategies/authenticatable.rb:56-57`);
+/// JSON clients send a real boolean. Both shapes mean the same thing,
+/// so the string arm reuses
+/// [`is_true_value`](crate::rememberable::is_true_value) - the single
+/// `TRUE_VALUES` home - instead of per-framework copies (the axum
+/// controller previously honored only the string shape, silently
+/// dropping `remember_me: true` from JSON clients).
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::parameter::remember_me_from;
+/// use serde_json::json;
+///
+/// assert!(remember_me_from(json!({ "remember_me": true }).as_object().unwrap()));
+/// assert!(remember_me_from(json!({ "remember_me": "1" }).as_object().unwrap()));
+/// assert!(!remember_me_from(json!({ "remember_me": "0" }).as_object().unwrap()));
+/// assert!(!remember_me_from(json!({}).as_object().unwrap()));
+/// ```
+#[must_use]
+pub fn remember_me_from(params: &Map<String, Value>) -> bool {
+    params.get("remember_me").is_some_and(|value| match value {
+        Value::Bool(flag) => *flag,
+        Value::String(text) => crate::rememberable::is_true_value(text),
+        _ => false,
+    })
+}
+
 /// Strong-parameters style sanitizer for Devise actions
 ///
 /// Mirrors `Devise::ParameterSanitizer` (`devise/lib/devise/parameter_sanitizer.rb`).
@@ -358,5 +437,81 @@ mod tests {
             })
             .expect_err("the block form reports the same error");
         assert!(matches!(block_error, DeviseError::Config(_)));
+    }
+
+    /// The credential lookup precedence: the scoped bracket form, the
+    /// bridge flat form, then the bare key (the flat `user_email` shape
+    /// must reach the lookup on every framework, matching the axum
+    /// controller's existing behavior).
+    #[test]
+    fn test_param_for_honors_the_devise_param_shapes() {
+        let params = json!({
+            "user[email]": "scoped@example.com",
+            "user_email": "flat@example.com",
+            "email": "bare@example.com",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            param_for(&params, "user", "email"),
+            "scoped@example.com",
+            "the scoped bracket form wins"
+        );
+
+        let flat_and_bare = json!({
+            "user_email": "flat@example.com",
+            "email": "bare@example.com",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            param_for(&flat_and_bare, "user", "email"),
+            "flat@example.com",
+            "the bridge flat form beats the bare key"
+        );
+
+        let bare_only = json!({ "email": "bare@example.com" })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(param_for(&bare_only, "user", "email"), "bare@example.com");
+
+        // Missing and non-string values read as the empty string.
+        let non_string = json!({ "email": 42 }).as_object().unwrap().clone();
+        assert_eq!(param_for(&non_string, "user", "email"), "");
+        assert_eq!(param_for(&serde_json::Map::new(), "user", "email"), "");
+    }
+
+    /// `remember_me` accepts the JSON boolean AND the Devise `TRUE_VALUES`
+    /// strings through the same `is_true_value` rule the actix controller
+    /// used (the axum leg previously dropped the boolean shape).
+    #[test]
+    fn test_remember_me_from_accepts_bool_and_true_value_strings() {
+        let of = |value: serde_json::Value| {
+            json!({ "remember_me": value })
+                .as_object()
+                .cloned()
+                .expect("object")
+        };
+        assert!(remember_me_from(&of(json!(true))));
+        assert!(!remember_me_from(&of(json!(false))));
+        // Devise's TRUE_VALUES: "1", "on", "t", "true" (case variants).
+        for text in ["1", "on", "ON", "t", "T", "true", "TRUE"] {
+            assert!(
+                remember_me_from(&of(json!(text))),
+                "'{text}' must request a persistent sign-in"
+            );
+        }
+        // Everything else means a session-only sign-in.
+        for text in ["0", "yes", "false", ""] {
+            assert!(
+                !remember_me_from(&of(json!(text))),
+                "'{text}' must not request a persistent sign-in"
+            );
+        }
+        assert!(!remember_me_from(&of(json!(7))));
+        assert!(!remember_me_from(&serde_json::Map::new()));
     }
 }

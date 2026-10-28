@@ -266,6 +266,45 @@ pub fn filter_unsafe_attributes(
         .collect()
 }
 
+/// Render [`ValidationErrors`] as the keyed JSON body the framework
+/// controllers emit for validation failures: one field mapped to the
+/// ordered list of its symbolic I18n error keys (en.yml symbols, never
+/// record values).
+///
+/// This is the single core definition of a body the actix and axum
+/// routers previously carried as byte-for-byte duplicates; both now
+/// consume this one (the consolidation the DRY audit asked for). The
+/// output shape is pinned against the pre-change verbatim output:
+/// `full_messages` yields every `(field, key)` pair in insertion order,
+/// grouped per field exactly like the removed framework copies.
+///
+/// == Examples
+///
+/// ```
+/// use devise_rust::error::{ValidationErrors, errors_json};
+///
+/// let mut errors = ValidationErrors::new();
+/// errors.add("email", ":blank");
+/// errors.add("email", ":invalid");
+/// let rendered = errors_json(&errors);
+/// assert_eq!(rendered["email"][0], ":blank");
+/// assert_eq!(rendered["email"][1], ":invalid");
+/// ```
+#[must_use]
+pub fn errors_json(errors: &ValidationErrors) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (field, message) in errors.full_messages() {
+        if let Some(list) = map
+            .entry(field)
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+        {
+            list.push(serde_json::Value::String(message));
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
 /// Debug redaction for OWNED models: the `inspect` half of
 /// [`UNSAFE_ATTRIBUTES_FOR_SERIALIZATION`] for concrete application types.
 ///
@@ -498,5 +537,37 @@ mod tests {
         // port adds the 3 virtual password fields (password,
         // password_confirmation, current_password), so the list has 21 entries.
         assert_eq!(UNSAFE_ATTRIBUTES_FOR_SERIALIZATION.len(), 21);
+    }
+
+    /// The keyed error body both framework controllers render for
+    /// validation failures: each field maps to the ordered list of its
+    /// symbolic keys, byte-identical to the shape the routers emitted
+    /// before the helper moved into core (T-261026-ghi-02: the output
+    /// shape is pinned, never changed by the move).
+    #[test]
+    fn test_errors_json_pins_the_framework_shape() {
+        let mut errors = ValidationErrors::new();
+        assert_eq!(errors_json(&errors), serde_json::json!({}));
+
+        errors.add("email", ":blank");
+        errors.add("email", ":invalid");
+        errors.add("password", ":too_short");
+        assert_eq!(
+            errors_json(&errors),
+            serde_json::json!({
+                "email": [":blank", ":invalid"],
+                "password": [":too_short"],
+            })
+        );
+
+        // Two fields render independently; a second key on the same field
+        // appends (insertion order preserved).
+        let mut nested = ValidationErrors::new();
+        nested.add("email", ":taken");
+        errors.merge(nested);
+        assert_eq!(
+            errors_json(&errors)["email"],
+            serde_json::json!([":blank", ":invalid", ":taken"])
+        );
     }
 }

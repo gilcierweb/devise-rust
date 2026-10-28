@@ -100,6 +100,33 @@ pub mod keys {
     pub fn remember_token_key(scope: &str) -> String {
         REMEMBER_TOKEN_KEY.replace("{scope}", scope)
     }
+
+    /// Build the omniauth CSRF-state stash key for one (scope, provider)
+    /// authorize attempt.
+    ///
+    /// The `devise.{scope}.` prefix means core `expire_devise_keys`
+    /// clears the stash on sign-in; the value is single-use (removed on
+    /// callback read). Previously duplicated verbatim in both framework
+    /// omniauth modules; core owns the grammar now.
+    ///
+    /// Mirrors the omniauth session-stash key family (`devise.{scope}.omniauth.{provider}.*`) devise's callbacks stash state and verifier under.
+    #[must_use]
+    pub fn omniauth_state_key(scope: &str, provider: &str) -> String {
+        format!("devise.{scope}.omniauth.{provider}.state")
+    }
+
+    /// Build the omniauth PKCE-verifier stash key for one (scope,
+    /// provider) authorize attempt (single-use; removed on callback
+    /// read).
+    ///
+    /// Previously duplicated verbatim in both framework omniauth modules;
+    /// core owns the grammar now.
+    ///
+    /// Mirrors the omniauth session-stash key family (`devise.{scope}.omniauth.{provider}.*`) devise's callbacks stash state and verifier under.
+    #[must_use]
+    pub fn omniauth_verifier_key(scope: &str, provider: &str) -> String {
+        format!("devise.{scope}.omniauth.{provider}.pkce_verifier")
+    }
 }
 
 /// Session serializer - exact Devise session format `[key, salt]`
@@ -402,6 +429,30 @@ mod tests {
         assert_eq!(
             keys::scope_session_key("admin"),
             "warden.user.admin.session"
+        );
+    }
+
+    /// The omniauth stash keys emit the exact strings both frameworks
+    /// previously defined verbatim (actix omniauth.rs and axum omniauth.rs
+    /// duplicated the grammar; the tests pin it before the routers
+    /// rewire onto core).
+    #[test]
+    fn test_omniauth_key_naming_pins_the_existing_strings() {
+        assert_eq!(
+            keys::omniauth_state_key("user", "stub"),
+            "devise.user.omniauth.stub.state"
+        );
+        assert_eq!(
+            keys::omniauth_verifier_key("user", "stub"),
+            "devise.user.omniauth.stub.pkce_verifier"
+        );
+        assert_eq!(
+            keys::omniauth_state_key("admin", "google_oauth2"),
+            "devise.admin.omniauth.google_oauth2.state"
+        );
+        assert_eq!(
+            keys::omniauth_verifier_key("admin", "google_oauth2"),
+            "devise.admin.omniauth.google_oauth2.pkce_verifier"
         );
     }
 
