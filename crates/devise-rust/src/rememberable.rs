@@ -492,9 +492,15 @@ pub fn build_cookie_triple_after_created_at(
 ) -> (String, String, String) {
     let mut generated = clock.now();
     if let Some(created) = created_at {
-        let floor = created + chrono::TimeDelta::seconds(1);
-        if generated <= created {
-            generated = floor;
+        // The guarantee is over INTEGER EPOCH SECONDS (the wire format
+        // `parse_generated_at` reads back), so a mint landing in the SAME
+        // second as `created` - even strictly later within that second -
+        // must nudge: the truncated timestamp would otherwise fail the
+        // five-condition check's strict greater-than rule (T-261026-ghj:
+        // the flow test caught the sub-second window the old
+        // `generated <= created` comparison left open).
+        if generated.timestamp() <= created.timestamp() {
+            generated = created + chrono::TimeDelta::seconds(1);
         }
     }
     (
@@ -1363,6 +1369,38 @@ mod tests {
         assert!(
             user.remember_me_valid(&value, &generated, &config, &clock),
             "same-second mint must validate"
+        );
+    }
+
+    /// Regression (T-261026-ghj): the same-second guarantee is over
+    /// INTEGER EPOCH SECONDS. A mint landing strictly LATER within the
+    /// same second as `remember_created_at` (created at .23s, minted at
+    /// .73s) still truncates to the same epoch second on the wire, so
+    /// the mint must nudge to created+1s — the old `generated <= created`
+    /// comparison kept the truncated timestamp and the cookie died on
+    /// condition 4 right after sign-in.
+    #[tokio::test]
+    async fn rememberable_same_second_later_instant_mint_stays_valid() {
+        let config = test_config();
+        let mut clock = fixed_clock();
+        let adapter = MemoryAdapter::<TestUser>::new();
+        let mut user = TestUser::fresh(1, "subsecond@example.com");
+        adapter.create(user.clone()).await.unwrap();
+        user.remember_me(&adapter, &clock).await.unwrap();
+        let created = user.remember_created_at().expect("created");
+
+        // Advance HALF a second: the same epoch second, strictly later
+        // than the creation instant.
+        clock.advance(TimeDelta::milliseconds(500));
+        let (key, value, generated) = user.serialize_into_cookie(&clock).unwrap();
+        assert_eq!(key, user.to_key().to_string());
+        assert!(
+            generated.parse::<i64>().expect("epoch") > created.timestamp(),
+            "the truncated same-second timestamp must be nudged past created"
+        );
+        assert!(
+            user.remember_me_valid(&value, &generated, &config, &clock),
+            "a same-second later-instant mint must validate"
         );
     }
 
