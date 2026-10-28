@@ -893,7 +893,7 @@ mod tests {
     }
     /// WR-06 closure (261026-ghl): a record without an authenticatable salt
     /// (omniauth-only models) deserializes normally from the `""` salt its
-    /// `serialize_into_session` persisted — the typed path mirrors the core
+    /// `serialize_into_session` persisted: the typed path mirrors the core
     /// proxy and the framework S6 semantics, so None compares as the empty
     /// string under the constant-time compare. A present salt still has to
     /// match in BOTH directions.

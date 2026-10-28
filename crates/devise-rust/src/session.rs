@@ -402,7 +402,7 @@ mod tests {
 
     /// WR-06 closure (261026-ghl): a record whose salt is `None`
     /// (omniauth-only models) fetches from the `""`-salt payload the session
-    /// helpers persist — `None` compares as the empty string under the
+    /// helpers persist: `None` compares as the empty string under the
     /// constant-time compare, matching the core proxy and the framework
     /// S6 semantics. A present salt on either side still mismatches and
     /// deletes the session key.

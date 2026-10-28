@@ -566,10 +566,10 @@ impl AuthProxy {
         };
         // WR-06 closure (261026-ghl): a record without an authenticatable
         // salt (omniauth-only models) fetches normally. `None` compares as
-        // the empty string under the constant-time compare — byte-identical
+        // the empty string under the constant-time compare, byte-identical
         // to the audited framework S6 behavior
         // (`saltless_record_session_fetch_stays_signed_in` in both
-        // framework suites is the behavioral contract) — because
+        // framework suites is the behavioral contract), because
         // `session_pair` persisted `""` for the saltless record. A
         // PRESENT salt on either side still must match, and mismatches
         // still delete the session key below.
@@ -1684,7 +1684,7 @@ mod tests {
 
     /// WR-06 closure (261026-ghl): a record whose `authenticatable_salt` is
     /// `None` (omniauth-only models without `encrypted_password`) fetches
-    /// normally — the core proxy now matches the framework S6 semantics
+    /// normally: the core proxy now matches the framework S6 semantics
     /// pinned by `saltless_record_session_fetch_stays_signed_in` in both
     /// framework suites. `None` compares as the empty string under the
     /// constant-time compare (the payload's stored salt is the `""` that
