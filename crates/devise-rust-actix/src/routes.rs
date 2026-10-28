@@ -31,7 +31,7 @@ use actix_session::Session;
 use actix_web::cookie::{CookieJar, Key};
 use actix_web::http::StatusCode;
 use actix_web::{Either, HttpMessage, HttpRequest, HttpResponse, Scope, web};
-use devise_rust::adapter::{Conditions, OrmAdapter, Value as AdapterValue};
+use devise_rust::adapter::{Conditions, DeviseKey, OrmAdapter, Value as AdapterValue};
 use devise_rust::config::DeviseConfig;
 use devise_rust::confirmable::Confirmable;
 use devise_rust::error::{ValidationErrors, errors_json};
@@ -43,6 +43,7 @@ use devise_rust::rememberable::{self, RememberCookieOp, Rememberable, remember_c
 use devise_rust::scope::{Mapping, RouteSpec, ScopeRegistry};
 use devise_rust::time::Clock;
 use serde_json::{Map, Value as JsonValue};
+use std::str::FromStr;
 
 use crate::bridge::{
     bypass_sign_in_and_renew_sync, expire_devise_data_sync, fetch_session_with_salt,
@@ -465,20 +466,56 @@ fn redirect_to(location: &str) -> HttpResponse {
 // Controllers (D-14)
 // ============================================================================
 
-/// Devise `require_no_authentication` (devise_controller.rb:169-179):
-/// navigational requests from an already-signed-in scope are redirected
-/// home with the `already_authenticated` flash; non-navigational (API)
-/// requests pass through, exactly like Devise's
+/// Devise `require_no_authentication` (devise_controller.rb:116-132):
+/// navigational requests authenticated by SESSION OR by a live remember
+/// cookie are redirected home with the `already_authenticated` flash;
+/// non-navigational (API) requests pass through, exactly like Devise's
 /// `return unless is_navigational_format?`.
 ///
-/// Registrations mounts this on `new`/`create`/`cancel`
-/// (`registrations_controller.rb:4`), sessions on `new`/`create`.
-fn require_no_authentication_response<M, A, L>(
+/// Devise's guard consults `warden.authenticate?` with the mapping's
+/// NO-INPUT strategies — the rememberable strategy runs
+/// (`strategies/rememberable.rb`) — so a remembered visitor (session
+/// dropped, remember cookie kept) is authenticated; the core
+/// [`no_authentication_guard_passes`](devise_rust::helpers::no_authentication_guard_passes)
+/// decision owns the rule and the five-condition cookie validation.
+///
+/// Mounted on sessions new/create (`sessions_controller.rb:4`), every
+/// passwords action (`passwords_controller.rb:4`), every unlocks action
+/// (`unlocks_controller.rb:4`), and registrations new/create/cancel
+/// (`registrations_controller.rb:4`).
+async fn require_no_authentication_response<M, A, L>(
     req: &HttpRequest,
     session: &Session,
     state: &DeviseWebState<M, A, L>,
-) -> Option<HttpResponse> {
-    if wants_json(req) || !scope_session_present(session, &state.mapping.name) {
+) -> Option<HttpResponse>
+where
+    M: FullDeviseModel,
+    A: OrmAdapter<M> + Send + Sync,
+    L: Mailer<M>,
+{
+    if wants_json(req) {
+        return None;
+    }
+    let scope = state.mapping.name.as_str();
+    let session_present = scope_session_present(session, scope);
+    let remember_triple = remember_triple_from(req, &state.config, scope);
+    let adapter = state.adapter.clone();
+    let authenticated = devise_rust::helpers::no_authentication_guard_passes(
+        session_present,
+        remember_triple,
+        &state.config,
+        state.clock.as_ref(),
+        |key: String| async move {
+            let key = DeviseKey::from_str(&key).ok()?;
+            let record = adapter.get(&key).await.ok()??;
+            Some((
+                record.rememberable_value().ok()?,
+                record.remember_created_at(),
+            ))
+        },
+    )
+    .await;
+    if !authenticated {
         return None;
     }
     Some(flash_redirect(
@@ -488,13 +525,50 @@ fn require_no_authentication_response<M, A, L>(
     ))
 }
 
-#[allow(clippy::extra_unused_type_parameters)] // monomorphized per route bundle
-async fn new_handler<M, A, L>() -> HttpResponse
+/// Read the signed remember cookie through the actix remember helper
+/// (`read_cookie` over a `SignedJar` keyed by the Devise secret): yields
+/// the verified `[key, value, generated_at]` triple only — a missing,
+/// tampered, or stale cookie reads as `None` (anonymous, never a
+/// failure). The cookie name is the `rememberable_options`-override-aware
+/// [`remember_cookie_key`].
+fn remember_triple_from(
+    req: &HttpRequest,
+    config: &DeviseConfig,
+    scope: &str,
+) -> Option<(String, String, String)> {
+    let name = rememberable::remember_cookie_key(scope, config);
+    let raw = req.cookie(&name)?.value().to_string();
+    let key = crate::remember::derive_remember_key(config).ok()?;
+    let mut jar = actix_web::cookie::CookieJar::new();
+    jar.add_original(actix_web::cookie::Cookie::new(name.clone(), raw));
+    match crate::remember::read_cookie(&jar.signed(&key), &name) {
+        crate::remember::RememberRead::Valid {
+            key,
+            value,
+            generated_at,
+        } => Some((key, value, generated_at)),
+        _ => None,
+    }
+}
+
+/// The generic `new`-form handler: sessions#new, passwords#new, and
+/// unlocks#new all render through here, and Devise guards ALL of them
+/// (`sessions_controller.rb:4`, `passwords_controller.rb:4`,
+/// `unlocks_controller.rb:4`) — the guard runs before the form renders
+/// (registrations#new carries it inside its own handler).
+async fn new_handler<M, A, L>(
+    req: HttpRequest,
+    session: Session,
+    state: web::Data<DeviseWebState<M, A, L>>,
+) -> HttpResponse
 where
     M: FullDeviseModel,
     A: OrmAdapter<M> + Send + Sync,
     L: Mailer<M>,
 {
+    if let Some(response) = require_no_authentication_response(&req, &session, &state).await {
+        return response;
+    }
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body("form")
@@ -513,7 +587,7 @@ where
     A: OrmAdapter<M> + Send + Sync,
     L: Mailer<M>,
 {
-    if let Some(response) = require_no_authentication_response(&req, &session, &state) {
+    if let Some(response) = require_no_authentication_response(&req, &session, &state).await {
         return response;
     }
     HttpResponse::Ok()
@@ -547,14 +621,12 @@ where
         staged.flags.allow_params_authentication = true;
     }
     // Devise `require_no_authentication` (sessions_controller.rb:4): an
-    // already signed-in scope is redirected home with `already_authenticated`
-    // instead of re-authenticating (navigational formats only, as in Devise).
-    if !wants_json(&req) && scope_session_present(&session, &scope) {
-        return flash_redirect(
-            &session,
-            &after_sign_in_target(&session, &state.mapping),
-            flash_keys::ALREADY_AUTHENTICATED,
-        );
+    // already authenticated request (session OR live remember cookie,
+    // devise_controller.rb:116-132) is redirected home with
+    // `already_authenticated` instead of re-authenticating (navigational
+    // formats only, as in Devise).
+    if let Some(response) = require_no_authentication_response(&req, &session, &state).await {
+        return response;
     }
     // S7: `sign_in_params` — the `:sign_in` sanitizer decides what the
     // controller may read (`sessions_controller.rb:34-36`); the raw body
@@ -978,7 +1050,7 @@ where
     // Devise `require_no_authentication` (registrations_controller.rb:4):
     // a signed-in visitor never reaches the create action — the second
     // account cannot be created (S13).
-    if let Some(response) = require_no_authentication_response(&req, &session, &state) {
+    if let Some(response) = require_no_authentication_response(&req, &session, &state).await {
         return response;
     }
     let singular = state.mapping.singular.clone();
@@ -1258,7 +1330,7 @@ where
     A: OrmAdapter<M> + Send + Sync,
     L: Mailer<M>,
 {
-    if let Some(response) = require_no_authentication_response(&req, &session, &state) {
+    if let Some(response) = require_no_authentication_response(&req, &session, &state).await {
         return response;
     }
     drop(expire_devise_data_sync(
@@ -1284,6 +1356,11 @@ where
     A: OrmAdapter<M, New = M> + Send + Sync,
     L: Mailer<M>,
 {
+    // Devise `require_no_authentication` (passwords_controller.rb:4): every
+    // passwords action is guarded.
+    if let Some(response) = require_no_authentication_response(&req, &session, &state).await {
+        return response;
+    }
     let singular = state.mapping.singular.clone();
     let attrs = body_map(body, &singular);
     let outcome = M::send_reset_password_instructions_for(
@@ -1308,7 +1385,7 @@ where
 }
 
 async fn passwords_edit<M, A, L>(
-    _req: HttpRequest,
+    req: HttpRequest,
     session: Session,
     state: web::Data<DeviseWebState<M, A, L>>,
     query: web::Query<HashMap<String, String>>,
@@ -1318,6 +1395,11 @@ where
     A: OrmAdapter<M> + Send + Sync,
     L: Mailer<M>,
 {
+    // Devise `require_no_authentication` (passwords_controller.rb:4): every
+    // passwords action is guarded.
+    if let Some(response) = require_no_authentication_response(&req, &session, &state).await {
+        return response;
+    }
     // Devise `assert_reset_token_passed` (`passwords_controller.rb:65-70`):
     // the blank-token redirect goes to `new_session_path`, NOT the site
     // root: the user must land on the sign-in form to start over.
@@ -1374,6 +1456,11 @@ where
     A: OrmAdapter<M, New = M> + Send + Sync,
     L: Mailer<M>,
 {
+    // Devise `require_no_authentication` (passwords_controller.rb:4): every
+    // passwords action is guarded.
+    if let Some(response) = require_no_authentication_response(&req, &session, &state).await {
+        return response;
+    }
     let singular = state.mapping.singular.clone();
     let attrs = body_map(body, &singular);
     // Devise `after_update :send_password_change_notification`
@@ -1565,6 +1652,11 @@ where
     A: OrmAdapter<M> + Send + Sync,
     L: Mailer<M>,
 {
+    // Devise `require_no_authentication` (unlocks_controller.rb:4): every
+    // unlocks action is guarded.
+    if let Some(response) = require_no_authentication_response(&req, &session, &state).await {
+        return response;
+    }
     let token = query.get("unlock_token");
     let token_str = token.map_or("", String::as_str);
     let outcome =
@@ -1595,6 +1687,11 @@ where
     A: OrmAdapter<M> + Send + Sync,
     L: Mailer<M>,
 {
+    // Devise `require_no_authentication` (unlocks_controller.rb:4): every
+    // unlocks action is guarded.
+    if let Some(response) = require_no_authentication_response(&req, &session, &state).await {
+        return response;
+    }
     let singular = state.mapping.singular.clone();
     let attrs = body_map(body, &singular);
     let outcome = M::send_unlock_instructions_for(

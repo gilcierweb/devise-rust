@@ -35,6 +35,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::Router;
@@ -42,7 +43,7 @@ use axum::extract::{Extension, Form, FromRequest, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, delete, post};
-use devise_rust::adapter::{Conditions, OrmAdapter, Value as AdapterValue};
+use devise_rust::adapter::{Conditions, DeviseKey, OrmAdapter, Value as AdapterValue};
 use devise_rust::config::DeviseConfig;
 use devise_rust::confirmable::Confirmable;
 use devise_rust::error::{DeviseError, ValidationErrors, errors_json};
@@ -56,7 +57,7 @@ use devise_rust::lockable::{self, LockAttemptOutcome, Lockable};
 use devise_rust::mailer::Mailer;
 use devise_rust::model::{ModelFinder, Recoverable, Registerable, Validatable};
 use devise_rust::proxy::{SetUserEvent, SetUserOpts};
-use devise_rust::rememberable::Rememberable;
+use devise_rust::rememberable::{Rememberable, remember_cookie_key};
 use devise_rust::request::AuthRequest;
 use devise_rust::scope::{Mapping, RouteSpec, ScopeRegistry};
 use devise_rust::time::Clock;
@@ -469,7 +470,7 @@ where
 {
     match (family, action) {
         ("registration", "new") => mr.get(registrations_new::<M, A, L>),
-        (_, "new") => mr.get(new_handler),
+        (_, "new") => mr.get(new_handler::<M, A, L>),
         ("password", "edit") => mr.get(passwords_edit::<M, A, L>),
         ("registration", "edit") => mr.get(registrations_edit::<M, A, L>),
         ("registration", "cancel") => mr.get(registrations_cancel::<M, A, L>),
@@ -817,7 +818,25 @@ pub(crate) async fn sign_in_bookkeeping<M, A>(
 // Controllers (D-14)
 // ============================================================================
 
-async fn new_handler() -> Response {
+async fn new_handler<M, A, L>(
+    State(st): State<DeviseWebState<M, A, L>>,
+    Extension(session): Extension<Session>,
+    Extension(handle): Extension<AuthProxyHandle>,
+    Extension(auth_request): Extension<AuthRequest>,
+) -> Response
+where
+    M: FullDeviseModel,
+    A: OrmAdapter<M> + Send + Sync + 'static,
+    L: Mailer<M> + 'static,
+{
+    // Devise mounts `require_no_authentication` on sessions#new and on
+    // EVERY passwords and unlocks action (`sessions_controller.rb:4`,
+    // `passwords_controller.rb:4`, `unlocks_controller.rb:4`): the generic
+    // new-form handler serves all three families, so the guard runs here
+    // too (registrations#new carries it inside its own handler).
+    if let Some(redirect) = require_no_authentication(&session, &handle, &auth_request, &st).await {
+        return redirect;
+    }
     (
         StatusCode::OK,
         [("content-type", "text/html; charset=utf-8")],
@@ -826,13 +845,23 @@ async fn new_handler() -> Response {
         .into_response()
 }
 
-/// `require_no_authentication` for the registrations controller
-/// (`registrations_controller.rb:4`, `devise_controller.rb:116-130`):
-/// a signed-in navigational request is redirected home with the
-/// `already_authenticated` flash instead of reaching new/create/cancel —
-/// without it, a signed-in POST /users created a SECOND account (S13).
+/// `require_no_authentication` (devise_controller.rb:116-132): a request
+/// authenticated by SESSION OR by a live remember cookie is redirected
+/// home with the `already_authenticated` flash instead of reaching the
+/// guarded action. Devise's guard consults `warden.authenticate?` with
+/// the mapping's NO-INPUT strategies — the rememberable strategy runs —
+/// so a remembered visitor (session dropped, remember cookie kept) is
+/// authenticated; the core
+/// [`no_authentication_guard_passes`](devise_rust::helpers::no_authentication_guard_passes)
+/// decision owns the rule and the five-condition cookie validation.
+///
+/// Mounted on sessions new/create (`sessions_controller.rb:4`), every
+/// passwords action (`passwords_controller.rb:4`), every unlocks action
+/// (`unlocks_controller.rb:4`), and registrations new/create/cancel
+/// (`registrations_controller.rb:4`).
 ///
 /// Returns `Some(redirect)` when the guard fires.
+#[allow(clippy::too_many_lines)]
 async fn require_no_authentication<M, A, L>(
     session: &Session,
     handle: &AuthProxyHandle,
@@ -850,7 +879,38 @@ where
         return None;
     }
     let scope = st.mapping.name.as_str();
-    if !scope_session_present(session, scope).await {
+    let session_present = scope_session_present(session, scope).await;
+    // The remember cookie: the layer already signature-verified the
+    // inbound cookie into `auth_request.cookies` for the resolved scope,
+    // so the decode here reads the verified triple (a failed verify kept
+    // the raw value, which decodes to nothing — anonymous, never a
+    // failure).
+    let remember_triple = auth_request
+        .cookies
+        .get(&remember_cookie_key(scope, &st.config))
+        .and_then(|raw| {
+            let (key, value, generated_at) =
+                devise_rust::rememberable::decode_cookie_value(raw)?;
+            devise_rust::rememberable::parse_generated_at(&generated_at)
+                .map(|_| (key, value, generated_at))
+        });
+    let adapter = st.adapter.clone();
+    let authenticated = devise_rust::helpers::no_authentication_guard_passes(
+        session_present,
+        remember_triple,
+        &st.config,
+        st.clock.as_ref(),
+        |key: String| async move {
+            let key = DeviseKey::from_str(&key).ok()?;
+            let record = adapter.get(&key).await.ok()??;
+            Some((
+                record.rememberable_value().ok()?,
+                record.remember_created_at(),
+            ))
+        },
+    )
+    .await;
+    if !authenticated {
         return None;
     }
     let proxy = handle.lock().await;
@@ -879,7 +939,12 @@ where
     if let Some(redirect) = require_no_authentication(&session, &handle, &auth_request, &st).await {
         return redirect;
     }
-    new_handler().await
+    (
+        StatusCode::OK,
+        [("content-type", "text/html; charset=utf-8")],
+        "form",
+    )
+        .into_response()
 }
 
 /// SessionsController#create: authenticate the params, run the lockable
@@ -901,17 +966,12 @@ where
     let singular = st.mapping.singular.clone();
     let scope = st.mapping.name.clone();
     // Devise `require_no_authentication` (sessions_controller.rb:4): an
-    // already signed-in scope is redirected home with `already_authenticated`
-    // instead of re-authenticating (navigational formats only, as in Devise).
-    if !wants_json(&auth_request) && scope_session_present(&session, &scope).await {
-        let proxy = handle.lock().await;
-        let target = after_sign_in_path_for(&scope, &proxy, &auth_request).await;
-        drop(proxy);
-        return flash_redirect(
-            &st.config,
-            &target,
-            flash_keys::ALREADY_AUTHENTICATED,
-        );
+    // already authenticated request (session OR live remember cookie,
+    // devise_controller.rb:116-132) is redirected home with
+    // `already_authenticated` instead of re-authenticating (navigational
+    // formats only, as in Devise).
+    if let Some(redirect) = require_no_authentication(&session, &handle, &auth_request, &st).await {
+        return redirect;
     }
     // Devise `allow_params_authentication!` (sessions_controller.rb:5):
     // the ONLY action that opts into params authentication — the layer
@@ -1562,6 +1622,8 @@ where
 
 async fn passwords_create<M, A, L>(
     State(st): State<DeviseWebState<M, A, L>>,
+    Extension(session): Extension<Session>,
+    Extension(handle): Extension<AuthProxyHandle>,
     Extension(auth_request): Extension<AuthRequest>,
     params: DeviseParams,
 ) -> Response
@@ -1570,6 +1632,11 @@ where
     A: OrmAdapter<M, New = M> + Send + Sync + 'static,
     L: Mailer<M> + 'static,
 {
+    // Devise `require_no_authentication` (passwords_controller.rb:4): every
+    // passwords action is guarded.
+    if let Some(redirect) = require_no_authentication(&session, &handle, &auth_request, &st).await {
+        return redirect;
+    }
     let singular = st.mapping.singular.clone();
     let attrs = body_map(params.0, &singular);
     let outcome = M::send_reset_password_instructions_for(
@@ -1599,6 +1666,9 @@ where
 
 async fn passwords_edit<M, A, L>(
     State(st): State<DeviseWebState<M, A, L>>,
+    Extension(session): Extension<Session>,
+    Extension(handle): Extension<AuthProxyHandle>,
+    Extension(auth_request): Extension<AuthRequest>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response
 where
@@ -1606,6 +1676,11 @@ where
     A: OrmAdapter<M> + Send + Sync + 'static,
     L: Mailer<M> + 'static,
 {
+    // Devise `require_no_authentication` (passwords_controller.rb:4): every
+    // passwords action is guarded.
+    if let Some(redirect) = require_no_authentication(&session, &handle, &auth_request, &st).await {
+        return redirect;
+    }
     // Devise `assert_reset_token_passed` (`passwords_controller.rb:65-70`):
     // the blank-token redirect goes to `new_session_path`, NOT the site
     // root: the user must land on the sign-in form to start over.
@@ -1657,6 +1732,7 @@ where
 async fn passwords_update<M, A, L>(
     State(st): State<DeviseWebState<M, A, L>>,
     Extension(session): Extension<Session>,
+    Extension(handle): Extension<AuthProxyHandle>,
     Extension(auth_request): Extension<AuthRequest>,
     params: DeviseParams,
 ) -> Response
@@ -1665,6 +1741,11 @@ where
     A: OrmAdapter<M, New = M> + Send + Sync + 'static,
     L: Mailer<M> + 'static,
 {
+    // Devise `require_no_authentication` (passwords_controller.rb:4): every
+    // passwords action is guarded.
+    if let Some(redirect) = require_no_authentication(&session, &handle, &auth_request, &st).await {
+        return redirect;
+    }
     let singular = st.mapping.singular.clone();
     let attrs = body_map(params.0, &singular);
     // Devise `after_update :send_password_change_notification`
@@ -1857,6 +1938,8 @@ where
 
 async fn unlocks_show<M, A, L>(
     State(st): State<DeviseWebState<M, A, L>>,
+    Extension(session): Extension<Session>,
+    Extension(handle): Extension<AuthProxyHandle>,
     Extension(auth_request): Extension<AuthRequest>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response
@@ -1865,6 +1948,11 @@ where
     A: OrmAdapter<M> + Send + Sync + 'static,
     L: Mailer<M> + 'static,
 {
+    // Devise `require_no_authentication` (unlocks_controller.rb:4): every
+    // unlocks action is guarded.
+    if let Some(redirect) = require_no_authentication(&session, &handle, &auth_request, &st).await {
+        return redirect;
+    }
     let token = query.get("unlock_token").map_or("", String::as_str);
     let outcome = M::unlock_access_by_token(Some(token), st.adapter.as_ref(), &st.config).await;
     let Ok(resource) = outcome else {
@@ -1892,6 +1980,8 @@ where
 
 async fn unlocks_create<M, A, L>(
     State(st): State<DeviseWebState<M, A, L>>,
+    Extension(session): Extension<Session>,
+    Extension(handle): Extension<AuthProxyHandle>,
     Extension(auth_request): Extension<AuthRequest>,
     params: DeviseParams,
 ) -> Response
@@ -1900,6 +1990,11 @@ where
     A: OrmAdapter<M, New = M> + Send + Sync + 'static,
     L: Mailer<M> + 'static,
 {
+    // Devise `require_no_authentication` (unlocks_controller.rb:4): every
+    // unlocks action is guarded.
+    if let Some(redirect) = require_no_authentication(&session, &handle, &auth_request, &st).await {
+        return redirect;
+    }
     let singular = st.mapping.singular.clone();
     let attrs = body_map(params.0, &singular);
     let outcome = M::send_unlock_instructions_for(

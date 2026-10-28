@@ -927,6 +927,125 @@ async fn flow_sign_in_accepts_the_bridge_flat_email_key() {
     );
 }
 
+/// T-261026-ghj (M-5): `require_no_authentication` matches Devise's
+/// coverage and remember-cookie awareness in both frameworks. A user
+/// signed in with remember_me (session dropped, remember cookie kept) is
+/// redirected with `already_authenticated` from every guarded route —
+/// the guard consults the remember cookie exactly like Devise's
+/// `warden.authenticate?` over the no-input strategies
+/// (`devise_controller.rb:116-132`); anonymous visitors reach the same
+/// routes unchanged.
+#[tokio::test]
+async fn flow_remembered_user_redirected_from_all_no_auth_routes() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user(&state, "flow-m5@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/users/sign_in")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "email=flow-m5%40example.com&password=secret123&remember_me=1",
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    jar.merge(&resp);
+    let remember = jar.value("remember_user_token").expect("remember cookie");
+    let remember_only = format!("remember_user_token={remember}");
+
+    // The remember cookie ALONE authenticates the guard on every
+    // Devise-guarded route (sessions new/create, all password actions,
+    // all unlock actions).
+    for (method, uri) in [
+        (Method::GET, "/users/sign_in"),
+        (Method::POST, "/users/sign_in"),
+        (Method::GET, "/users/password/new"),
+        (Method::POST, "/users/password"),
+        (Method::GET, "/users/password/edit?reset_password_token=tok"),
+        (Method::GET, "/users/unlock/new"),
+        (Method::POST, "/users/unlock"),
+        (Method::GET, "/users/unlock?unlock_token=tok"),
+    ] {
+        let resp = call(
+            &app,
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::COOKIE, &remember_only)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND, "guarded route: {uri}");
+        assert_eq!(
+            resp.headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/users"),
+            "already_authenticated redirects to the scope root: {uri}"
+        );
+        let cookies = set_cookie_pairs(&resp);
+        assert!(
+            common::flash_keys_from_cookies(&cookies, &state.config)
+                .contains(&"already_authenticated".to_string()),
+            "already_authenticated flash on {uri}: {cookies:?}"
+        );
+    }
+
+    // Anonymous traffic on the same GET routes: unchanged 200 forms.
+    for uri in [
+        "/users/sign_in",
+        "/users/password/new",
+        "/users/password/edit?reset_password_token=tok",
+        "/users/unlock/new",
+    ] {
+        let resp = call(
+            &app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "anonymous {uri} stays 200");
+    }
+
+    // A session-authenticated visitor is redirected the same way.
+    let resp = form_sign_in(&app, "flow-m5@example.com", "secret123").await;
+    jar.merge(&resp);
+    let session_only = format!("id={}", jar.value("id").expect("session cookie"));
+    for uri in [
+        "/users/sign_in",
+        "/users/password/new",
+        "/users/password/edit?reset_password_token=tok",
+        "/users/unlock/new",
+    ] {
+        let resp = call(
+            &app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::COOKIE, &session_only)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND, "session user on {uri}");
+        let cookies = set_cookie_pairs(&resp);
+        assert!(
+            common::flash_keys_from_cookies(&cookies, &state.config)
+                .contains(&"already_authenticated".to_string()),
+            "already_authenticated flash on {uri}: {cookies:?}"
+        );
+    }
+}
+
 /// D-04 renewal gates: Set-Cookie rotation asserted on ALL FOUR privilege
 /// paths — `sign_in`, `bypass_sign_in`, account update (`bypass_sign_in`
 /// re-sign-in), and `sign_out` — in one running session jar.

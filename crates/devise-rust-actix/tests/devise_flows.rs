@@ -902,6 +902,123 @@ async fn flow_sign_in_accepts_the_bridge_flat_email_key() {
     );
 }
 
+/// T-261026-ghj (M-5): `require_no_authentication` matches Devise's
+/// coverage and remember-cookie awareness in both frameworks. A user
+/// signed in with remember_me (session dropped, remember cookie kept) is
+/// redirected with `already_authenticated` from every guarded route —
+/// the guard consults the remember cookie exactly like Devise's
+/// `warden.authenticate?` over the no-input strategies
+/// (`devise_controller.rb:116-132`); anonymous visitors reach the same
+/// routes unchanged.
+#[actix_web::test]
+async fn flow_remembered_user_redirected_from_all_no_auth_routes() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    seed_user(&state, "flow-m5@example.com", "secret123").await;
+
+    let mut jar = Jar::new();
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/users/sign_in")
+            .insert_header(("content-type", "application/x-www-form-urlencoded"))
+            .set_payload("email=flow-m5%40example.com&password=secret123&remember_me=1")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 302);
+    jar.merge(&resp);
+    let remember = jar.value("remember_user_token").expect("remember cookie");
+    let remember_only = format!("remember_user_token={remember}");
+
+    // The remember cookie ALONE authenticates the guard on every
+    // Devise-guarded route (sessions new/create, all password actions,
+    // all unlock actions).
+    for (method, uri) in [
+        (actix_web::http::Method::GET, "/users/sign_in"),
+        (actix_web::http::Method::POST, "/users/sign_in"),
+        (actix_web::http::Method::GET, "/users/password/new"),
+        (actix_web::http::Method::POST, "/users/password"),
+        (
+            actix_web::http::Method::GET,
+            "/users/password/edit?reset_password_token=tok",
+        ),
+        (actix_web::http::Method::GET, "/users/unlock/new"),
+        (actix_web::http::Method::POST, "/users/unlock"),
+        (
+            actix_web::http::Method::GET,
+            "/users/unlock?unlock_token=tok",
+        ),
+    ] {
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::default()
+                .method(method)
+                .uri(uri)
+                .insert_header(("cookie", remember_only.clone()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 302, "guarded route: {uri}");
+        assert_eq!(
+            resp.headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/users"),
+            "already_authenticated redirects to the scope root: {uri}"
+        );
+        assert_eq!(
+            common::flash_of(&app, &session_cookie(&resp))
+                .await
+                .as_deref(),
+            Some("already_authenticated"),
+            "already_authenticated flash on {uri}"
+        );
+    }
+
+    // Anonymous traffic on the same GET routes: unchanged 200 forms.
+    for uri in [
+        "/users/sign_in",
+        "/users/password/new",
+        "/users/password/edit?reset_password_token=tok",
+        "/users/unlock/new",
+    ] {
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri(uri).to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "anonymous {uri} stays 200");
+    }
+
+    // A session-authenticated visitor is redirected the same way.
+    let resp = form_sign_in(&app, "flow-m5@example.com", "secret123").await;
+    jar.merge(&resp);
+    let session_only = format!("id={}", jar.value("id").expect("session cookie"));
+    for uri in [
+        "/users/sign_in",
+        "/users/password/new",
+        "/users/password/edit?reset_password_token=tok",
+        "/users/unlock/new",
+    ] {
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(uri)
+                .insert_header(("cookie", session_only.clone()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 302, "session user on {uri}");
+        assert_eq!(
+            common::flash_of(&app, &session_cookie(&resp))
+                .await
+                .as_deref(),
+            Some("already_authenticated"),
+            "already_authenticated flash on {uri}"
+        );
+    }
+}
+
 /// D-03 renewal gates: Set-Cookie rotation asserted on `sign_in`, bypass
 /// (account update), and `sign_out` paths, all in one running session jar.
 #[actix_web::test]
