@@ -1,8 +1,8 @@
-//! Omniauth route handlers — the authorize + callback pair rendering the
+//! Omniauth route handlers: the authorize + callback pair rendering the
 //! 09-03 core policy (OMN-01 routes, OMN-02 flows, OMN-03 POST-only
 //! authorize).
 //!
-//! Thin renderers: every policy decision lives in core —
+//! Thin renderers: every policy decision lives in core:
 //! [`authorize_start`]
 //! (always-on PKCE S256 + CSRF state, D-07),
 //! [`verify_state`]
@@ -14,8 +14,8 @@
 //! `devise.omniauth_callbacks` flash templates, and the
 //! `omniauth_providers` request-time allowlist. The route table is the
 //! shared core spec data ([`omniauth_router`] iterates
-//! [`Mapping::omniauth_route_specs_for`](devise_rust::scope::Mapping::omniauth_route_specs_for)
-//! — no per-framework omniauth paths anywhere).
+//! [`Mapping::omniauth_route_specs_for`](devise_rust::scope::Mapping::omniauth_route_specs_for));
+//! no per-framework omniauth paths exist anywhere.
 //!
 //! ## Session stash (D-07 / D-12)
 //!
@@ -27,21 +27,23 @@
 //! OAuth access and refresh tokens live in the requesting flow only and
 //! never reach the database (D-12).
 //!
-//! ## Redirect origin
+//! ## Redirect origin (WR-02)
 //!
-//! OAuth `redirect_uri` values must be absolute. The state's
-//! [`origin`](OmniauthWebState::origin) override supplies the external
-//! origin for production mounts (e.g. behind TLS); when unset the
-//! handler derives `http://{Host}` from the request's Host header — the
-//! handler never trusts `X-Forwarded-*` proxy headers (D-11/D-20
-//! posture), so TLS-terminated apps set the override.
+//! OAuth `redirect_uri` values must be absolute. The origin is EXPLICIT
+//! configuration only: the state's [`origin`](OmniauthWebState::origin)
+//! override carries the external origin for production mounts (e.g.
+//! behind TLS). The handler NEVER derives the origin from the request's
+//! `Host` header, which is client-controlled: an attacker-supplied host
+//! would steer the OAuth redirect (WR-02). Mounting providers without an
+//! origin fails closed: [`omniauth_router`] returns
+//! [`DeviseError::Config`] naming the field instead of guessing.
 //!
 //! ## Examples
 //!
 //! ```rust,ignore
 //! let providers = HashMap::from([("stub".to_string(), stub_config)]);
-//! let state = OmniauthWebState::new(devise_state, providers)
-//!     .with_origin("https://app.example.com");
+//! let state = OmniauthWebState::new(devise_state, providers)?
+//!     .with_origin("https://app.example.com")?;
 //! let app = Router::new()
 //!     .merge(devise_for_router(devise_state))
 //!     .merge(omniauth_router(state)?);
@@ -107,6 +109,14 @@ fn omniauth_kind(provider: &str) -> String {
 /// app-supplied, zero vendor presets) and the external origin for OAuth
 /// redirect URIs.
 ///
+/// ## Redirect origin (WR-02)
+///
+/// OAuth `redirect_uri` values must be absolute and are **fail-closed**: when
+/// one or more providers are configured, an explicit origin MUST be set via
+/// [`with_origin`](OmniauthWebState::with_origin). The handler never derives
+/// the origin from the `Host` header (client-controlled) or from proxy
+/// headers; production mounts behind TLS must set the override explicitly.
+///
 /// == Options
 ///
 /// * `devise` — the mapping's [`DeviseWebState`] (config, adapter,
@@ -114,13 +124,14 @@ fn omniauth_kind(provider: &str) -> String {
 /// * `providers` — [`OAuthProviderConfig`] per provider name; a
 ///   provider allowlisted in config but missing here fails the request
 ///   with 500 (app misconfiguration).
-/// * `origin` — absolute origin for OAuth `redirect_uri` values; `None`
-///   derives `http://{Host}` from the request Host header.
+/// * `origin` — absolute origin for OAuth `redirect_uri` values; required
+///   when providers are configured (no Host-header derivation).
 ///
 /// == Examples
 ///
 /// ```rust,ignore
-/// let state = OmniauthWebState::new(devise_state, providers);
+/// let state = OmniauthWebState::new(devise_state, providers)
+///     .with_origin("https://app.example.com")?;
 /// let router = omniauth_router(state)?;
 /// ```
 pub struct OmniauthWebState<M, A, L> {
@@ -129,8 +140,7 @@ pub struct OmniauthWebState<M, A, L> {
     pub devise: DeviseWebState<M, A, L>,
     /// `OAuth2` provider endpoint configs keyed by provider name (D-05).
     pub providers: HashMap<String, OAuthProviderConfig>,
-    /// External origin for OAuth redirect URIs; `None` derives
-    /// `http://{Host}` from the request.
+    /// External origin for OAuth redirect URIs (required when providers configured).
     pub origin: Option<String>,
 }
 
@@ -148,48 +158,76 @@ impl<M, A, L> Clone for OmniauthWebState<M, A, L> {
 
 impl<M, A, L> OmniauthWebState<M, A, L> {
     /// Build the omniauth state for one mapping.
-    #[must_use]
+    ///
+    /// This never fails: the origin arrives through
+    /// [`with_origin`](OmniauthWebState::with_origin) BEFORE
+    /// [`omniauth_router`] consumes the state, and the fail-closed check
+    /// (providers configured, origin absent) runs there so an app cannot
+    /// mount a stealable redirect by forgetting the override.
+    ///
+    /// # Errors
+    ///
+    /// This constructor does not fail; the `Result` keeps the builder
+    /// shape uniform with [`with_origin`](OmniauthWebState::with_origin).
     pub fn new(
         devise: DeviseWebState<M, A, L>,
         providers: HashMap<String, OAuthProviderConfig>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DeviseError> {
+        Ok(Self {
             devise,
             providers,
             origin: None,
-        }
+        })
     }
 
-    /// Override the external origin for OAuth redirect URIs (production
-    /// mounts behind TLS set this; the default derivation is `http`
-    /// because the handler never trusts proxy headers).
-    #[must_use]
-    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+    /// Set the explicit external origin for OAuth redirect URIs.
+    ///
+    /// WR-02: the only source of the origin. No Host-header derivation
+    /// exists in this crate, so a client-controlled host can never steer
+    /// the OAuth redirect.
+    ///
+    /// # Errors
+    ///
+    /// This setter does not fail; the `Result` keeps the builder shape
+    /// uniform with [`new`](OmniauthWebState::new).
+    #[must_use = "validation result must be checked"]
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Result<Self, DeviseError> {
         self.origin = Some(origin.into());
-        self
+        Ok(self)
+    }
+
+    /// The fail-closed origin gate (WR-02).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviseError::Config`] when providers are configured but
+    /// no origin was set through
+    /// [`with_origin`](OmniauthWebState::with_origin).
+    fn require_origin(&self) -> Result<(), DeviseError> {
+        let has_providers =
+            !self.providers.is_empty() || !self.devise.config.omniauth_providers.is_empty();
+        if has_providers && self.origin.is_none() {
+            return Err(DeviseError::Config(
+                "omniauth: origin is required when providers are configured (set via with_origin; no Host-header derivation)".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
 /// The absolute redirect URI for one provider's callback: the external
-/// origin override or the request's Host header, joined with the
-/// callback path derived from the shared spec table.
+/// origin override joined with the callback path derived from the shared
+/// spec table.
 fn redirect_uri<M, A, L>(
     st: &OmniauthWebState<M, A, L>,
-    auth_request: &AuthRequest,
+    _auth_request: &AuthRequest,
     provider: &str,
 ) -> String {
     let callback_path = st
         .devise
         .mapping
         .omniauth_callback_path(&st.devise.config, provider);
-    let origin = st.origin.clone().unwrap_or_else(|| {
-        let host = auth_request
-            .headers
-            .get("host")
-            .cloned()
-            .unwrap_or_default();
-        format!("http://{host}")
-    });
+    let origin = st.origin.clone().expect("omniauth origin must be set");
     format!("{origin}{callback_path}")
 }
 
@@ -273,6 +311,11 @@ where
 {
     // Registration-time Config error: Devise's dynamic-segment ban.
     state.devise.mapping.validate_omniauth_paths()?;
+    // WR-02 fail-closed origin: the router is the first consumer of the
+    // fully-built state, so this is the point where "providers configured
+    // but no explicit origin" becomes a boot-time Config error instead of
+    // a per-request Host-header guess.
+    state.require_origin()?;
     // The route table IS the shared core spec data — no per-framework
     // omniauth paths (OMN-01 prohibition).
     let specs = state
@@ -414,14 +457,14 @@ where
 
     // Callback params: the provider redirect carries query params (GET);
     // `OmniAuth` 2 form-posts carry them in the body. Query wins on
-    // overlap (the redirect shape is authoritative).
-    let mut callback_params: HashMap<String, String> = params
-        .0
-        .iter()
-        .filter_map(|(key, value)| value.as_str().map(|raw| (key.clone(), raw.to_string())))
-        .collect();
-    for (key, value) in query {
-        callback_params.entry(key).or_insert(value);
+    // overlap (the redirect shape is authoritative) - query-first.
+    let mut callback_params: HashMap<String, String> = query;
+    for (key, value) in &params.0 {
+        if let Some(raw) = value.as_str() {
+            callback_params
+                .entry(key.clone())
+                .or_insert_with(|| raw.to_string());
+        }
     }
     let returned_state = callback_params.get("state").cloned();
     let code = callback_params.get("code").cloned();
@@ -522,7 +565,11 @@ where
 
     // The app's from_omniauth seam owns the handoff (D-08); the core
     // default policy (D-09/D-10) runs when the app delegates to it.
-    let outcome = M::from_omniauth(profile, devise.adapter.as_ref(), devise.clock.as_ref()).await;
+    let Ok(outcome) =
+        M::from_omniauth(profile, devise.adapter.as_ref(), devise.clock.as_ref()).await
+    else {
+        return internal_error();
+    };
     let mut record = if outcome.is_valid() {
         outcome.record
     } else {

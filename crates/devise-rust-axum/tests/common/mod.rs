@@ -646,7 +646,7 @@ impl devise_rust::omniauthable::Omniauthable for FixtureUser {
         profile: devise_rust::omniauthable::ProviderProfile,
         adapter: &A,
         clock: &dyn Clock,
-    ) -> devise_rust::error::ResourceWithErrors<Self>
+    ) -> Result<devise_rust::error::ResourceWithErrors<Self>, devise_rust::error::DeviseError>
     where
         Self: Sized,
         A: devise_rust::adapter::OrmAdapter<Self, New = Self::New> + Send + Sync,
@@ -657,7 +657,7 @@ impl devise_rust::omniauthable::Omniauthable for FixtureUser {
             &devise_rust::config::DeviseConfig::default(),
             clock,
         )
-        .await;
+        .await?;
         // Devise's canonical from_omniauth pattern: a provider-verified
         // identity is confirmed on creation (one home: core helper).
         if outcome.is_valid() {
@@ -669,7 +669,7 @@ impl devise_rust::omniauthable::Omniauthable for FixtureUser {
             )
             .await;
         }
-        outcome
+        Ok(outcome)
     }
 
     fn new_from_profile(
@@ -1213,7 +1213,20 @@ pub fn build_omniauth_app(
     .with_finder(&scope_name, finder);
     let session_layer = session_manager_layer(&state.config).expect("session layer builds");
 
-    let omniauth_state = devise_rust_axum::OmniauthWebState::new(state.clone(), providers);
+    let omniauth_state = devise_rust_axum::OmniauthWebState::new(state.clone(), providers)
+        .expect("omniauth state")
+        .with_origin("http://localhost")
+        .expect("omniauth origin");
+    // WR-02 fail-closed: the same state WITHOUT the explicit origin must
+    // fail at router construction with a Config error naming the field,
+    // never mount a Host-derived redirect.
+    let bare =
+        devise_rust_axum::OmniauthWebState::new(state.clone(), omniauth_state.providers.clone())
+            .expect("bare state");
+    assert!(
+        devise_rust_axum::omniauth_router(bare).is_err(),
+        "WR-02: mounting providers without an explicit origin fails closed"
+    );
     let app = Router::new()
         .merge(devise_for_router(state.clone()))
         .merge(devise_rust_axum::omniauth_router(omniauth_state).expect("omniauth router"))

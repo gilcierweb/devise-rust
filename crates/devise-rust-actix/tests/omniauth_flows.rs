@@ -292,8 +292,12 @@ async fn authorize_redirects_to_stub_with_pkce_and_state() {
     assert!(location.contains("state="));
     assert!(location.contains("client_id=stub-client-id"));
     assert!(
-        location.contains("redirect_uri=http%3A%2F%2Fapp.test%2Fusers%2Fauth%2Fstub%2Fcallback"),
-        "redirect URI derives from the request Host: {location}"
+        location.contains("redirect_uri=http%3A%2F%2Flocalhost%2Fusers%2Fauth%2Fstub%2Fcallback"),
+        "WR-02: redirect_uri carries the CONFIGURED origin, never the request Host: {location}"
+    );
+    assert!(
+        !location.contains("app.test"),
+        "WR-02: the client-controlled Host header never reaches redirect_uri: {location}"
     );
     // The authorize step primed a session cookie the callback must replay.
     assert!(
@@ -521,7 +525,7 @@ async fn pkce_verifier_mismatch_fails_closed() {
     let (challenge, _verifier) = oauth2::PkceCodeChallenge::new_random_sha256();
     let http = stub_http_client();
     let stub_authorize_url = format!(
-        "http://{stub_addr}/authorize?redirect_uri=http%3A%2F%2Fapp.test%2Fusers%2Fauth%2Fstub%2Fcallback&state={state}&code_challenge={}",
+        "http://{stub_addr}/authorize?redirect_uri=http%3A%2F%2Flocalhost%2Fusers%2Fauth%2Fstub%2Fcallback&state={state}&code_challenge={}",
         challenge.as_str()
     );
     let stub_response = http

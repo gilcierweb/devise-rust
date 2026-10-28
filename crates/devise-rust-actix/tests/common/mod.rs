@@ -625,7 +625,7 @@ impl devise_rust::omniauthable::Omniauthable for FixtureUser {
         profile: devise_rust::omniauthable::ProviderProfile,
         adapter: &A,
         clock: &dyn Clock,
-    ) -> devise_rust::error::ResourceWithErrors<Self>
+    ) -> Result<devise_rust::error::ResourceWithErrors<Self>, devise_rust::error::DeviseError>
     where
         Self: Sized,
         A: devise_rust::adapter::OrmAdapter<Self, New = Self::New> + Send + Sync,
@@ -636,7 +636,7 @@ impl devise_rust::omniauthable::Omniauthable for FixtureUser {
             &test_config(),
             clock,
         )
-        .await;
+        .await?;
         // Devise's canonical from_omniauth pattern: a provider-verified
         // identity is confirmed on creation (one home: core helper).
         if outcome.is_valid() {
@@ -648,7 +648,7 @@ impl devise_rust::omniauthable::Omniauthable for FixtureUser {
             )
             .await;
         }
-        outcome
+        Ok(outcome)
     }
 
     fn new_from_profile(
@@ -939,7 +939,20 @@ pub async fn build_omniauth_service(
         DeviseMiddleware::new(registry_with(state.mapping.clone()), state.config.clone())
             .with_finder(&scope_name, finder);
 
-    let omniauth_state = devise_rust_actix::OmniauthWebState::new(state.clone(), providers);
+    let omniauth_state = devise_rust_actix::OmniauthWebState::new(state.clone(), providers)
+        .expect("omniauth state")
+        .with_origin("http://localhost")
+        .expect("omniauth origin");
+    // WR-02 fail-closed: the same state WITHOUT the explicit origin must
+    // fail at scope construction with a Config error naming the field,
+    // never mount a Host-derived redirect.
+    let bare =
+        devise_rust_actix::OmniauthWebState::new(state.clone(), omniauth_state.providers.clone())
+            .expect("bare state");
+    assert!(
+        devise_rust_actix::devise_omniauth_scope(web::Data::new(bare)).is_err(),
+        "WR-02: mounting providers without an explicit origin fails closed"
+    );
     let data_state = state.clone();
     let service = actix_web::test::init_service(
         App::new()

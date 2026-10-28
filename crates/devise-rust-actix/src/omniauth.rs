@@ -89,6 +89,13 @@ pub(crate) use devise_rust::session::keys::{omniauth_state_key, omniauth_verifie
 /// app-supplied, zero vendor presets) and the external origin for OAuth
 /// redirect URIs.
 ///
+/// ## Redirect origin (WR-02)
+///
+/// OAuth `redirect_uri` values must be absolute and are **fail-closed**: when
+/// one or more providers are configured, an explicit origin MUST be set via
+/// [`with_origin`](OmniauthWebState::with_origin). The handler never derives
+/// the origin from the `Host` header (client-controlled).
+///
 /// == Options
 ///
 /// * `devise` — the mapping's [`DeviseWebState`] (config with the
@@ -96,13 +103,14 @@ pub(crate) use devise_rust::session::keys::{omniauth_state_key, omniauth_verifie
 /// * `providers` — [`OAuthProviderConfig`] per provider name; a provider
 ///   allowlisted in config but missing here fails the request with 500
 ///   (app misconfiguration).
-/// * `origin` — absolute origin for OAuth `redirect_uri` values; `None`
-///   derives `http://{Host}` from the request Host header.
+/// * `origin` — absolute origin for OAuth `redirect_uri` values; required
+///   when providers are configured.
 ///
 /// == Examples
 ///
 /// ```rust,ignore
-/// let state = OmniauthWebState::new(devise_state, providers);
+/// let state = OmniauthWebState::new(devise_state, providers)
+///     .with_origin("https://app.example.com")?;
 /// let scope = devise_omniauth_scope(web::Data::new(state))?;
 /// ```
 pub struct OmniauthWebState<M, A, L> {
@@ -111,8 +119,7 @@ pub struct OmniauthWebState<M, A, L> {
     pub devise: DeviseWebState<M, A, L>,
     /// `OAuth2` provider endpoint configs keyed by provider name (D-05).
     pub providers: HashMap<String, OAuthProviderConfig>,
-    /// External origin for OAuth redirect URIs; `None` derives
-    /// `http://{Host}` from the request.
+    /// External origin for OAuth redirect URIs (required when providers configured).
     pub origin: Option<String>,
 }
 
@@ -128,48 +135,76 @@ impl<M, A, L> Clone for OmniauthWebState<M, A, L> {
 
 impl<M, A, L> OmniauthWebState<M, A, L> {
     /// Build the omniauth state for one mapping.
-    #[must_use]
+    ///
+    /// This never fails: the origin arrives through
+    /// [`with_origin`](OmniauthWebState::with_origin) BEFORE
+    /// [`devise_omniauth_scope`] consumes the state, and the fail-closed
+    /// check (providers configured, origin absent) runs there so an app
+    /// cannot mount a stealable redirect by forgetting the override.
+    ///
+    /// # Errors
+    ///
+    /// This constructor does not fail; the `Result` keeps the builder
+    /// shape uniform with [`with_origin`](OmniauthWebState::with_origin).
     pub fn new(
         devise: DeviseWebState<M, A, L>,
         providers: HashMap<String, OAuthProviderConfig>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DeviseError> {
+        Ok(Self {
             devise,
             providers,
             origin: None,
-        }
+        })
     }
 
-    /// Override the external origin for OAuth redirect URIs (production
-    /// mounts behind TLS set this; the default derivation is `http`
-    /// because the handler never trusts proxy headers).
-    #[must_use]
-    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+    /// Set the explicit external origin for OAuth redirect URIs.
+    ///
+    /// WR-02: the only source of the origin. No Host-header derivation
+    /// exists in this crate, so a client-controlled host can never steer
+    /// the OAuth redirect.
+    ///
+    /// # Errors
+    ///
+    /// This setter does not fail; the `Result` keeps the builder shape
+    /// uniform with [`new`](OmniauthWebState::new).
+    #[must_use = "validation result must be checked"]
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Result<Self, DeviseError> {
         self.origin = Some(origin.into());
-        self
+        Ok(self)
+    }
+
+    /// The fail-closed origin gate (WR-02).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviseError::Config`] when providers are configured but
+    /// no origin was set through
+    /// [`with_origin`](OmniauthWebState::with_origin).
+    fn require_origin(&self) -> Result<(), DeviseError> {
+        let has_providers =
+            !self.providers.is_empty() || !self.devise.config.omniauth_providers.is_empty();
+        if has_providers && self.origin.is_none() {
+            return Err(DeviseError::Config(
+                "omniauth: origin is required when providers are configured (set via with_origin; no Host-header derivation)".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
 /// The absolute redirect URI for one provider's callback: the external
-/// origin override or the request's Host header, joined with the
-/// callback path derived from the shared spec table.
+/// origin override joined with the callback path derived from the shared
+/// spec table.
 fn redirect_uri<M, A, L>(
     st: &OmniauthWebState<M, A, L>,
-    req: &HttpRequest,
+    _req: &HttpRequest,
     provider: &str,
 ) -> String {
     let callback_path = st
         .devise
         .mapping
         .omniauth_callback_path(&st.devise.config, provider);
-    let origin = st.origin.clone().unwrap_or_else(|| {
-        let host = req
-            .headers()
-            .get(actix_web::http::header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        format!("http://{host}")
-    });
+    let origin = st.origin.clone().expect("omniauth origin must be set");
     format!("{origin}{callback_path}")
 }
 
@@ -215,17 +250,11 @@ fn after_sign_in_target(session: &Session, mapping: &devise_rust::scope::Mapping
     crate::routes::after_sign_in_target(session, mapping)
 }
 
-/// Durable sign-in bookkeeping on the omniauth callback path: the shared
-/// `crate::routes::sign_in_bookkeeping` (framework parity with the axum
-/// crate; the string-literal trackable map that used to live here was
-/// consolidated into the core `tracked_fields_changeset` builder,
-/// 261026-ghl).
-///
 /// Register the mapping's omniauth route pair (POST-only authorize plus
 /// GET-or-POST callback) as an actix [`Scope`] mounted at the resolved
-/// omniauth base — the same shared core spec data the axum crate
-/// renders — actix-router 0.5 consumes the `{provider}` captures
-/// natively, so the spec paths render verbatim.
+/// omniauth base: the same shared core spec data the axum crate renders.
+/// actix-router 0.5 consumes the `{provider}` captures natively, so the
+/// spec paths render verbatim.
 ///
 /// The mapping must be omniauthable (`Module::Omniauthable`); the model
 /// must implement the [`Omniauthable`] seam. Registration validates
@@ -240,7 +269,9 @@ fn after_sign_in_target(session: &Session, mapping: &devise_rust::scope::Mapping
 ///
 /// Returns [`DeviseError::Config`] when the mapping is omniauthable and
 /// its scope path carries a dynamic segment (Devise's
-/// `devise_omniauth_callback` raise, ported).
+/// `devise_omniauth_callback` raise, ported), or when providers are
+/// configured without an explicit origin (WR-02, fail-closed: the
+/// scope builder is the first consumer of the fully-built state).
 ///
 /// == Examples
 ///
@@ -260,6 +291,11 @@ where
     let devise = &state.devise;
     // Registration-time Config error: Devise's dynamic-segment ban.
     devise.mapping.validate_omniauth_paths()?;
+    // WR-02 fail-closed origin: the scope builder is the first consumer
+    // of the fully-built state, so "providers configured but no explicit
+    // origin" becomes a boot-time Config error instead of a per-request
+    // Host-header guess.
+    state.require_origin()?;
     let base = devise.mapping.omniauth_base(&devise.config);
     // The route table IS the shared core spec data. actix-router 0.5
     // consumes the same `{provider}` curly-brace captures as the spec,
@@ -510,7 +546,11 @@ where
 
     // The app's from_omniauth seam owns the handoff (D-08); the core
     // default policy (D-09/D-10) runs when the app delegates to it.
-    let outcome = M::from_omniauth(profile, devise.adapter.as_ref(), devise.clock.as_ref()).await;
+    let Ok(outcome) =
+        M::from_omniauth(profile, devise.adapter.as_ref(), devise.clock.as_ref()).await
+    else {
+        return internal_error();
+    };
     let mut record = if outcome.is_valid() {
         outcome.record
     } else {

@@ -248,8 +248,12 @@ async fn authorize_redirects_to_stub_with_pkce_and_state() {
     assert!(location.contains("state="));
     assert!(location.contains("client_id=stub-client-id"));
     assert!(
-        location.contains("redirect_uri=http%3A%2F%2Fapp.test%2Fusers%2Fauth%2Fstub%2Fcallback"),
-        "redirect URI derives from the request Host: {location}"
+        location.contains("redirect_uri=http%3A%2F%2Flocalhost%2Fusers%2Fauth%2Fstub%2Fcallback"),
+        "WR-02: redirect_uri carries the CONFIGURED origin, never the request Host: {location}"
+    );
+    assert!(
+        !location.contains("app.test"),
+        "WR-02: the client-controlled Host header never reaches redirect_uri: {location}"
     );
     // The authorize step created a session carrying the stash — the jar
     // holds the session cookie the callback must replay.

@@ -61,6 +61,8 @@ use devise_rust::{
 };
 use serde_json::Value;
 use std::fmt;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
 use tower_sessions::Session;
 
 /// Session-resident index of bridge-inserted keys, enabling
@@ -70,6 +72,12 @@ use tower_sessions::Session;
 /// The leading underscore keeps the name out of the `warden.*` and
 /// `devise.*` namespaces.
 pub const KEY_INDEX: &str = "_devise_rust_session_keys";
+
+static KEY_INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn key_index_lock() -> &'static Mutex<()> {
+    KEY_INDEX_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Tower-sessions-backed session store implementing the core
 /// `SessionStore` trait.
@@ -423,6 +431,7 @@ async fn index_keys(session: &Session) -> Vec<String> {
 
 /// Track `key` in the session-resident index.
 async fn index_insert(session: &Session, key: &str) {
+    let _guard = key_index_lock().lock().await;
     let mut known = index_keys(session).await;
     if known.iter().any(|known| known == key) {
         return;
@@ -436,6 +445,7 @@ async fn index_insert(session: &Session, key: &str) {
 /// Drop `key` from the index, removing the index entirely once empty so a
 /// signed-out session stays record-clean.
 async fn index_remove(session: &Session, key: &str) {
+    let _guard = key_index_lock().lock().await;
     let mut known = index_keys(session).await;
     let before = known.len();
     known.retain(|known| known != key);
