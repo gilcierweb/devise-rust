@@ -864,6 +864,69 @@ async fn flow_two_cookie_jar_password_change_kills_session_and_remember() {
     );
 }
 
+/// T-261026-ghi: the JSON boolean `remember_me: true` reaches the core
+/// `remember_me_from` (the axum controller previously honored only the
+/// string shape, silently dropping the boolean, so JSON clients never
+/// got the remember cookie).
+#[tokio::test]
+async fn flow_json_remember_me_boolean_issues_remember_cookie() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user(&state, "flow-json-remember@example.com", "secret123").await;
+
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/users/sign_in")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::from(
+                r#"{"email":"flow-json-remember@example.com","password":"secret123","remember_me":true}"#,
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|pair| pair.starts_with("remember_user_token=")),
+        "the JSON boolean remember_me must issue the remember cookie: {cookies:?}"
+    );
+}
+
+/// T-261026-ghi: the form-bridge flat spelling `user_email` reaches the
+/// sign-in params lookup through the one core `param_for` precedence on
+/// BOTH frameworks (actix previously read only the bare key).
+#[tokio::test]
+async fn flow_sign_in_accepts_the_bridge_flat_email_key() {
+    let (state, app) = common::build_app(common::test_state(default_mapping()));
+    seed_user(&state, "flow-flat@example.com", "secret123").await;
+
+    let resp = call(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/users/sign_in")
+            .header(
+                header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(Body::from(
+                "user_email=flow-flat%40example.com&password=secret123",
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        common::flash_keys_from_cookies(&cookies, &state.config).contains(&"signed_in".to_string()),
+        "the bridge flat key must authenticate: {cookies:?}"
+    );
+}
+
 /// D-04 renewal gates: Set-Cookie rotation asserted on ALL FOUR privilege
 /// paths — `sign_in`, `bypass_sign_in`, account update (`bypass_sign_in`
 /// re-sign-in), and `sign_out` — in one running session jar.

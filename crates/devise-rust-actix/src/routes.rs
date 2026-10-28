@@ -34,7 +34,8 @@ use actix_web::{Either, HttpMessage, HttpRequest, HttpResponse, Scope, web};
 use devise_rust::adapter::{Conditions, OrmAdapter, Value as AdapterValue};
 use devise_rust::config::DeviseConfig;
 use devise_rust::confirmable::Confirmable;
-use devise_rust::error::ValidationErrors;
+use devise_rust::error::{ValidationErrors, errors_json};
+use devise_rust::failure::{Failure, FailureRenderer, flash_keys, successfully_sent_key};
 use devise_rust::lockable::{LockAttemptOutcome, Lockable};
 use devise_rust::mailer::Mailer;
 use devise_rust::model::{Recoverable, Registerable, Validatable};
@@ -48,6 +49,7 @@ use crate::bridge::{
     insert_session_and_renew_sync, sign_out_all_scopes_and_renew_sync, sign_out_and_renew,
 };
 use crate::callbacks::rotate_csrf_token;
+use crate::failure::ActixFailureRenderer;
 
 /// The full model trait bundle the controller matrix needs (D-14).
 ///
@@ -345,27 +347,31 @@ pub(crate) fn flash_redirect(session: &Session, location: &str, flash_key: &str)
         .finish()
 }
 
-fn errors_json(errors: &ValidationErrors) -> JsonValue {
-    let mut map = Map::new();
-    for (field, message) in errors.full_messages() {
-        if let Some(list) = map
-            .entry(field)
-            .or_insert_with(|| JsonValue::Array(Vec::new()))
-            .as_array_mut()
-        {
-            list.push(JsonValue::String(message));
-        }
-    }
-    JsonValue::Object(map)
-}
-
-/// Fail an authentication post: navigational → 302 to sign-in + flash;
-/// JSON → 401 with the symbolic key (never values, T-08-10).
-fn auth_fail(req: &HttpRequest, session: &Session, mapping: &Mapping, key: &str) -> HttpResponse {
+/// Fail an authentication post through the typed failure renderer:
+/// navigational requests stage the Devise flash key in the signed session
+/// and render the redirect through [`ActixFailureRenderer`] (the same
+/// renderer the extractors already use, replacing the hand-rolled 302);
+/// JSON requests keep the symbolic-keyed 401 body (never values,
+/// T-08-10). The flash key set is byte-identical to the old helper's.
+///
+/// The core [`Failure::NavigationalRedirect`] carries the raw key
+/// directly because the lockable `last_attempt` warning lives outside
+/// the [`devise_rust::failure::FailureReason`] vocabulary; the staged
+/// key reaches the session unchanged either way.
+fn auth_fail(req: &HttpRequest, session: &Session, mapping: &Mapping, key: &'static str) -> HttpResponse {
     if wants_json(req) {
         return HttpResponse::Unauthorized().json(serde_json::json!({ "error": key }));
     }
-    flash_redirect(session, &mapping.sign_in_path(), key)
+    // Stage the flash (session state, S11) BEFORE the render - the
+    // renderer contract carries no session access, exactly like the
+    // extractor call sites.
+    crate::bridge::set_flash(session, key);
+    let failure = Failure::NavigationalRedirect {
+        location: mapping.sign_in_path(),
+        flash_key: key,
+        stored_location: None,
+    };
+    ActixFailureRenderer::new().render(&failure, mapping)
 }
 
 /// Unauthenticated gate for owner-only controller actions (edit/update/
@@ -478,7 +484,7 @@ fn require_no_authentication_response<M, A, L>(
     Some(flash_redirect(
         session,
         &after_sign_in_target(session, &state.mapping),
-        "already_authenticated",
+        flash_keys::ALREADY_AUTHENTICATED,
     ))
 }
 
@@ -547,31 +553,40 @@ where
         return flash_redirect(
             &session,
             &after_sign_in_target(&session, &state.mapping),
-            "already_authenticated",
+            flash_keys::ALREADY_AUTHENTICATED,
         );
     }
-    let params = match sanitized_body(&state.config, "sign_in", body, &singular) {
+    // S7: `sign_in_params` — the `:sign_in` sanitizer decides what the
+    // controller may read (`sessions_controller.rb:34-36`); the raw body
+    // map stays available for the authentication-key lookup below (the
+    // bridge flat spelling of the SAME permitted keys).
+    // Devise's `unknown_action!` raise renders as the framework's 500.
+    let raw_params = body_map(body, &singular);
+    let params = match devise_rust::parameter::ParameterSanitizer::new(&state.config)
+        .sanitize("sign_in", &raw_params)
+    {
         Ok(params) => params,
-        Err(response) => return response,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
     };
     let password = param_str(&params, "password").to_string();
-    // Devise's sign-in form posts "1"; JSON clients send a real boolean —
-    // accept both shapes (`TRUE_VALUES` for strings, `as_bool` for JSON).
-    let remember = params.get("remember_me").is_some_and(|value| match value {
-        JsonValue::Bool(flag) => *flag,
-        JsonValue::String(text) => rememberable::is_true_value(text),
-        _ => false,
-    });
+    // Devise's sign-in form posts "1" (`TRUE_VALUES`); JSON clients send a
+    // real boolean - the core helper accepts both shapes, the same rule
+    // both frameworks now share.
+    let remember = devise_rust::parameter::remember_me_from(&params);
 
     let mut conditions = Conditions::new();
     // Devise `find_for_database_authentication` looks the record up
     // through `config.authentication_keys` — email is only the DEFAULT key
     // (`database_authenticatable.rb`). Each value passes the single
-    // normalization home the params filter and the write path share.
+    // normalization home the params filter and the write path share, and
+    // arrives through the core `param_for` precedence (scoped bracket,
+    // bridge flat, bare key) over the RAW body map, so the `user_email`
+    // bridge form reaches the lookup here exactly like it does on axum:
+    // every spelling of the CONFIGURED keys, nothing unconfigured.
     for key in &state.config.authentication_keys {
-        let raw = param_str(&params, key);
+        let raw = devise_rust::parameter::param_for(&raw_params, &singular, key);
         let value = devise_rust::model::normalize_credential_value(
-            raw,
+            &raw,
             key,
             &state.config.case_insensitive_keys,
             &state.config.strip_whitespace_keys,
@@ -710,7 +725,7 @@ where
         HttpResponse::Ok().json(serde_json::json!({ "signed_in": true }))
     } else {
         let target = after_sign_in_target(&session, &state.mapping);
-        flash_redirect(&session, &target, "signed_in")
+        flash_redirect(&session, &target, flash_keys::SIGNED_IN)
     };
 
     if remember
@@ -808,7 +823,7 @@ where
     let mut response = if wants_json(&req) {
         HttpResponse::NoContent().finish()
     } else {
-        flash_redirect(&session, "/", "signed_out")
+        flash_redirect(&session, "/", flash_keys::SIGNED_OUT)
     };
     if let (Some(op), Ok(jar_key)) = (
         clear_op,
@@ -1048,7 +1063,7 @@ where
         if wants_json(&req) {
             HttpResponse::Created().json(serde_json::json!({ "signed_up": true }))
         } else {
-            flash_redirect(&session, "/", "signed_up")
+            flash_redirect(&session, "/", flash_keys::SIGNED_UP)
         }
     }
 }
@@ -1183,11 +1198,11 @@ where
     // `active_for_authentication?`; the reference never lets account
     // activity pick the flash key (M-4).
     let flash_key = if reconfirmation_pending {
-        "update_needs_confirmation"
+        flash_keys::UPDATE_NEEDS_CONFIRMATION
     } else if sign_in_after_change_password {
-        "updated"
+        flash_keys::UPDATED
     } else {
-        "updated_but_not_signed_in"
+        flash_keys::UPDATED_BUT_NOT_SIGNED_IN
     };
     if wants_json(&req) {
         HttpResponse::Ok().json(serde_json::json!({ "updated": true }))
@@ -1225,7 +1240,7 @@ where
     if wants_json(&req) {
         HttpResponse::NoContent().finish()
     } else {
-        flash_redirect(&session, "/", "destroyed")
+        flash_redirect(&session, "/", flash_keys::DESTROYED)
     }
 }
 
@@ -1286,11 +1301,7 @@ where
         if wants_json(&req) {
             return HttpResponse::Created().json(serde_json::json!({ "sent": true }));
         }
-        let key = if state.config.paranoid && !resource.is_valid() {
-            "send_paranoid_instructions"
-        } else {
-            "send_instructions"
-        };
+        let key = successfully_sent_key(resource.is_valid(), state.config.paranoid);
         return flash_redirect(&session, &state.mapping.sign_in_path(), key);
     }
     invalid_response(&req, &resource.errors, error_status_of(&state.config))
@@ -1313,7 +1324,11 @@ where
     let token = query.get("reset_password_token");
     let token_str = token.map_or("", String::as_str);
     if token_str.trim().is_empty() {
-        return flash_redirect(&session, &state.mapping.sign_in_path(), "no_token");
+        return flash_redirect(
+            &session,
+            &state.mapping.sign_in_path(),
+            flash_keys::NO_TOKEN,
+        );
     }
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
@@ -1445,9 +1460,9 @@ where
     }
 
     let key = if state.config.sign_in_after_reset_password && active {
-        "updated"
+        flash_keys::UPDATED
     } else {
-        "updated_not_active"
+        flash_keys::UPDATED_NOT_ACTIVE
     };
     if wants_json(&req) {
         HttpResponse::Ok().json(serde_json::json!({ "reset": true, "key": key }))
@@ -1490,7 +1505,7 @@ where
         if wants_json(&req) {
             return HttpResponse::Ok().json(serde_json::json!({ "confirmed": true }));
         }
-        return flash_redirect(&session, &state.mapping.sign_in_path(), "confirmed");
+        return flash_redirect(&session, &state.mapping.sign_in_path(), flash_keys::CONFIRMED);
     }
     // Devise carves `confirmations#show` out of the configurable
     // `error_status` with a TODO to adopt it only when the default changes
@@ -1526,11 +1541,7 @@ where
     // mode clears the errors and reports `send_paranoid_instructions` so the
     // response is uniform for known and unknown addresses.
     if resource.is_valid() || state.config.paranoid {
-        let key = if state.config.paranoid && !resource.is_valid() {
-            "send_paranoid_instructions"
-        } else {
-            "send_instructions"
-        };
+        let key = successfully_sent_key(resource.is_valid(), state.config.paranoid);
         if wants_json(&req) {
             return HttpResponse::Created().json(serde_json::json!({ "sent": true }));
         }
@@ -1565,7 +1576,7 @@ where
         if wants_json(&req) {
             return HttpResponse::Ok().json(serde_json::json!({ "unlocked": true }));
         }
-        return flash_redirect(&session, &state.mapping.sign_in_path(), "unlocked");
+        return flash_redirect(&session, &state.mapping.sign_in_path(), flash_keys::UNLOCKED);
     }
     // Devise carves `unlocks#show` out of the configurable `error_status`
     // with a TODO to adopt it only when the default changes
@@ -1602,11 +1613,7 @@ where
     // `send_paranoid_instructions`, so known and unknown addresses get the
     // same response (the unlocks section ships that key in the catalog).
     if resource.is_valid() || state.config.paranoid {
-        let key = if state.config.paranoid && !resource.is_valid() {
-            "send_paranoid_instructions"
-        } else {
-            "send_instructions"
-        };
+        let key = successfully_sent_key(resource.is_valid(), state.config.paranoid);
         if wants_json(&req) {
             return HttpResponse::Created().json(serde_json::json!({ "sent": true }));
         }

@@ -844,6 +844,64 @@ async fn flow_two_cookie_jar_password_change_kills_session_and_remember() {
     );
 }
 
+/// T-261026-ghi: the JSON boolean `remember_me: true` keeps working through
+/// the one core `remember_me_from` (actix accepted the boolean before; the
+/// shared helper pins the behavior for both frameworks).
+#[actix_web::test]
+async fn flow_json_remember_me_boolean_issues_remember_cookie() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    seed_user(&state, "flow-json-remember@example.com", "secret123").await;
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/users/sign_in")
+            .insert_header(("content-type", "application/json"))
+            .insert_header(("accept", "application/json"))
+            .set_payload(
+                r#"{"email":"flow-json-remember@example.com","password":"secret123","remember_me":true}"#,
+            )
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let cookies = set_cookie_pairs(&resp);
+    assert!(
+        cookies
+            .iter()
+            .any(|pair| pair.starts_with("remember_user_token=")),
+        "the JSON boolean remember_me must issue the remember cookie: {cookies:?}"
+    );
+}
+
+/// T-261026-ghi: the form-bridge flat spelling `user_email` reaches the
+/// sign-in params lookup through the one core `param_for` precedence on
+/// BOTH frameworks (actix previously read only the bare key, so the flat
+/// form failed here).
+#[actix_web::test]
+async fn flow_sign_in_accepts_the_bridge_flat_email_key() {
+    let (state, app) = common::build_app(common::test_state(common::default_mapping())).await;
+    seed_user(&state, "flow-flat@example.com", "secret123").await;
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/users/sign_in")
+            .insert_header(("content-type", "application/x-www-form-urlencoded"))
+            .set_payload("user_email=flow-flat%40example.com&password=secret123")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        common::flash_of(&app, &session_cookie(&resp))
+            .await
+            .as_deref(),
+        Some("signed_in"),
+        "the bridge flat key must authenticate"
+    );
+}
+
 /// D-03 renewal gates: Set-Cookie rotation asserted on `sign_in`, bypass
 /// (account update), and `sign_out` paths, all in one running session jar.
 #[actix_web::test]

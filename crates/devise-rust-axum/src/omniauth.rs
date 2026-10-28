@@ -80,17 +80,15 @@ use crate::layer::AuthProxyHandle;
 use crate::routes::{DeviseParams, DeviseWebState, FullDeviseModel, sign_in_bookkeeping};
 
 /// Session key carrying the stashed CSRF state for one (scope, provider)
-/// authorize attempt. The `devise.{scope}.` prefix means core
-/// `expire_devise_keys` clears it on sign-in.
-fn omniauth_state_key(scope: &str, provider: &str) -> String {
-    format!("devise.{scope}.omniauth.{provider}.state")
-}
-
-/// Session key carrying the stashed PKCE verifier for one (scope,
-/// provider) authorize attempt (single-use; removed on callback read).
-fn omniauth_verifier_key(scope: &str, provider: &str) -> String {
-    format!("devise.{scope}.omniauth.{provider}.pkce_verifier")
-}
+/// authorize attempt, and the PKCE verifier twin: both live in core
+/// `devise_rust::session::keys` (the `devise.{scope}.` prefix means core
+/// `expire_devise_keys` clears them on sign-in; the values are
+/// single-use, removed on callback read). Both framework omniauth modules
+/// previously carried these key constructors verbatim; they re-export the
+/// one core definition now.
+pub(crate) use devise_rust::session::keys::{
+    omniauth_state_key, omniauth_verifier_key,
+};
 
 /// `OmniAuth::Utils.camelize` for the flash `kind`: "stub" -> "Stub",
 /// `google_oauth2` -> `GoogleOauth2`.

@@ -70,18 +70,16 @@ use crate::callbacks::rotate_csrf_token;
 use crate::routes::{DeviseWebState, FullDeviseModel};
 
 /// Session key carrying the stashed CSRF state for one (scope, provider)
-/// authorize attempt (twin of the axum module's key shape; actix and
-/// axum sessions never interoperate, but the key grammar stays
-/// identical for auditability).
-pub(crate) fn omniauth_state_key(scope: &str, provider: &str) -> String {
-    format!("devise.{scope}.omniauth.{provider}.state")
-}
-
-/// Session key carrying the stashed PKCE verifier for one (scope,
-/// provider) authorize attempt (single-use; removed on callback read).
-pub(crate) fn omniauth_verifier_key(scope: &str, provider: &str) -> String {
-    format!("devise.{scope}.omniauth.{provider}.pkce_verifier")
-}
+/// authorize attempt, and the PKCE verifier twin: both live in core
+/// `devise_rust::session::keys` (the `devise.{scope}.` prefix means core
+/// `expire_devise_keys` clears them on sign-in; the values are single-use,
+/// removed on callback read). Both framework omniauth modules previously
+/// carried these key constructors verbatim; they re-export the one core
+/// definition now (actix and axum sessions never interoperate, but the key
+/// grammar stays identical for auditability).
+pub(crate) use devise_rust::session::keys::{
+    omniauth_state_key, omniauth_verifier_key,
+};
 
 // `OmniAuth::Utils.camelize` was used to interpolate the provider kind into
 // the RENDERED flash sentences; the flash now carries the bare I18n key
