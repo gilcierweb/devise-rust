@@ -11,6 +11,7 @@ use crate::failure::{Failure, FailureReason, build_failure, stored_location_for}
 use crate::proxy::AuthProxy;
 use crate::request::AuthRequest;
 use crate::scope::Mapping;
+use chrono::{DateTime, Utc};
 
 /// Options for [`authenticate`] and [`authenticate_strict`].
 ///
@@ -133,6 +134,75 @@ pub async fn require_no_authentication(
     Err(failure)
 }
 
+/// The rememberable facts a guard lookup resolves for one cookie key: the
+/// stored rememberable value and the record's `remember_created_at`.
+pub type RememberedRecordFacts = (String, Option<DateTime<Utc>>);
+
+/// Decide `require_no_authentication` for one request (M-5),
+/// framework-agnostic: session presence OR a live remember cookie means
+/// the request is authenticated and the guarded action must redirect
+/// with `already_authenticated`.
+///
+/// Devise's guard consults `warden.authenticate?` with the mapping's
+/// no-input strategies (`devise/lib/devise/devise_controller.rb:116-132`),
+/// which runs the rememberable strategy
+/// (`devise/lib/devise/strategies/rememberable.rb`): a user whose
+/// session was dropped but whose remember cookie is still live IS
+/// authenticated. The five-condition validity check lives in
+/// [`remember_cookie_valid`](crate::rememberable::remember_cookie_valid)
+/// - this decision never re-implements it, it only feeds the facts.
+///
+/// `remember_cookie_triple` is the decoded `[key, value, generated_at]`
+/// cookie triple (the frameworks read and signature-verify the cookie
+/// through their remember helpers before calling this).
+/// `record_lookup` resolves the remembered record's facts for the
+/// triple's key (fetch by key plus the rememberable value and
+/// `remember_created_at`); an unresolvable key is anonymous. A missing
+/// or malformed triple is anonymous, never a failure.
+///
+/// == Examples
+///
+/// ```ignore
+/// // Ignored doctest: the decision is async over a record-lookup future; the compiled equivalents live in the framework flow tests.
+/// assert!(no_authentication_guard_passes(true, None, &config, &clock, |_| async { None }).await);
+/// ```
+///
+/// Mirrors `DeviseController#require_no_authentication` (`devise/lib/devise/devise_controller.rb`): `warden.authenticate?` over the no-input strategies.
+pub async fn no_authentication_guard_passes<F, Fut>(
+    session_payload_present: bool,
+    remember_cookie_triple: Option<(String, String, String)>,
+    config: &crate::config::DeviseConfig,
+    clock: &dyn crate::time::Clock,
+    record_lookup: F,
+) -> bool
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Option<RememberedRecordFacts>>,
+{
+    if session_payload_present {
+        return true;
+    }
+    let Some((key, token, generated_at)) = remember_cookie_triple else {
+        return false;
+    };
+    // Strict integer-epoch parse (the same rule the remember strategy
+    // applies): an unparseable timestamp is a stale cookie, not a failure.
+    let Some(generated) = crate::rememberable::parse_generated_at(&generated_at) else {
+        return false;
+    };
+    let Some((stored_value, remember_created_at)) = record_lookup(key).await else {
+        return false;
+    };
+    crate::rememberable::remember_cookie_valid(
+        &stored_value,
+        &token,
+        Some(generated),
+        remember_created_at,
+        config,
+        clock,
+    )
+}
+
 /// Multi-scope group, mirroring `devise_group`.
 #[derive(Debug, Clone)]
 pub struct Group {
@@ -140,9 +210,7 @@ pub struct Group {
     pub name: String,
     /// Scopes tried in order.
     pub scopes: Vec<String>,
-}
-
-impl Group {
+}impl Group {
     /// Create a group from a name and scope list.
     ///
     /// Constructs a group, mirroring `devise_group`'s scope list.
@@ -484,6 +552,212 @@ mod tests {
             .await
             .expect_err("signed-in user is redirected");
         assert_eq!(err.flash_key(), Some("already_authenticated"));
+    }
+
+    /// M-5: `require_no_authentication` must be remember-cookie aware -
+    /// Devise's guard consults `warden.authenticate?` over the no-input
+    /// strategies (`devise_controller.rb:116-132`), so a session-less
+    /// request holding a LIVE remember cookie is authenticated. The core
+    /// decision reuses the five-condition remember check; these tests pin
+    /// every branch the frameworks feed.
+    mod no_authentication_guard {
+        use super::*;
+        use crate::config::DeviseConfig;
+        use crate::time::{Clock as _, FixedClock};
+        use chrono::TimeDelta;
+
+        fn config() -> DeviseConfig {
+            DeviseConfig::default()
+        }
+
+        fn facts(
+            stored: &str,
+            created_at: Option<DateTime<Utc>>,
+        ) -> Option<RememberedRecordFacts> {
+            Some((stored.to_string(), created_at))
+        }
+
+        #[tokio::test]
+        async fn session_payload_authenticates_regardless_of_cookies() {
+            let clock = FixedClock::now();
+            // A live session plus garbage cookie facts: still authenticated.
+            assert!(
+                no_authentication_guard_passes(
+                    true,
+                    Some(("1".to_string(), "tok".to_string(), "garbage".to_string())),
+                    &config(),
+                    &clock,
+                    |_: String| async { None },
+                )
+                .await,
+                "a present session payload is authoritative"
+            );
+            // A live session with NO cookie at all.
+            assert!(
+                no_authentication_guard_passes(
+                    true,
+                    None,
+                    &config(),
+                    &clock,
+                    |_: String| async { None },
+                )
+                .await
+            );
+        }
+
+        #[tokio::test]
+        async fn valid_remember_cookie_authenticates_without_a_session() {
+            let clock = FixedClock::now();
+            let now = clock.now();
+            let triple = Some((
+                "7".to_string(),
+                "tok".to_string(),
+                now.timestamp().to_string(),
+            ));
+            // Finder returns the matching record's facts: the token
+            // matches, the timestamp is fresh, and remember_created_at
+            // sits strictly before the cookie's generation instant.
+            assert!(
+                no_authentication_guard_passes(
+                    false,
+                    triple.clone(),
+                    &config(),
+                    &clock,
+                    |key: String| async move {
+                        (key == "7")
+                            .then(|| facts("tok", Some(now - TimeDelta::hours(1))))
+                            .flatten()
+                    },
+                )
+                .await,
+                "a live remember cookie authenticates the guard"
+            );
+
+            // Unknown key: the finder misses, the request stays anonymous.
+            assert!(
+                !no_authentication_guard_passes(
+                    false,
+                    triple,
+                    &config(),
+                    &clock,
+                    |_: String| async { None },
+                )
+                .await
+            );
+        }
+
+        #[tokio::test]
+        async fn stale_invalid_or_expired_cookies_stay_anonymous() {
+            let clock = FixedClock::now();
+            let now = clock.now();
+
+            // No cookie, no session: anonymous.
+            assert!(
+                !no_authentication_guard_passes(false, None, &config(), &clock, |_: String| async {
+                    facts("tok", Some(now - TimeDelta::hours(1)))
+                })
+                .await
+            );
+
+            // Malformed timestamp: stale cookie, anonymous.
+            assert!(
+                !no_authentication_guard_passes(
+                    false,
+                    Some(("1".to_string(), "tok".to_string(), "not-a-time".to_string())),
+                    &config(),
+                    &clock,
+                    |_: String| async { facts("tok", Some(now)) },
+                )
+                .await
+            );
+
+            // Float-string timestamp: the strict integer-epoch rule
+            // rejects it (the Devise time_from_json TODO resolved
+            // fail-closed in this port).
+            assert!(
+                !no_authentication_guard_passes(
+                    false,
+                    Some((
+                        "1".to_string(),
+                        "tok".to_string(),
+                        format!("{}.5", now.timestamp())
+                    )),
+                    &config(),
+                    &clock,
+                    |_: String| async { facts("tok", Some(now)) },
+                )
+                .await
+            );
+
+            // Expired: the cookie was minted before the remember_for
+            // window opened (default 2 weeks).
+            assert!(
+                !no_authentication_guard_passes(
+                    false,
+                    Some((
+                        "1".to_string(),
+                        "tok".to_string(),
+                        (now - TimeDelta::weeks(3)).timestamp().to_string()
+                    )),
+                    &config(),
+                    &clock,
+                    |_: String| async { facts("tok", Some(now - TimeDelta::weeks(4))) },
+                )
+                .await,
+                "an expired remember cookie is anonymous"
+            );
+
+            // Wrong presented token: the constant-time compare fails.
+            assert!(
+                !no_authentication_guard_passes(
+                    false,
+                    Some((
+                        "2".to_string(),
+                        "tok".to_string(),
+                        now.timestamp().to_string()
+                    )),
+                    &config(),
+                    &clock,
+                    |_: String| async { facts("other", Some(now - TimeDelta::hours(1))) },
+                )
+                .await,
+                "a token mismatch is anonymous"
+            );
+
+            // Missing remember_created_at on the record: condition 3 of
+            // the five-condition check fails closed.
+            assert!(
+                !no_authentication_guard_passes(
+                    false,
+                    Some((
+                        "1".to_string(),
+                        "tok".to_string(),
+                        now.timestamp().to_string()
+                    )),
+                    &config(),
+                    &clock,
+                    |_: String| async { facts("tok", None) },
+                )
+                .await
+            );
+
+            // generated_at equal to remember_created_at: the STRICT
+            // greater-than rule (RMB-05) rejects it.
+            assert!(
+                !no_authentication_guard_passes(
+                    false,
+                    Some((
+                        "1".to_string(),
+                        "tok".to_string(),
+                        now.timestamp().to_string()
+                    )),
+                    &config(),
+                    &clock,
+                    |_: String| async { facts("tok", Some(now)) },
+                )
+                .await
+            );
+        }
     }
 
     #[tokio::test]
